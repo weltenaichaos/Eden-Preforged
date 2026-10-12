@@ -27,6 +27,7 @@ jobs:
 
       - name: Install NDK and CMake
         run: |
+          sudo apt-get update -q && sudo apt-get install -y -q glslang-tools
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "ndk;28.2.13676358" "cmake;3.31.6" "platforms;android-36"
@@ -59,6 +60,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Provides glslangValidator, needed to compile Eden's host shaders
+      - uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
