@@ -920,8 +920,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Shader timing test: guest shader translation to SPIR-V, done on the GPU thread in game
         const std::chrono::duration<double, std::milli> translate_time{
             std::chrono::steady_clock::now() - translate_start};
-        LOG_INFO(Render_Vulkan, "[ShaderTiming] {:016x} translate {:.2f} ms", hash,
-                 translate_time.count());
+        LOG_INFO(Render_Vulkan, "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x}",
+                 hash, translate_time.count(), fmt::join(key.unique_hashes, ","));
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
