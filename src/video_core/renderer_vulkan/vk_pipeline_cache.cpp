@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
@@ -494,6 +495,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     }
 
     LOG_INFO(Render_Vulkan, "DynamicState setting value: {}", u32(Settings::values.dyna_state.GetValue()));
+    LOG_INFO(Render_Vulkan, "[ShaderTiming] VK_EXT_graphics_pipeline_library available: {}",
+             device.GetAvailableExtensions().contains(
+                 VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME));
 
     dynamic_features = {};
     dynamic_features.driver_id = device.GetDriverID();
@@ -813,6 +817,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel) try {
+    const auto translate_start{std::chrono::steady_clock::now()};
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -910,6 +915,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             modules[stage_index].SetObjectNameEXT(name.c_str());
         }
         previous_stage = &program;
+    }
+    if (build_in_parallel) {
+        // Shader timing test: guest shader translation to SPIR-V, done on the GPU thread in game
+        const std::chrono::duration<double, std::milli> translate_time{
+            std::chrono::steady_clock::now() - translate_start};
+        LOG_INFO(Render_Vulkan, "[ShaderTiming] {:016x} translate {:.2f} ms", hash,
+                 translate_time.count());
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(

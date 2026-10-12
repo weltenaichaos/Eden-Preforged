@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -309,11 +310,20 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
+    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
+                in_game = worker_thread != nullptr] {
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
         try {
+            const auto driver_start{std::chrono::steady_clock::now()};
             MakePipeline(render_pass);
+            if (in_game) {
+                // Shader timing test: the driver's own compile of the finished pipeline
+                const std::chrono::duration<double, std::milli> driver_time{
+                    std::chrono::steady_clock::now() - driver_start};
+                LOG_INFO(Render_Vulkan, "[ShaderTiming] {:016x} driver {:.2f} ms", key.Hash(),
+                         driver_time.count());
+            }
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
             std::scoped_lock lock{build_mutex};
