@@ -683,7 +683,9 @@ struct Values {
 
     SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,
 #if defined(__ANDROID__)
-                                           ExtendedDynamicState::Disabled,
+                                           // EDS1 cuts pipeline variants and renders cleanly on
+                                           // Adreno; EDS2/3 showed major glitches there
+                                           ExtendedDynamicState::EDS1,
 #elif defined(__APPLE__)
                                            ExtendedDynamicState::Disabled,
 #else
