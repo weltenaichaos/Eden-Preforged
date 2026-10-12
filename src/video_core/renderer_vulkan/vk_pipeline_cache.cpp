@@ -632,10 +632,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // Keys queued for building, so entries that collapse onto the same key after retargeting
     // are only built once. Only touched from this thread while the cache file is parsed.
     std::unordered_set<GraphicsPipelineCacheKey> queued_graphics_keys;
+    // Imported caches can repeat compute pipelines too
+    std::unordered_set<ComputePipelineCacheKey> queued_compute_keys;
     size_t retargeted_graphics{};
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        if (!queued_compute_keys.insert(key).second) {
+            return;
+        }
 
         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
