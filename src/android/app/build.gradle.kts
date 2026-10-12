@@ -190,8 +190,10 @@ android {
             isDefault = true
             minSdk = 33
 
-            manifestPlaceholders += mapOf("appNameBase" to "Eden")
-            resValue("string", "app_name_suffixed", "Eden")
+            // Own package ID so it installs alongside official Eden builds
+            applicationId = "dev.preforged.eden_emulator"
+            manifestPlaceholders += mapOf("appNameBase" to "Eden Preforged")
+            resValue("string", "app_name_suffixed", "Eden Preforged")
 
             ndk {
                 abiFilters += listOf("arm64-v8a")
@@ -270,7 +272,7 @@ android {
 
         // apply nightly suffix I/A
         resValue("string", "app_name_suffixed", "$currentName$suffix")
-        resValue("string", "app_name", "Eden$suffix")
+        resValue("string", "app_name", "$currentName$suffix")
     }
 
     sourceSets {
