@@ -119,6 +119,17 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
+    struct CachedShaderCode {
+        u64 unique_hash;
+        Shader::Stage stage;
+        std::vector<u64> code;
+    };
+
+    /// Reads the guest code of every distinct shader stored in a pipeline cache file.
+    /// Pass a private copy of the file: a damaged file is deleted while it is read.
+    [[nodiscard]] static std::vector<CachedShaderCode> ReadCachedShaderCode(
+        const std::filesystem::path& filename, std::stop_token stop_loading);
+
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 

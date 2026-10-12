@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <optional>
+#include <thread>
 
 #include <android/native_window_jni.h>
 #include "common/android/applets/software_keyboard.h"
@@ -88,6 +89,9 @@ private:
     std::unique_ptr<FileSys::ManualContentProvider> m_manual_provider;
     int m_applet_id{1};
     std::optional<u64> m_pending_shader_cache_title;
+
+    // Measures how many cached shaders can be found in the game's files
+    std::jthread m_shader_scan;
 
     // GPU driver parameters
     std::shared_ptr<Common::DynamicLibrary> m_vulkan_library;

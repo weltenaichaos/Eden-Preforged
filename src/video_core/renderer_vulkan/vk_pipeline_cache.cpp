@@ -751,6 +751,39 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 }
 
+std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode(
+    const std::filesystem::path& filename, std::stop_token stop_loading) {
+    std::vector<CachedShaderCode> result;
+    std::unordered_set<u64> seen;
+    const auto add{[&](const FileEnvironment& env) {
+        const std::span<const u64> code{env.Code()};
+        if (code.size() < 2) {
+            return;
+        }
+        // The stored code ends with the terminating instruction, which the unique hash excludes.
+        const u64 hash{Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+                                          (code.size() - 1) * sizeof(u64))};
+        if (seen.insert(hash).second) {
+            result.push_back({hash, env.ShaderStage(), std::vector<u64>(code.begin(), code.end())});
+        }
+    }};
+    VideoCommon::LoadPipelines(
+        stop_loading, filename, CACHE_VERSION,
+        [&](std::ifstream& file, FileEnvironment env) {
+            ComputePipelineCacheKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            add(env);
+        },
+        [&](std::ifstream& file, std::vector<FileEnvironment> envs) {
+            GraphicsPipelineCacheKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            for (const FileEnvironment& env : envs) {
+                add(env);
+            }
+        });
+    return result;
+}
+
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;

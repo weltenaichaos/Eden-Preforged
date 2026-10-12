@@ -92,6 +92,7 @@ extern "C" {
 #include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_amiibo.h"
 #include "jni/native.h"
+#include "jni/shader_file_scan.h"
 #include "video_core/frame_gen/lossless_dll.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -371,6 +372,12 @@ void EmulationSession::ShutdownEmulation() {
     // Enable all controllers
     m_system.HIDCore().SetSupportedStyleTag({Core::HID::NpadStyleSet::All});
 
+    // Stop the shader file scan before the game's files go away.
+    if (m_shader_scan.joinable()) {
+        m_shader_scan.request_stop();
+        m_shader_scan.join();
+    }
+
     // Shutdown the main emulated process
     if (m_load_result == Core::SystemResultStatus::Success) {
         m_system.DetachDebugger();
@@ -416,6 +423,11 @@ void EmulationSession::RunEmulation() {
             m_system.GetApplicationProcessProgramID(), std::stop_token{}, LoadDiskCacheProgress);
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
     }
+
+    m_shader_scan = std::jthread([this, program_id = m_system.GetApplicationProcessProgramID()](
+                                     std::stop_token stop) {
+        RunShaderFileScan(m_system, program_id, stop);
+    });
 
     void(m_system.Run());
 

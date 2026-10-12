@@ -197,6 +197,10 @@ public:
         return cbuf_replacements.size() != 0;
     }
 
+    [[nodiscard]] std::span<const u64> Code() const noexcept {
+        return code;
+    }
+
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
 private:
