@@ -11,6 +11,7 @@
 #include <memory>
 #include <span>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <bit>
 #include <numeric>
@@ -628,6 +629,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
     }
+    // Keys queued for building, so entries that collapse onto the same key after retargeting
+    // are only built once. Only touched from this thread while the cache file is parsed.
+    std::unordered_set<GraphicsPipelineCacheKey> queued_graphics_keys;
+    size_t retargeted_graphics{};
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
@@ -678,6 +683,20 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
+        // The key records the driver it was created with, but nothing else reads those fields.
+        // Entries saved under an older driver (or another machine's) would be built here and then
+        // never match at runtime, so every one of them would recompile mid-game. Retarget them
+        // to the current driver so the preload is actually used.
+        if (key.state.driver_id != dynamic_features.driver_id ||
+            key.state.driver_version != dynamic_features.driver_version) {
+            key.state.driver_id = dynamic_features.driver_id;
+            key.state.driver_version = dynamic_features.driver_version;
+            ++retargeted_graphics;
+        }
+        if (!queued_graphics_keys.insert(key).second) {
+            return;
+        }
+
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
@@ -702,6 +721,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                load_graphics);
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (retargeted_graphics != 0) {
+        LOG_INFO(Render_Vulkan, "Retargeted {} cached pipelines to the current driver",
+                 retargeted_graphics);
+    }
 
     std::unique_lock lock{state.mutex};
     callback(VideoCore::LoadCallbackStage::Build, 0, state.total);
