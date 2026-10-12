@@ -903,6 +903,10 @@
     <string name="minutes_must_be_between_0_and_59">Minutes must be between 0 and 59</string>
     <string name="seconds_must_be_between_0_and_59">Seconds must be between 0 and 59</string>
     <string name="playtime_updated_successfully">Playtime updated successfully</string>
+    <string name="share_shader_cache">Shared shader cache</string>
+    <string name="share_shader_cache_description">Export this game\'s shaders, or import shaders from other players so they build on the loading screen</string>
+    <string name="shader_cache_invalid">This is not an Eden shader cache file</string>
+    <string name="shader_cache_version_mismatch">This shader cache was made by a different Eden version</string>
     <string name="clear_shader_cache">Clear shader cache</string>
     <string name="clear_shader_cache_description">Removes all shaders built while playing this game</string>
     <string name="clear_shader_cache_warning_description">You will experience more stuttering as the shader cache regenerates</string>

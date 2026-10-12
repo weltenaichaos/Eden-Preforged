@@ -471,6 +471,19 @@ class GamePropertiesFragment : Fragment() {
                     DirectoryInitialization.userDirectory +
                         "/cache/shader/" + args.game.settingsName.lowercase()
                 )
+                add(
+                    InstallableProperty(
+                        R.string.share_shader_cache,
+                        R.string.share_shader_cache_description,
+                        R.drawable.ic_graphics,
+                        { importShaderCache.launch(arrayOf("*/*")) },
+                        if (shaderCacheFile.exists()) {
+                            { exportShaderCache.launch("${args.game.title} shaders.bin") }
+                        } else {
+                            null
+                        }
+                    )
+                )
                 if (shaderCacheDir.exists()) {
                     add(
                         SubmenuProperty(
@@ -688,6 +701,102 @@ class GamePropertiesFragment : Fragment() {
         }.show(parentFragmentManager, ProgressDialogFragment.TAG)
     }
 
+    private val shaderCacheFile: File
+        get() = File(
+            DirectoryInitialization.userDirectory + "/cache/shader/" +
+                args.game.settingsName.lowercase() + "/vulkan.bin"
+        )
+
+    /**
+     * Merges a shared Vulkan shader cache into this game's cache. Pipelines already in the cache
+     * are skipped when it loads, so importing several caches collects all of their shaders.
+     */
+    private val importShaderCache = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { result ->
+        if (result == null) {
+            return@registerForActivityResult
+        }
+
+        ProgressDialogFragment.newInstance(
+            requireActivity(),
+            R.string.share_shader_cache,
+            false
+        ) { _, _ ->
+            val message = try {
+                mergeShaderCache(result)
+            } catch (e: Exception) {
+                getString(R.string.import_failed)
+            }
+            withContext(Dispatchers.Main) {
+                homeViewModel.reloadPropertiesList(true)
+            }
+            return@newInstance message
+        }.show(parentFragmentManager, ProgressDialogFragment.TAG)
+    }
+
+    private fun mergeShaderCache(source: android.net.Uri): String {
+        val target = shaderCacheFile
+        requireContext().contentResolver.openInputStream(source)!!.use { input ->
+            val header = ByteArray(SHADER_CACHE_HEADER_SIZE)
+            if (readFully(input, header) != header.size ||
+                !header.copyOfRange(0, SHADER_CACHE_MAGIC.size).contentEquals(SHADER_CACHE_MAGIC)
+            ) {
+                return getString(R.string.shader_cache_invalid)
+            }
+            target.parentFile?.mkdirs()
+            if (target.length() < SHADER_CACHE_HEADER_SIZE) {
+                target.outputStream().use { output ->
+                    output.write(header)
+                    input.copyTo(output)
+                }
+                return getString(R.string.import_success)
+            }
+            val targetHeader = ByteArray(SHADER_CACHE_HEADER_SIZE)
+            target.inputStream().use { readFully(it, targetHeader) }
+            if (!header.contentEquals(targetHeader)) {
+                return getString(R.string.shader_cache_version_mismatch)
+            }
+            java.io.FileOutputStream(target, true).use { output -> input.copyTo(output) }
+        }
+        return getString(R.string.import_success)
+    }
+
+    private fun readFully(input: java.io.InputStream, buffer: ByteArray): Int {
+        var total = 0
+        while (total < buffer.size) {
+            val read = input.read(buffer, total, buffer.size - total)
+            if (read < 0) {
+                break
+            }
+            total += read
+        }
+        return total
+    }
+
+    private val exportShaderCache = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { result ->
+        if (result == null) {
+            return@registerForActivityResult
+        }
+
+        ProgressDialogFragment.newInstance(
+            requireActivity(),
+            R.string.share_shader_cache,
+            false
+        ) { _, _ ->
+            return@newInstance try {
+                requireContext().contentResolver.openOutputStream(result)!!.use { output ->
+                    shaderCacheFile.inputStream().use { it.copyTo(output) }
+                }
+                getString(R.string.export_success)
+            } catch (e: Exception) {
+                getString(R.string.export_failed)
+            }
+        }.show(parentFragmentManager, ProgressDialogFragment.TAG)
+    }
+
     /**
      * Imports an ini file from external storage to internal app directory and override per-game config
      */
@@ -773,3 +882,7 @@ class GamePropertiesFragment : Fragment() {
         }
     }
 }
+
+// Header of Eden's pipeline cache files (vulkan.bin): magic number followed by a u32 version
+private val SHADER_CACHE_MAGIC = "yuzucach".toByteArray(Charsets.US_ASCII)
+private const val SHADER_CACHE_HEADER_SIZE = 12
