@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -53,6 +54,7 @@ constexpr u32 FILTER_BITS = 22;
 constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
+constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
 constexpr u32 NVN_CODE_MAGIC = 0x12345678;
 constexpr size_t NVN_CODE_HEADER_SIZE = 0x30;
 constexpr size_t MAX_SHADER_SIZE = 0x100000;
@@ -714,6 +716,25 @@ public:
                          f.offset);
             }
         }
+        size_t from_programs = 0;
+        for (const auto& key : keys) {
+            from_programs += program_pairs.contains({key.unique_hashes[1], key.unique_hashes[5]});
+        }
+        std::unordered_set<u64> program_vertex;
+        std::unordered_set<u64> program_fragment;
+        for (const auto& [vertex, fragment] : program_pairs) {
+            program_vertex.insert(vertex);
+            program_fragment.insert(fragment);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] programs: {} containers searched, {} pairs from program tables "
+                 "({} vertex, {} fragment shaders), {} of {} played pipelines among them",
+                 program_buffers, program_pairs.size(), program_vertex.size(),
+                 program_fragment.size(), from_programs, keys.size());
+        LOG_INFO(Frontend,
+                 "[ShaderScan] program tables: pointer bases {}, record fields {}, fragment slots {}",
+                 fmt::join(pointer_bases, ","), fmt::join(slot_fields, ","),
+                 fmt::join(fragment_slots, ","));
         size_t multi_state_pairs = 0;
         for (const auto& [pair, states] : states_per_pair) {
             multi_state_pairs += states.size() > 1 ? 1 : 0;
@@ -959,6 +980,8 @@ private:
             headers.emplace_back();
         }
         const u32 file_id = file_it->second;
+        std::unordered_map<u64, HeaderInfo> local_headers;
+        std::vector<u64> bnsh_starts;
         const size_t end = data.size() - NEEDLE_WORDS * sizeof(u64);
         for (size_t pos = 0; pos <= end; pos += 4) {
             if ((pos & 0xFFFFF) == 0 && Stopped()) {
@@ -970,11 +993,15 @@ private:
             }
             if (static_cast<u32>(first) == NVN_CODE_MAGIC) {
                 Extract(data, pos + NVN_CODE_HEADER_SIZE, file_id, base_offset + pos);
+                const auto& file_headers = headers[file_id];
+                if (const auto it = file_headers.find(base_offset + pos);
+                    it != file_headers.end()) {
+                    local_headers.emplace(pos, it->second);
+                }
             }
-            if (static_cast<u32>(first) == BNSH_MAGIC && bnsh_logged < 10) {
-                ++bnsh_logged;
-                LOG_INFO(Frontend, "[ShaderScan] BNSH container in {} at 0x{:x}", name,
-                         base_offset + pos);
+            if ((static_cast<u32>(first) == BNSH_MAGIC || static_cast<u32>(first) == FSHA_MAGIC) &&
+                (pos & 7) == 0) {
+                bnsh_starts.push_back(pos);
             }
             const u64 mixed = Mix(first);
             if ((filter[(mixed & ((1u << FILTER_BITS) - 1)) / 64] & (u64{1} << (mixed % 64))) ==
@@ -999,10 +1026,112 @@ private:
                 }
             }
         }
+        if (!local_headers.empty() && base_offset == 0) {
+            FindPrograms(data, name, local_headers, bnsh_starts);
+        }
         if (hits > 0) {
             auto& stats = hits_per_file[name];
             stats.hits += hits;
             stats.terminators += terminators;
+        }
+    }
+
+    static std::string Hex(std::span<const u8> data, size_t start, size_t length) {
+        std::string out;
+        for (size_t i = start; i < std::min(data.size(), start + length); ++i) {
+            out += fmt::format("{:02x}", data[i]);
+        }
+        return out;
+    }
+
+    // Shader containers (BNSH) describe programs as tables of pointers to per-stage shader
+    // code. Follows those pointers back from each code header to learn which vertex and
+    // fragment shaders the game combines.
+    void FindPrograms(std::span<const u8> data, const std::string& name,
+                      const std::unordered_map<u64, HeaderInfo>& local_headers,
+                      const std::vector<u64>& bnsh_starts) {
+        ++program_buffers;
+        const auto base_of = [&](size_t pos) -> u64 {
+            const auto it = std::upper_bound(bnsh_starts.begin(), bnsh_starts.end(), pos);
+            return it == bnsh_starts.begin() ? 0 : *std::prev(it);
+        };
+        // Pointers to code headers, by where the pointer is stored.
+        std::unordered_map<u64, HeaderInfo> code_pointers;
+        for (size_t pos = 0; pos + 8 <= data.size(); pos += 8) {
+            const u64 value = Load64(data.data() + pos);
+            if (value == 0 || value >= data.size()) {
+                continue;
+            }
+            const u64 base = base_of(pos);
+            for (const u64 candidate_base : {base, u64{0}}) {
+                const auto it = local_headers.find(candidate_base + value);
+                if (it == local_headers.end()) {
+                    continue;
+                }
+                code_pointers.emplace(pos, it->second);
+                ++pointer_bases[candidate_base == 0 ? "buffer" : "container"];
+                if (pointer_examples_logged < 3) {
+                    ++pointer_examples_logged;
+                    LOG_INFO(Frontend,
+                             "[ShaderScan] pointer to code header in {} at 0x{:x} (container "
+                             "0x{:x}): {}",
+                             name, pos, base, Hex(data, pos - std::min<size_t>(pos, 0x40), 0x80));
+                }
+                break;
+            }
+        }
+        if (code_pointers.empty()) {
+            if (pointer_misses_logged < 2) {
+                ++pointer_misses_logged;
+                const u64 first_header = std::min_element(local_headers.begin(), local_headers.end(),
+                                                          [](const auto& a, const auto& b) {
+                                                              return a.first < b.first;
+                                                          })->first;
+                LOG_INFO(Frontend,
+                         "[ShaderScan] no pointers to code headers in {}; container at 0x{:x}: "
+                         "{}; first code header at 0x{:x}: {}",
+                         name, bnsh_starts.empty() ? 0 : bnsh_starts[0],
+                         Hex(data, bnsh_starts.empty() ? 0 : bnsh_starts[0], 0x100), first_header,
+                         Hex(data, first_header - std::min<u64>(first_header, 0x40), 0x80));
+            }
+            return;
+        }
+        // Pointers to the records holding those pointers, which make up each program's table.
+        std::unordered_map<u64, HeaderInfo> stage_slots;
+        for (size_t pos = 0; pos + 8 <= data.size(); pos += 8) {
+            const u64 value = Load64(data.data() + pos);
+            if (value == 0 || value >= data.size()) {
+                continue;
+            }
+            const u64 base = base_of(pos);
+            bool found = false;
+            for (const u64 candidate_base : {base, u64{0}}) {
+                for (u64 field = 0; field <= 0x18 && !found; field += 8) {
+                    const auto it = code_pointers.find(candidate_base + value + field);
+                    if (it == code_pointers.end()) {
+                        continue;
+                    }
+                    stage_slots.emplace(pos, it->second);
+                    ++slot_fields[field];
+                    found = true;
+                }
+                if (found) {
+                    break;
+                }
+            }
+        }
+        for (const auto& [pos, header] : stage_slots) {
+            if (header.stage != Shader::Stage::VertexB) {
+                continue;
+            }
+            for (u64 slot = 1; slot <= 5; ++slot) {
+                const auto it = stage_slots.find(pos + slot * 8);
+                if (it != stage_slots.end() && it->second.stage == Shader::Stage::Fragment) {
+                    program_pairs.insert({header.hash, it->second.hash});
+                    ++fragment_slots[slot];
+                    break;
+                }
+            }
         }
     }
 
@@ -1112,7 +1241,13 @@ private:
     std::vector<std::string> file_names;
     /// Code headers of each file by offset, in the order the game stores them.
     std::vector<std::map<u64, HeaderInfo>> headers;
-    size_t bnsh_logged = 0;
+    size_t program_buffers = 0;
+    size_t pointer_examples_logged = 0;
+    size_t pointer_misses_logged = 0;
+    std::map<std::string, size_t> pointer_bases;
+    std::map<u64, size_t> slot_fields;
+    std::map<u64, size_t> fragment_slots;
+    std::set<std::pair<u64, u64>> program_pairs;
     u32 texture_bound = 2;
     DriverConstants driver_constants;
     size_t extracted_bytes = 0;
@@ -1126,7 +1261,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done_v6";
+    const auto done_marker = shader_dir / "shader_scan_done_v7";
     std::error_code error;
     if (std::filesystem::exists(done_marker, error)) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
