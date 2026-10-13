@@ -38,6 +38,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "video_core/preforged_shaders.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 namespace {
@@ -589,8 +590,8 @@ public:
             }
             try {
                 const std::string real = translate(*shader.env);
-                GuessEnvironment guess{shader.code,   shader.stage,     shader.env->StartAddress(),
-                                       texture_bound, driver_constants};
+                VideoCommon::PreforgedEnvironment guess{shader.code, shader.stage,
+                                                        shader.env->StartAddress(), texture_bound};
                 if (translate(guess) == real) {
                     ++unfolded_same;
                 } else {
@@ -829,6 +830,28 @@ public:
             LOG_INFO(Frontend, "[ShaderScan] translate error x{}: {}", sorted[i].first,
                      sorted[i].second);
         }
+    }
+
+    // Keeps the shader pairs from the game's program tables, for compiling them ahead of time.
+    void SavePrograms(const std::filesystem::path& path) const {
+        VideoCommon::PreforgedPrograms programs;
+        programs.texture_bound = texture_bound;
+        for (const auto& [vertex, fragment] : program_pairs) {
+            const auto vertex_it = extracted.find(vertex);
+            const auto fragment_it = extracted.find(fragment);
+            if (vertex_it == extracted.end() || fragment_it == extracted.end()) {
+                continue;
+            }
+            for (const auto& [hash, shader] : {*vertex_it, *fragment_it}) {
+                programs.shaders.try_emplace(hash, VideoCommon::PreforgedShader{
+                                                       shader.stage, shader.start_address,
+                                                       shader.code});
+            }
+            programs.pairs.emplace_back(vertex, fragment);
+        }
+        const bool written = VideoCommon::WritePreforgedPrograms(path, programs);
+        LOG_INFO(Frontend, "[ShaderScan] saved {} shader pairs with {} shaders: {}",
+                 programs.pairs.size(), programs.shaders.size(), written ? "ok" : "failed");
     }
 
     bool Stopped() const {
@@ -1124,10 +1147,13 @@ private:
             if (header.stage != Shader::Stage::VertexB) {
                 continue;
             }
+            // Programs list their stages as vertex, hull, domain, geometry, pixel, compute.
             for (u64 slot = 1; slot <= 5; ++slot) {
                 const auto it = stage_slots.find(pos + slot * 8);
                 if (it != stage_slots.end() && it->second.stage == Shader::Stage::Fragment) {
-                    program_pairs.insert({header.hash, it->second.hash});
+                    if (slot == 4) {
+                        program_pairs.insert({header.hash, it->second.hash});
+                    }
                     ++fragment_slots[slot];
                     break;
                 }
@@ -1261,7 +1287,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done_v7";
+    const auto done_marker = shader_dir / "shader_scan_done_v8";
     std::error_code error;
     if (std::filesystem::exists(done_marker, error)) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
@@ -1324,6 +1350,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         normal.ParseFilterString(Settings::values.log_filter.GetValue());
         Common::Log::SetGlobalFilter(normal);
     }
+    scanner.SavePrograms(shader_dir / "preforged_programs.bin");
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - start_time);
     LOG_INFO(Frontend, "[ShaderScan] finished in {} s{}", seconds.count(),

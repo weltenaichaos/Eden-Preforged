@@ -221,6 +221,8 @@ add_library(video_core STATIC
 
     shader_cache.cpp
     shader_cache.h
+    preforged_shaders.cpp
+    preforged_shaders.h
     shader_environment.cpp
     shader_environment.h
     shader_notify.cpp

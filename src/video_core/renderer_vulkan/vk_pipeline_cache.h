@@ -138,6 +138,13 @@ public:
     [[nodiscard]] static u64 ShaderStateHash(const GraphicsPipelineCacheKey& key);
 
 private:
+    /// Compiles the shader pairs found in the game files that no cached pipeline uses yet, so the
+    /// driver keeps their compiled code. Pipelines with other states reuse that code.
+    void PrecompilePreforgedPairs(const std::filesystem::path& base_dir,
+                                  std::span<const GraphicsPipelineCacheKey> played_keys,
+                                  std::stop_token stop_loading,
+                                  const VideoCore::DiskResourceLoadCallback& callback);
+
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;

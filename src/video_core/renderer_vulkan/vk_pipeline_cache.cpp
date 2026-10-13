@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <fstream>
+#include <mutex>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -30,6 +31,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/preforged_shaders.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -636,6 +638,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // Keys queued for building, so entries that collapse onto the same key after retargeting
     // are only built once. Only touched from this thread while the cache file is parsed.
     std::unordered_set<GraphicsPipelineCacheKey> queued_graphics_keys;
+    std::vector<GraphicsPipelineCacheKey> played_keys;
     size_t retargeted_graphics{};
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
@@ -700,6 +703,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!queued_graphics_keys.insert(key).second) {
             return;
         }
+        played_keys.push_back(key);
 
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
@@ -736,6 +740,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+
+    PrecompilePreforgedPairs(base_dir, played_keys, stop_loading, callback);
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -815,6 +821,138 @@ u64 PipelineCache::ShaderStateHash(const GraphicsPipelineCacheKey& key) {
                                        : CastAttributeType(state.attributes[index]));
     }
     return Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words));
+}
+
+void PipelineCache::PrecompilePreforgedPairs(
+    const std::filesystem::path& base_dir, std::span<const GraphicsPipelineCacheKey> played_keys,
+    std::stop_token stop_loading, const VideoCore::DiskResourceLoadCallback& callback) {
+    const auto programs_ptr{std::make_shared<std::optional<VideoCommon::PreforgedPrograms>>(
+        VideoCommon::ReadPreforgedPrograms(base_dir / "preforged_programs.bin"))};
+    if (!*programs_ptr || played_keys.empty()) {
+        return;
+    }
+    const VideoCommon::PreforgedPrograms& programs{**programs_ptr};
+    const auto pair_id{[](u64 vertex, u64 fragment) {
+        return (vertex * 0x9E3779B97F4A7C15ULL) ^ fragment;
+    }};
+
+    // Pairs compiled on earlier boots; the driver's pipeline cache keeps their code.
+    const auto warmed_path{base_dir / "preforged_warmed.bin"};
+    std::unordered_set<u64> done;
+    {
+        std::ifstream file{warmed_path, std::ios::binary};
+        u64 id{};
+        while (file.read(reinterpret_cast<char*>(&id), sizeof(id))) {
+            done.insert(id);
+        }
+    }
+
+    // A pair compiled with a state that changes its shaders differently than the game will is
+    // compiled again by the driver, so use a state the game drew this vertex shader with, or
+    // else the state most of its pipelines use.
+    std::unordered_map<u64, const GraphicsPipelineCacheKey*> vertex_templates;
+    std::unordered_map<u64, std::pair<size_t, const GraphicsPipelineCacheKey*>> state_counts;
+    for (const GraphicsPipelineCacheKey& key : played_keys) {
+        done.insert(pair_id(key.unique_hashes[1], key.unique_hashes[5]));
+        if (key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 ||
+            key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0) {
+            continue;
+        }
+        vertex_templates.try_emplace(key.unique_hashes[1], &key);
+        auto& [count, example] = state_counts[ShaderStateHash(key)];
+        ++count;
+        example = &key;
+    }
+    if (state_counts.empty()) {
+        return;
+    }
+    const GraphicsPipelineCacheKey* common_template{};
+    size_t common_count{};
+    for (const auto& [hash, entry] : state_counts) {
+        if (entry.first > common_count) {
+            common_count = entry.first;
+            common_template = entry.second;
+        }
+    }
+
+    std::vector<GraphicsPipelineCacheKey> todo;
+    for (const auto& [vertex, fragment] : programs.pairs) {
+        if (done.contains(pair_id(vertex, fragment)) || !programs.shaders.contains(vertex) ||
+            !programs.shaders.contains(fragment)) {
+            continue;
+        }
+        const auto it{vertex_templates.find(vertex)};
+        GraphicsPipelineCacheKey key{it != vertex_templates.end() ? *it->second : *common_template};
+        key.unique_hashes = {};
+        key.unique_hashes[1] = vertex;
+        key.unique_hashes[5] = fragment;
+        todo.push_back(key);
+        done.insert(pair_id(vertex, fragment));
+    }
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] {} shader pairs from the game files, {} to compile now, {} states seen",
+             programs.pairs.size(), todo.size(), state_counts.size());
+    if (todo.empty()) {
+        return;
+    }
+
+    struct {
+        std::mutex mutex;
+        size_t built{};
+        size_t failed{};
+        size_t slow{};
+        double total_ms{};
+        std::vector<u64> warmed;
+    } state;
+    const auto start{std::chrono::steady_clock::now()};
+    callback(VideoCore::LoadCallbackStage::Build, 0, todo.size());
+    for (const GraphicsPipelineCacheKey& key : todo) {
+        workers.QueueWork([this, key, programs_ptr, pair_id, total = todo.size(), &state,
+                           &callback] {
+            const VideoCommon::PreforgedPrograms& shared{**programs_ptr};
+            const auto& vertex{shared.shaders.at(key.unique_hashes[1])};
+            const auto& fragment{shared.shaders.at(key.unique_hashes[5])};
+            VideoCommon::PreforgedEnvironment vertex_env{vertex.code, vertex.stage,
+                                                         vertex.start_address,
+                                                         shared.texture_bound};
+            VideoCommon::PreforgedEnvironment fragment_env{fragment.code, fragment.stage,
+                                                           fragment.start_address,
+                                                           shared.texture_bound};
+            std::array<Shader::Environment*, 2> envs{&vertex_env, &fragment_env};
+            const auto pipeline_start{std::chrono::steady_clock::now()};
+            bool built{};
+            try {
+                ShaderPools pools;
+                built = CreateGraphicsPipeline(pools, key, envs, nullptr, false) != nullptr;
+            } catch (const std::exception& e) {
+                LOG_DEBUG(Render_Vulkan, "[Preforged] pair failed: {}", e.what());
+            }
+            const std::chrono::duration<double, std::milli> time{
+                std::chrono::steady_clock::now() - pipeline_start};
+            std::scoped_lock lock{state.mutex};
+            if (built) {
+                state.total_ms += time.count();
+                state.slow += time.count() > 5.0 ? 1 : 0;
+                state.warmed.push_back(pair_id(key.unique_hashes[1], key.unique_hashes[5]));
+            } else {
+                ++state.failed;
+            }
+            ++state.built;
+            callback(VideoCore::LoadCallbackStage::Build, state.built, total);
+        });
+    }
+    workers.WaitForRequests(stop_loading);
+
+    std::ofstream file{warmed_path, std::ios::binary | std::ios::app};
+    file.write(reinterpret_cast<const char*>(state.warmed.data()),
+               state.warmed.size() * sizeof(u64));
+    const auto seconds{std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start)};
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] compiled {} shader pairs in {} s ({} failed, {} over 5 ms, {:.1f} ms "
+             "average per pair)",
+             state.warmed.size(), seconds.count(), state.failed, state.slow,
+             state.warmed.empty() ? 0.0 : state.total_ms / state.warmed.size());
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
