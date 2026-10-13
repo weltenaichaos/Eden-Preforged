@@ -1333,7 +1333,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     std::error_code error;
     const auto& options = Common::Preforged::Options();
     if (!options.scan_game_files) {
-        LOG_INFO(Frontend, "[ShaderScan] switched off in preforged_debug.ini");
+        LOG_INFO(Frontend, "[ShaderScan] switched off in the settings");
         return;
     }
     if (std::filesystem::exists(done_marker, error) && !options.rescan_game_files) {

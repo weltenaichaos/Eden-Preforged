@@ -1517,6 +1517,15 @@ class SettingsFragmentPresenter(
 
     private fun addDebugSettings(sl: ArrayList<SettingsItem>) {
         sl.apply {
+            if (!NativeConfig.isPerGameConfigLoaded()) {
+                add(HeaderSetting(R.string.preforged_header))
+                add(BooleanSetting.PREFORGED_BAKE_DRIVER_CONSTANTS.key)
+                add(BooleanSetting.PREFORGED_SCAN_GAME_FILES.key)
+                add(BooleanSetting.PREFORGED_RESCAN_GAME_FILES.key)
+                add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
+                add(BooleanSetting.PREFORGED_LOG_SHADER_COMPILES.key)
+            }
+
             add(HeaderSetting(R.string.gpu))
 
             add(IntSetting.RENDERER_BACKEND.key)

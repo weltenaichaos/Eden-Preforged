@@ -900,7 +900,7 @@ void PipelineCache::PrecompilePreforgedPairs(
              "[Preforged] {} shader pairs from the game files, {} to compile now, {} states seen",
              programs.pairs.size(), todo.size(), state_counts.size());
     if (!Common::Preforged::Options().precompile_game_shaders) {
-        LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in preforged_debug.ini");
+        LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in the settings");
         return;
     }
     if (todo.empty()) {

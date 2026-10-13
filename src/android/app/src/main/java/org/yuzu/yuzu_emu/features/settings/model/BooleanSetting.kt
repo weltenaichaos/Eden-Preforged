@@ -81,6 +81,11 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     SHOW_SHADERS_BUILDING("show_shaders_building"),
 
     DEBUG_FLUSH_BY_LINE("flush_line"),
+    PREFORGED_BAKE_DRIVER_CONSTANTS("preforged_bake_driver_constants"),
+    PREFORGED_SCAN_GAME_FILES("preforged_scan_game_files"),
+    PREFORGED_RESCAN_GAME_FILES("preforged_rescan_game_files"),
+    PREFORGED_PRECOMPILE_GAME_SHADERS("preforged_precompile_game_shaders"),
+    PREFORGED_LOG_SHADER_COMPILES("preforged_log_shader_compiles"),
     EXTENDED_LOGGING("extended_logging"),
     DONT_SHOW_DRIVER_SHADER_WARNING("dont_show_driver_shader_warning"),
     ENABLE_OVERLAY("enable_overlay"),

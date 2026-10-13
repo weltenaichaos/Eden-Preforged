@@ -654,6 +654,17 @@
     <string name="fastmem">Fastmem</string>
 
     <string name="log">Logging</string>
+    <string name="preforged_header">Eden Preforged</string>
+    <string name="preforged_bake_driver_constants">Bake constant buffer into shaders</string>
+    <string name="preforged_bake_driver_constants_description">Bakes constant buffer 1 values into shaders like upstream Eden. Off lets shaders from the game files match the game\'s own. Restart the game after changing.</string>
+    <string name="preforged_scan_game_files">Search game files for shaders</string>
+    <string name="preforged_scan_game_files_description">Searches each game\'s files for shaders once, on its first start.</string>
+    <string name="preforged_rescan_game_files">Search game files on every start</string>
+    <string name="preforged_rescan_game_files_description">Repeats the game file search on every start while on. Takes a few minutes.</string>
+    <string name="preforged_precompile_game_shaders">Compile shaders from game files</string>
+    <string name="preforged_precompile_game_shaders_description">Compiles the shader pairs found in the game files while the game loads, so they do not stutter later.</string>
+    <string name="preforged_log_shader_compiles">Log shader compiles</string>
+    <string name="preforged_log_shader_compiles_description">Logs every shader compile during play with its timing and where its shaders came from.</string>
     <string name="flush_by_line">Flush debug logs by line</string>
     <string name="flush_by_line_description">Flushes debugging logs on each line written, making debugging easier in cases of crashing or freezing.</string>
     <string name="extended_logging">Enable extended logging</string>

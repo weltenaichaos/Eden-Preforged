@@ -273,8 +273,7 @@ void EmulationSession::InitializeSystem(bool reload) {
     }
 
     // Read on every game start, so a changed switch only needs the game restarted.
-    Common::Preforged::LoadOptions(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) /
-                                   "preforged_debug.ini");
+    Common::Preforged::LoadOptions();
     Shader::Optimization::SetDriverConstBufferFolding(
         Common::Preforged::Options().bake_driver_constants);
 

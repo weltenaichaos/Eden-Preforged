@@ -3,11 +3,9 @@
 
 #pragma once
 
-#include <filesystem>
-
 namespace Common::Preforged {
 
-/// Switches for testing Eden Preforged without a new build, read from a text file at startup.
+/// Switches for testing Eden Preforged without a new build, set in the debug settings.
 struct DebugOptions {
     /// Bakes the values of constant buffer 1 into shaders, as upstream Eden does. Off makes
     /// shaders built from the game files match the game's own.
@@ -24,7 +22,7 @@ struct DebugOptions {
 
 [[nodiscard]] DebugOptions& Options();
 
-/// Reads the options from the file, or writes the file with the defaults when it is missing.
-void LoadOptions(const std::filesystem::path& path);
+/// Takes the switches from the settings and logs them. Call when a game starts.
+void LoadOptions();
 
 } // namespace Common::Preforged

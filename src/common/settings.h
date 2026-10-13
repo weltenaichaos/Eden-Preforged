@@ -927,6 +927,13 @@ struct Values {
     // Miscellaneous
     Setting<std::string> log_filter{linkage, "*:Info", "log_filter", Category::Miscellaneous};
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
+
+    // Eden Preforged test switches
+    Setting<bool> preforged_bake_driver_constants{linkage, false, "preforged_bake_driver_constants", Category::Miscellaneous};
+    Setting<bool> preforged_scan_game_files{linkage, true, "preforged_scan_game_files", Category::Miscellaneous};
+    Setting<bool> preforged_rescan_game_files{linkage, false, "preforged_rescan_game_files", Category::Miscellaneous};
+    Setting<bool> preforged_precompile_game_shaders{linkage, true, "preforged_precompile_game_shaders", Category::Miscellaneous};
+    Setting<bool> preforged_log_shader_compiles{linkage, true, "preforged_log_shader_compiles", Category::Miscellaneous};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
 
