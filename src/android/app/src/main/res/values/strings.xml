@@ -654,6 +654,16 @@
     <string name="fastmem">Fastmem</string>
 
     <string name="log">Logging</string>
+    <string name="preforged_header">Eden Preforged</string>
+    <string name="preforged_update">Update Eden Preforged</string>
+    <string name="preforged_update_description">Downloads and installs the newest test build</string>
+    <string name="preforged_update_installed">Installed: build %1$d</string>
+    <string name="preforged_update_checking">Looking for a newer build…</string>
+    <string name="preforged_update_check_failed">Couldn\'t reach GitHub to look for a newer build. Check the internet connection and try again.</string>
+    <string name="preforged_update_newest">Build %1$d is installed, which is the newest.</string>
+    <string name="preforged_update_available">Build %1$d is available. You have build %2$d.\n\n%3$s</string>
+    <string name="preforged_update_install">Install</string>
+    <string name="preforged_update_downloading">Downloading build %1$d</string>
     <string name="flush_by_line">Flush debug logs by line</string>
     <string name="flush_by_line_description">Flushes debugging logs on each line written, making debugging easier in cases of crashing or freezing.</string>
     <string name="extended_logging">Enable extended logging</string>
