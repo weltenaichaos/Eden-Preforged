@@ -34,11 +34,12 @@ using CachedShaderCode = Vulkan::PipelineCache::CachedShaderCode;
 
 constexpr size_t SPH_SIZE = 0x50;
 constexpr size_t NEEDLE_WORDS = 4;
-constexpr size_t MAX_WHOLE_FILE = 256ULL << 20;
+constexpr size_t MAX_WHOLE_FILE = 64ULL << 20;
 constexpr size_t CHUNK_SIZE = 64ULL << 20;
 constexpr size_t CHUNK_OVERLAP = 1ULL << 20;
-constexpr size_t MAX_DECOMPRESSED = 512ULL << 20;
+constexpr size_t MAX_DECOMPRESSED = 256ULL << 20;
 constexpr u32 FILTER_BITS = 22;
+constexpr auto TIME_LIMIT = std::chrono::minutes{3};
 constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
 constexpr u64 SELF_BRANCH_B = 0xE2400FFFFF07000FULL;
 
@@ -171,8 +172,9 @@ std::vector<u8> Decompress(std::span<const u8> data) {
 
 class Scanner {
 public:
-    explicit Scanner(std::vector<CachedShaderCode> shaders_, std::stop_token stop_)
-        : shaders{std::move(shaders_)}, stop{stop_}, filter((size_t{1} << FILTER_BITS) / 64),
+    explicit Scanner(std::vector<CachedShaderCode> shaders_, std::stop_token stop_,
+                     std::chrono::steady_clock::time_point deadline_)
+        : shaders{std::move(shaders_)}, stop{stop_}, deadline{deadline_}, filter((size_t{1} << FILTER_BITS) / 64),
           results(shaders.size()) {
         for (size_t index = 0; index < shaders.size(); ++index) {
             const auto& shader = shaders[index];
@@ -188,11 +190,11 @@ public:
     }
 
     void ScanDir(const FileSys::VirtualDir& dir, const std::string& path, bool shader_files) {
-        if (!dir || stop.stop_requested()) {
+        if (!dir || Stopped()) {
             return;
         }
         for (const auto& file : dir->GetFiles()) {
-            if (stop.stop_requested()) {
+            if (Stopped()) {
                 return;
             }
             const std::string name = path + "/" + file->GetName();
@@ -247,6 +249,10 @@ public:
         }
         LOG_INFO(Frontend, "[ShaderScan] files with hits: {}, shaders in them (estimate): {}",
                  hits_per_file.size(), total_terminators);
+    }
+
+    bool Stopped() const {
+        return stop.stop_requested() || std::chrono::steady_clock::now() > deadline;
     }
 
     bool AllFound() const {
@@ -318,7 +324,7 @@ private:
             ScanBuffer(data, name, 0);
         } else {
             std::vector<u8> chunk;
-            for (size_t offset = 0; offset < size && !stop.stop_requested();
+            for (size_t offset = 0; offset < size && !Stopped();
                  offset += CHUNK_SIZE) {
                 const size_t length = std::min(size - offset, CHUNK_SIZE + CHUNK_OVERLAP);
                 chunk = file->ReadBytes(length, offset);
@@ -330,7 +336,7 @@ private:
     }
 
     void ScanBuffer(std::span<const u8> data, const std::string& name, int depth) {
-        if (stop.stop_requested() || depth > 4) {
+        if (Stopped() || depth > 4) {
             return;
         }
         if (std::vector<u8> decompressed = Decompress(data); !decompressed.empty()) {
@@ -390,7 +396,7 @@ private:
         size_t terminators = 0;
         const size_t end = data.size() - NEEDLE_WORDS * sizeof(u64);
         for (size_t pos = 0; pos <= end; pos += 4) {
-            if ((pos & 0xFFFFF) == 0 && stop.stop_requested()) {
+            if ((pos & 0xFFFFF) == 0 && Stopped()) {
                 return;
             }
             const u64 first = Load64(data.data() + pos);
@@ -474,6 +480,7 @@ private:
 
     std::vector<CachedShaderCode> shaders;
     std::stop_token stop;
+    std::chrono::steady_clock::time_point deadline;
     std::vector<u64> filter;
     std::unordered_map<u64, std::vector<size_t>> needles;
     std::vector<Result> results;
@@ -487,15 +494,19 @@ private:
 } // namespace
 
 void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token stop) {
-    Common::SetCurrentThreadName("ShaderScan");
-    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
     const auto start_time = std::chrono::steady_clock::now();
-
-    // Read from a copy, because the live cache file is appended to while the game runs.
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto copy = shader_dir / "shader_scan_copy.bin";
+    const auto done_marker = shader_dir / "shader_scan_done";
     std::error_code error;
+    if (std::filesystem::exists(done_marker, error)) {
+        LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
+                 Common::FS::PathToUTF8String(done_marker));
+        return;
+    }
+
+    // Read from a copy, because a damaged cache file is deleted while it is read.
+    const auto copy = shader_dir / "shader_scan_copy.bin";
     std::filesystem::copy_file(shader_dir / "vulkan.bin", copy,
                                std::filesystem::copy_options::overwrite_existing, error);
     if (error) {
@@ -521,15 +532,18 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     }
     LOG_INFO(Frontend, "[ShaderScan] searching game files for {} cached shaders", shaders.size());
 
-    Scanner scanner{std::move(shaders), stop};
+    // Mark the scan as done up front, so a crash during it never blocks the game twice.
+    void(Common::FS::NewFile(done_marker));
+
+    Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
     scanner.ScanDir(root, "", true);
     scanner.Report("shader-named files");
-    if (!scanner.AllFound() && !stop.stop_requested()) {
+    if (!scanner.AllFound() && !scanner.Stopped()) {
         scanner.ScanDir(root, "", false);
         scanner.Report("all files");
     }
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - start_time);
     LOG_INFO(Frontend, "[ShaderScan] finished in {} s{}", seconds.count(),
-             stop.stop_requested() ? " (stopped early)" : "");
+             scanner.Stopped() ? " (stopped at the time limit)" : "");
 }

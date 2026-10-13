@@ -372,12 +372,6 @@ void EmulationSession::ShutdownEmulation() {
     // Enable all controllers
     m_system.HIDCore().SetSupportedStyleTag({Core::HID::NpadStyleSet::All});
 
-    // Stop the shader file scan before the game's files go away.
-    if (m_shader_scan.joinable()) {
-        m_shader_scan.request_stop();
-        m_shader_scan.join();
-    }
-
     // Shutdown the main emulated process
     if (m_load_result == Core::SystemResultStatus::Success) {
         m_system.DetachDebugger();
@@ -424,10 +418,10 @@ void EmulationSession::RunEmulation() {
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
     }
 
-    m_shader_scan = std::jthread([this, program_id = m_system.GetApplicationProcessProgramID()](
-                                     std::stop_token stop) {
-        RunShaderFileScan(m_system, program_id, stop);
-    });
+    // Runs before the game starts: the game's file layers are not safe to read from two threads.
+    LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
+    RunShaderFileScan(m_system, m_system.GetApplicationProcessProgramID(), std::stop_token{});
+    LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
 
     void(m_system.Run());
 
