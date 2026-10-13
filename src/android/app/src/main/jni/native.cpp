@@ -418,7 +418,10 @@ void EmulationSession::RunEmulation() {
                           LoadDiskCacheProgress(VideoCore::LoadCallbackStage::ScanGameFiles,
                                                 static_cast<int>(done), static_cast<int>(total));
                       });
-    LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
+    // The loading screen stays up while the disk cache loads right after.
+    if (!Settings::values.use_disk_shader_cache.GetValue()) {
+        LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
+    }
 
     // Load the disk shader cache.
     if (Settings::values.use_disk_shader_cache.GetValue()) {
