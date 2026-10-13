@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -394,10 +395,45 @@ public:
                 continue;
             }
             ScanFile(file, name);
+            ++files_visited;
+            ReportProgress(false);
         }
         for (const auto& subdir : dir->GetSubdirectories()) {
             ScanDir(subdir, path + "/" + subdir->GetName(), shader_files);
         }
+    }
+
+    // Counts the files the two passes of ScanDir visit, for the progress bar.
+    static size_t CountFiles(const FileSys::VirtualDir& dir, const std::string& path) {
+        if (!dir) {
+            return 0;
+        }
+        size_t count = 0;
+        for (const auto& file : dir->GetFiles()) {
+            count += IsMedia(path + "/" + file->GetName()) ? 0 : 1;
+        }
+        for (const auto& subdir : dir->GetSubdirectories()) {
+            count += CountFiles(subdir, path + "/" + subdir->GetName());
+        }
+        return count;
+    }
+
+    void SetProgress(const std::function<void(size_t, size_t)>* callback, size_t total) {
+        progress_callback = callback;
+        total_files = total;
+    }
+
+    void ReportProgress(bool force) {
+        if (!progress_callback || !*progress_callback) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - last_progress_report < std::chrono::milliseconds{250}) {
+            return;
+        }
+        last_progress_report = now;
+        // Stays one short of the end until the shaders are processed too.
+        (*progress_callback)(std::min(files_visited, total_files - 1), total_files);
     }
 
     void Report(std::string_view phase) const {
@@ -1267,6 +1303,10 @@ private:
     std::vector<std::string> file_names;
     /// Code headers of each file by offset, in the order the game stores them.
     std::vector<std::map<u64, HeaderInfo>> headers;
+    const std::function<void(size_t, size_t)>* progress_callback = nullptr;
+    size_t total_files = 1;
+    size_t files_visited = 0;
+    std::chrono::steady_clock::time_point last_progress_report{};
     size_t program_buffers = 0;
     size_t pointer_examples_logged = 0;
     size_t pointer_misses_logged = 0;
@@ -1283,7 +1323,8 @@ private:
 
 } // namespace
 
-void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token stop) {
+void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token stop,
+                       const std::function<void(std::size_t, std::size_t)>& progress) {
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
@@ -1327,6 +1368,8 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     void(Common::FS::NewFile(done_marker));
 
     Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
+    scanner.SetProgress(&progress, std::max<size_t>(Scanner::CountFiles(root, "") + 1, 2));
+    scanner.ReportProgress(true);
     scanner.ScanDir(root, "", true);
     scanner.Report("shader-named files");
     if (!scanner.Stopped()) {
@@ -1351,6 +1394,9 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         Common::Log::SetGlobalFilter(normal);
     }
     scanner.SavePrograms(shader_dir / "preforged_programs.bin");
+    if (progress) {
+        progress(1, 1);
+    }
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - start_time);
     LOG_INFO(Frontend, "[ShaderScan] finished in {} s{}", seconds.count(),

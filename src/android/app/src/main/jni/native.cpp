@@ -413,7 +413,11 @@ void EmulationSession::RunEmulation() {
     // Runs before the game starts: the game's file layers are not safe to read from two threads.
     // Runs before the disk cache loads, which compiles the shader pairs the scan finds.
     LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
-    RunShaderFileScan(m_system, m_system.GetApplicationProcessProgramID(), std::stop_token{});
+    RunShaderFileScan(m_system, m_system.GetApplicationProcessProgramID(), std::stop_token{},
+                      [](std::size_t done, std::size_t total) {
+                          LoadDiskCacheProgress(VideoCore::LoadCallbackStage::ScanGameFiles,
+                                                static_cast<int>(done), static_cast<int>(total));
+                      });
     LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
 
     // Load the disk shader cache.

@@ -905,7 +905,7 @@ void PipelineCache::PrecompilePreforgedPairs(
         std::vector<u64> warmed;
     } state;
     const auto start{std::chrono::steady_clock::now()};
-    callback(VideoCore::LoadCallbackStage::Build, 0, todo.size());
+    callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, todo.size());
     for (const GraphicsPipelineCacheKey& key : todo) {
         workers.QueueWork([this, key, programs_ptr, pair_id, total = todo.size(), &state,
                            &callback] {
@@ -938,7 +938,7 @@ void PipelineCache::PrecompilePreforgedPairs(
                 ++state.failed;
             }
             ++state.built;
-            callback(VideoCore::LoadCallbackStage::Build, state.built, total);
+            callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, state.built, total);
         });
     }
     workers.WaitForRequests(stop_loading);

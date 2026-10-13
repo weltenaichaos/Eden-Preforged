@@ -1244,6 +1244,8 @@
 
     <!-- Disk shader cache -->
     <string name="building_shaders">Building shaders</string>
+    <string name="scanning_game_files">Searching game files for shaders (first start only)</string>
+    <string name="precompiling_game_shaders">Compiling shaders from game files (first start only)</string>
 
     <!-- App options -->
     <string name="change_app_theme">Change app theme</string>

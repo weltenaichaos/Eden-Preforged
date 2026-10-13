@@ -40,12 +40,23 @@ object DiskShaderCacheProgress {
                 )
 
                 LoadCallbackStage.Complete -> {}
+                LoadCallbackStage.ScanGameFiles -> emulationViewModel.updateProgress(
+                    emulationActivity.getString(R.string.scanning_game_files),
+                    progress,
+                    max
+                )
+
+                LoadCallbackStage.PrecompileGameShaders -> emulationViewModel.updateProgress(
+                    emulationActivity.getString(R.string.precompiling_game_shaders),
+                    progress,
+                    max
+                )
             }
         }
     }
 
     // Equivalent to VideoCore::LoadCallbackStage
     enum class LoadCallbackStage {
-        Prepare, Build, Complete
+        Prepare, Build, Complete, ScanGameFiles, PrecompileGameShaders
     }
 }
