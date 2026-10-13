@@ -209,6 +209,11 @@ public:
         return cbuf_values.size();
     }
 
+    /// Constant buffer reads, keyed by buffer index in the upper 32 bits and offset in the lower.
+    [[nodiscard]] const auto& CbufValues() const noexcept {
+        return cbuf_values;
+    }
+
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
 private:

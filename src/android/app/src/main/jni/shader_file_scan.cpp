@@ -211,13 +211,26 @@ std::optional<Shader::Stage> StageFromHeader(const Shader::ProgramHeader& sph) {
     }
 }
 
+using DriverConstants = std::unordered_map<u64, u32>;
+
+// What a guessing environment may take from the real one, to find out which guess differs.
+struct RealParts {
+    bool cbuf = false;
+    bool textures = false;
+    bool misc = false;
+};
+
 // An environment for a shader taken from the game files, where nothing about the running game is
-// known: every texture is guessed to be 2D and every constant buffer read returns zero.
+// known: every texture is guessed to be 2D, reads of the driver's constant buffer come from values
+// seen in other shaders, and every other constant buffer read returns zero. For testing, parts can
+// be taken from the environment the game really used.
 class GuessEnvironment final : public Shader::Environment {
 public:
     explicit GuessEnvironment(std::span<const u64> code_, Shader::Stage stage_, u32 start_address_,
-                              u32 texture_bound_)
-        : code{code_}, texture_bound{texture_bound_} {
+                              u32 texture_bound_, const DriverConstants& driver_constants_,
+                              Shader::Environment* real_ = nullptr, RealParts parts_ = {})
+        : code{code_}, texture_bound{texture_bound_}, driver_constants{driver_constants_},
+          real{real_}, parts{parts_} {
         stage = stage_;
         start_address = start_address_;
         is_proprietary_driver = texture_bound == 2;
@@ -235,38 +248,63 @@ public:
         }
         return code[index];
     }
-    u32 ReadCbufValue(u32, u32) override {
-        return 0;
+    u32 ReadCbufValue(u32 index, u32 offset) override {
+        if (parts.cbuf) {
+            try {
+                return real->ReadCbufValue(index, offset);
+            } catch (const std::exception&) {
+            }
+        }
+        const auto it = driver_constants.find((u64{index} << 32) | offset);
+        return it != driver_constants.end() ? it->second : 0;
     }
-    Shader::TextureType ReadTextureType(u32) override {
+    Shader::TextureType ReadTextureType(u32 handle) override {
+        if (parts.textures) {
+            try {
+                return real->ReadTextureType(handle);
+            } catch (const std::exception&) {
+            }
+        }
         return Shader::TextureType::Color2D;
     }
-    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        if (parts.textures) {
+            try {
+                return real->ReadTexturePixelFormat(handle);
+            } catch (const std::exception&) {
+            }
+        }
         return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
     }
-    bool IsTexturePixelFormatInteger(u32) override {
+    bool IsTexturePixelFormatInteger(u32 handle) override {
+        if (parts.textures) {
+            try {
+                return real->IsTexturePixelFormatInteger(handle);
+            } catch (const std::exception&) {
+            }
+        }
         return false;
     }
     u32 ReadViewportTransformState() override {
-        return 1;
+        return parts.misc ? real->ReadViewportTransformState() : 1;
     }
     u32 TextureBoundBuffer() const override {
         return texture_bound;
     }
     u32 LocalMemorySize() const override {
-        return local_memory_size;
+        return parts.misc ? real->LocalMemorySize() : local_memory_size;
     }
     u32 SharedMemorySize() const override {
-        return 0x8000;
+        return parts.misc ? real->SharedMemorySize() : 0x8000;
     }
     std::array<u32, 3> WorkgroupSize() const override {
-        return {64, 1, 1};
+        return parts.misc ? real->WorkgroupSize() : std::array<u32, 3>{64, 1, 1};
     }
     bool HasHLEMacroState() const override {
-        return false;
+        return parts.misc && real->HasHLEMacroState();
     }
-    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
-        return std::nullopt;
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override {
+        return parts.misc ? real->GetReplaceConstBuffer(bank, offset) : std::nullopt;
     }
     void Dump(u64, u64) override {}
 
@@ -274,6 +312,9 @@ private:
     std::span<const u64> code;
     u32 texture_bound;
     u32 local_memory_size = 0;
+    const DriverConstants& driver_constants;
+    Shader::Environment* real;
+    RealParts parts;
 };
 
 class Scanner {
@@ -308,6 +349,26 @@ public:
         }
         LOG_INFO(Frontend, "[ShaderScan] game uses constant buffer {} for bindless textures",
                  texture_bound);
+
+        // The official driver keeps its own values in constant buffer 1, the same for every
+        // shader, so values read by cached shaders can stand in for shaders not seen yet.
+        size_t conflicts = 0;
+        for (const auto& shader : shaders) {
+            if (!shader.env) {
+                continue;
+            }
+            for (const auto& [key, value] : shader.env->CbufValues()) {
+                if ((key >> 32) != 1) {
+                    continue;
+                }
+                const auto [it, inserted] = driver_constants.emplace(key, value);
+                if (!inserted && it->second != value) {
+                    ++conflicts;
+                }
+            }
+        }
+        LOG_INFO(Frontend, "[ShaderScan] driver constants seen: {}, conflicting values: {}",
+                 driver_constants.size(), conflicts);
     }
 
     void ScanDir(const FileSys::VirtualDir& dir, const std::string& path, bool shader_files) {
@@ -446,10 +507,20 @@ public:
             pools.ReleaseContents();
             return dump;
         };
-        size_t same = 0;
-        size_t different = 0;
+        struct Variant {
+            std::string_view name;
+            RealParts parts;
+            size_t same = 0;
+            size_t different = 0;
+            size_t failed = 0;
+        };
+        std::array<Variant, 4> variants{{
+            {"all guessed", {}},
+            {"real constant buffers", {.cbuf = true}},
+            {"real textures", {.textures = true}},
+            {"real everything through the guess path", {.cbuf = true, .textures = true, .misc = true}},
+        }};
         size_t real_failed = 0;
-        size_t guess_failed = 0;
         size_t logged = 0;
         for (const auto& shader : shaders) {
             if (!shader.env) {
@@ -463,30 +534,37 @@ public:
                 ++real_failed;
                 continue;
             }
-            try {
-                GuessEnvironment guess{shader.code, shader.stage, shader.env->StartAddress(),
-                                       texture_bound};
-                if (translate(guess) == real) {
-                    ++same;
-                } else {
-                    ++different;
-                    if (logged++ < 5) {
-                        LOG_INFO(Frontend,
-                                 "[ShaderScan] guess differs for {:016x} stage {}: {} textures, "
-                                 "{} constant buffer reads",
-                                 shader.unique_hash, static_cast<u32>(shader.stage),
-                                 shader.texture_types.size(), shader.cbuf_value_count);
+            for (auto& variant : variants) {
+                try {
+                    GuessEnvironment guess{shader.code,     shader.stage, shader.env->StartAddress(),
+                                           texture_bound,   driver_constants, shader.env.get(),
+                                           variant.parts};
+                    if (translate(guess) == real) {
+                        ++variant.same;
+                    } else {
+                        ++variant.different;
+                        if (&variant == &variants[0] && logged++ < 5) {
+                            LOG_INFO(Frontend,
+                                     "[ShaderScan] guess differs for {:016x} stage {}: {} "
+                                     "textures, {} constant buffer reads",
+                                     shader.unique_hash, static_cast<u32>(shader.stage),
+                                     shader.texture_types.size(), shader.cbuf_value_count);
+                        }
                     }
+                } catch (const std::exception&) {
+                    pools.ReleaseContents();
+                    ++variant.failed;
                 }
-            } catch (const std::exception&) {
-                pools.ReleaseContents();
-                ++guess_failed;
             }
         }
-        LOG_INFO(Frontend,
-                 "[ShaderScan] guesses vs runtime on cached shaders: {} identical, {} different, "
-                 "{} guess failed, {} runtime failed",
-                 same, different, guess_failed, real_failed);
+        for (const auto& variant : variants) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] {} vs runtime on cached shaders: {} identical, {} different, "
+                     "{} failed",
+                     variant.name, variant.same, variant.different, variant.failed);
+        }
+        LOG_INFO(Frontend, "[ShaderScan] runtime translation failed for {} cached shaders",
+                 real_failed);
     }
 
     static Shader::HostTranslateInfo MakeHostInfo() {
@@ -515,7 +593,8 @@ public:
             auto& counts = by_stage[static_cast<u32>(shader.stage)];
             ++counts.first;
             try {
-                GuessEnvironment env{shader.code, shader.stage, shader.start_address, texture_bound};
+                GuessEnvironment env{shader.code, shader.stage, shader.start_address, texture_bound,
+                                     driver_constants};
                 const u32 cfg_offset =
                     shader.start_address +
                     (shader.stage == Shader::Stage::Compute ? 0 : sizeof(Shader::ProgramHeader));
@@ -834,6 +913,7 @@ private:
     std::unordered_map<u64, ExtractedShader> extracted;
     std::unordered_set<u64> self_branch_hashes;
     u32 texture_bound = 2;
+    DriverConstants driver_constants;
     size_t extracted_bytes = 0;
     size_t code_headers = 0;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
@@ -845,7 +925,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done_v3";
+    const auto done_marker = shader_dir / "shader_scan_done_v4";
     std::error_code error;
     if (std::filesystem::exists(done_marker, error)) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",

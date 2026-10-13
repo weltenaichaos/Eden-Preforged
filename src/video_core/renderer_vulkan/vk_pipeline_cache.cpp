@@ -757,12 +757,13 @@ std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode
     std::unordered_set<u64> seen;
     const auto add{[&](FileEnvironment& env) {
         const std::span<const u64> code{env.Code()};
-        if (code.size() < 2) {
+        if (code.size() < 3) {
             return;
         }
-        // The stored code ends with the terminating instruction, which the unique hash excludes.
+        // The unique hash covers the code up to the terminating instruction. Pipelines store the
+        // cached size, which adds the terminator, plus one more word from SetCachedSize.
         const u64 hash{Common::CityHash64(reinterpret_cast<const char*>(code.data()),
-                                          (code.size() - 1) * sizeof(u64))};
+                                          (code.size() - 2) * sizeof(u64))};
         if (seen.insert(hash).second) {
             std::vector<Shader::TextureType> texture_types;
             for (const auto& [handle, type] : env.TextureTypes()) {
