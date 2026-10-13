@@ -7,14 +7,18 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
+#include "common/cityhash.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -26,6 +30,10 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "jni/shader_file_scan.h"
+#include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/host_translate_info.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 namespace {
@@ -39,7 +47,12 @@ constexpr size_t CHUNK_SIZE = 64ULL << 20;
 constexpr size_t CHUNK_OVERLAP = 1ULL << 20;
 constexpr size_t MAX_DECOMPRESSED = 256ULL << 20;
 constexpr u32 FILTER_BITS = 22;
-constexpr auto TIME_LIMIT = std::chrono::minutes{3};
+constexpr auto TIME_LIMIT = std::chrono::minutes{4};
+constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
+constexpr u32 NVN_CODE_MAGIC = 0x12345678;
+constexpr size_t NVN_CODE_HEADER_SIZE = 0x30;
+constexpr size_t MAX_SHADER_SIZE = 0x100000;
+constexpr size_t MAX_EXTRACTED_BYTES = 256ULL << 20;
 constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
 constexpr u64 SELF_BRANCH_B = 0xE2400FFFFF07000FULL;
 
@@ -170,6 +183,92 @@ std::vector<u8> Decompress(std::span<const u8> data) {
     return {};
 }
 
+struct ExtractedShader {
+    Shader::Stage stage;
+    std::vector<u64> code; ///< Starts at the program header for graphics stages
+};
+
+// Reads the stage from a program header, if the words look like one.
+std::optional<Shader::Stage> StageFromHeader(const Shader::ProgramHeader& sph) {
+    const u32 sph_type = sph.common0.sph_type;
+    switch (static_cast<u32>(sph.common0.shader_type)) {
+    case 1:
+        return sph_type == 1 ? std::optional{Shader::Stage::VertexB} : std::nullopt;
+    case 2:
+        return sph_type == 1 ? std::optional{Shader::Stage::TessellationControl} : std::nullopt;
+    case 3:
+        return sph_type == 1 ? std::optional{Shader::Stage::TessellationEval} : std::nullopt;
+    case 4:
+        return sph_type == 1 ? std::optional{Shader::Stage::Geometry} : std::nullopt;
+    case 5:
+        return sph_type == 2 ? std::optional{Shader::Stage::Fragment} : std::nullopt;
+    default:
+        return std::nullopt;
+    }
+}
+
+// An environment for a shader taken from the game files, where nothing about the running game is
+// known: every texture is guessed to be 2D and every constant buffer read returns zero.
+class GuessEnvironment final : public Shader::Environment {
+public:
+    explicit GuessEnvironment(const ExtractedShader& shader) : code{shader.code} {
+        stage = shader.stage;
+        start_address = 0;
+        is_proprietary_driver = true;
+        if (stage != Shader::Stage::Compute) {
+            std::memcpy(&sph, code.data(), sizeof(sph));
+            local_memory_size = static_cast<u32>(sph.LocalMemorySize()) +
+                                sph.common3.shader_local_memory_crs_size;
+        }
+    }
+
+    u64 ReadInstruction(u32 address) override {
+        const size_t index = address / sizeof(u64);
+        if (index >= code.size()) {
+            throw Shader::LogicError("Read past the end of the shader");
+        }
+        return code[index];
+    }
+    u32 ReadCbufValue(u32, u32) override {
+        return 0;
+    }
+    Shader::TextureType ReadTextureType(u32) override {
+        return Shader::TextureType::Color2D;
+    }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+    }
+    bool IsTexturePixelFormatInteger(u32) override {
+        return false;
+    }
+    u32 ReadViewportTransformState() override {
+        return 1;
+    }
+    u32 TextureBoundBuffer() const override {
+        return 2;
+    }
+    u32 LocalMemorySize() const override {
+        return local_memory_size;
+    }
+    u32 SharedMemorySize() const override {
+        return 0x8000;
+    }
+    std::array<u32, 3> WorkgroupSize() const override {
+        return {64, 1, 1};
+    }
+    bool HasHLEMacroState() const override {
+        return false;
+    }
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+    void Dump(u64, u64) override {}
+
+private:
+    std::span<const u64> code;
+    u32 local_memory_size = 0;
+};
+
 class Scanner {
 public:
     explicit Scanner(std::vector<CachedShaderCode> shaders_, std::stop_token stop_,
@@ -249,6 +348,111 @@ public:
         }
         LOG_INFO(Frontend, "[ShaderScan] files with hits: {}, shaders in them (estimate): {}",
                  hits_per_file.size(), total_terminators);
+    }
+
+    void ReportExtraction() const {
+        std::map<u32, size_t> by_stage;
+        for (const auto& [hash, shader] : extracted) {
+            ++by_stage[static_cast<u32>(shader.stage)];
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] extraction: {} code headers, {} distinct shaders, {} MiB",
+                 code_headers, extracted.size(), extracted_bytes >> 20);
+        for (const auto& [stage, count] : by_stage) {
+            LOG_INFO(Frontend, "[ShaderScan] extracted stage {}: {}", stage, count);
+        }
+        std::map<u32, std::pair<size_t, size_t>> recall;
+        for (const auto& shader : shaders) {
+            auto& entry = recall[static_cast<u32>(shader.stage)];
+            ++entry.first;
+            if (extracted.contains(shader.unique_hash)) {
+                ++entry.second;
+            }
+        }
+        for (const auto& [stage, counts] : recall) {
+            LOG_INFO(Frontend, "[ShaderScan] cached stage {}: {} of {} extracted from game files",
+                     stage, counts.second, counts.first);
+        }
+    }
+
+    // How often the guesses used for game-file shaders match what the game really used.
+    void ReportGuessAccuracy() const {
+        size_t no_textures = 0;
+        size_t all_2d = 0;
+        size_t needs_cbuf = 0;
+        std::array<size_t, Shader::NUM_TEXTURE_TYPES> type_counts{};
+        for (const auto& shader : shaders) {
+            if (shader.cbuf_value_count > 0) {
+                ++needs_cbuf;
+            }
+            if (shader.texture_types.empty()) {
+                ++no_textures;
+            } else if (std::ranges::all_of(shader.texture_types, [](Shader::TextureType type) {
+                           return type == Shader::TextureType::Color2D;
+                       })) {
+                ++all_2d;
+            }
+            for (const auto type : shader.texture_types) {
+                ++type_counts[static_cast<size_t>(type)];
+            }
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] runtime info of {} cached shaders: {} use no texture types, {} use "
+                 "only 2D textures, {} read constant buffers for bindless handles",
+                 shaders.size(), no_textures, all_2d, needs_cbuf);
+        LOG_INFO(Frontend, "[ShaderScan] texture types used: {}", fmt::join(type_counts, ","));
+    }
+
+    void TranslateExtracted() const {
+        Shader::HostTranslateInfo host_info{
+            .support_float64 = false,
+            .support_float16 = true,
+            .support_int64 = true,
+            .support_snorm_render_buffer = true,
+        };
+        host_info.ApplyDescriptorLimitPolicy();
+        Vulkan::ShaderPools pools;
+        std::map<u32, std::pair<size_t, size_t>> by_stage;
+        std::map<std::string, size_t> errors;
+        const auto start = std::chrono::steady_clock::now();
+        size_t attempted = 0;
+        for (const auto& [hash, shader] : extracted) {
+            if (std::chrono::steady_clock::now() - start > TRANSLATE_TIME_LIMIT) {
+                break;
+            }
+            ++attempted;
+            auto& counts = by_stage[static_cast<u32>(shader.stage)];
+            ++counts.first;
+            try {
+                GuessEnvironment env{shader};
+                const u32 cfg_offset =
+                    shader.stage == Shader::Stage::Compute ? 0 : sizeof(Shader::ProgramHeader);
+                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset);
+                void(Shader::Maxwell::TranslateProgram(pools.inst, pools.block, env, cfg,
+                                                       host_info));
+                ++counts.second;
+            } catch (const std::exception& e) {
+                ++errors[std::string(e.what()).substr(0, 80)];
+            }
+            pools.ReleaseContents();
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        LOG_INFO(Frontend, "[ShaderScan] translated {} of {} extracted shaders in {} ms",
+                 attempted, extracted.size(), ms.count());
+        for (const auto& [stage, counts] : by_stage) {
+            LOG_INFO(Frontend, "[ShaderScan] translate stage {}: {} of {} succeeded", stage,
+                     counts.second, counts.first);
+        }
+        std::vector<std::pair<size_t, std::string>> sorted;
+        for (const auto& [error, count] : errors) {
+            sorted.emplace_back(count, error);
+        }
+        std::sort(sorted.rbegin(), sorted.rend());
+        for (size_t i = 0; i < std::min<size_t>(sorted.size(), 5); ++i) {
+            LOG_INFO(Frontend, "[ShaderScan] translate error x{}: {}", sorted[i].first,
+                     sorted[i].second);
+        }
     }
 
     bool Stopped() const {
@@ -403,6 +607,9 @@ private:
             if ((pos & 7) == 0 && (first == SELF_BRANCH_A || first == SELF_BRANCH_B)) {
                 ++terminators;
             }
+            if (static_cast<u32>(first) == NVN_CODE_MAGIC) {
+                Extract(data, pos + NVN_CODE_HEADER_SIZE);
+            }
             const u64 mixed = Mix(first);
             if ((filter[(mixed & ((1u << FILTER_BITS) - 1)) / 64] & (u64{1} << (mixed % 64))) ==
                 0) {
@@ -433,6 +640,39 @@ private:
         }
     }
 
+    // Takes the shader that follows an NVN code header, using the same end marker and hash as the
+    // emulator uses for shaders the game uploads.
+    void Extract(std::span<const u8> data, size_t start) {
+        ++code_headers;
+        if (start + SPH_SIZE + sizeof(u64) > data.size() || extracted_bytes > MAX_EXTRACTED_BYTES) {
+            return;
+        }
+        Shader::ProgramHeader sph;
+        std::memcpy(&sph, data.data() + start, sizeof(sph));
+        const Shader::Stage stage = StageFromHeader(sph).value_or(Shader::Stage::Compute);
+        const size_t limit = std::min(data.size(), start + MAX_SHADER_SIZE);
+        for (size_t pos = start; pos + sizeof(u64) <= limit; pos += sizeof(u64)) {
+            const u64 inst = Load64(data.data() + pos);
+            if (inst != SELF_BRANCH_A && inst != SELF_BRANCH_B) {
+                continue;
+            }
+            const size_t size = pos - start;
+            if (size == 0) {
+                return;
+            }
+            const u64 hash =
+                Common::CityHash64(reinterpret_cast<const char*>(data.data() + start), size);
+            if (extracted.contains(hash)) {
+                return;
+            }
+            std::vector<u64> code(size / sizeof(u64) + 1);
+            std::memcpy(code.data(), data.data() + start, code.size() * sizeof(u64));
+            extracted_bytes += code.size() * sizeof(u64);
+            extracted.emplace(hash, ExtractedShader{stage, std::move(code)});
+            return;
+        }
+    }
+
     MatchKind Verify(size_t index, std::span<const u8> data, size_t pos) const {
         const auto& shader = shaders[index];
         const size_t needle_offset = NeedleOffset(shader);
@@ -452,12 +692,11 @@ private:
 
     void LogFirstMatches(size_t index, MatchKind kind, std::span<const u8> data, size_t pos,
                          const std::string& name, size_t base_offset) {
-        if (logged_matches >= 6) {
+        const auto& shader = shaders[index];
+        if (logged_per_stage[static_cast<u32>(shader.stage)]++ >= 3) {
             return;
         }
-        ++logged_matches;
-        const auto& shader = shaders[index];
-        const size_t start = pos - std::min(pos, NeedleOffset(shader) + 0x40);
+        const size_t start = pos - std::min(pos, NeedleOffset(shader) + 0x100);
         std::string bytes;
         for (size_t i = start; i < pos + 16 && i < data.size(); ++i) {
             bytes += fmt::format("{:02x}", data[i]);
@@ -487,7 +726,10 @@ private:
     std::map<std::string, FileStats> hits_per_file;
     size_t files_scanned = 0;
     size_t bytes_scanned = 0;
-    size_t logged_matches = 0;
+    std::map<u32, size_t> logged_per_stage;
+    std::unordered_map<u64, ExtractedShader> extracted;
+    size_t extracted_bytes = 0;
+    size_t code_headers = 0;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
@@ -497,7 +739,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done";
+    const auto done_marker = shader_dir / "shader_scan_done_v2";
     std::error_code error;
     if (std::filesystem::exists(done_marker, error)) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
@@ -538,10 +780,13 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
     scanner.ScanDir(root, "", true);
     scanner.Report("shader-named files");
-    if (!scanner.AllFound() && !scanner.Stopped()) {
+    if (!scanner.Stopped()) {
         scanner.ScanDir(root, "", false);
         scanner.Report("all files");
     }
+    scanner.ReportExtraction();
+    scanner.ReportGuessAccuracy();
+    scanner.TranslateExtracted();
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - start_time);
     LOG_INFO(Frontend, "[ShaderScan] finished in {} s{}", seconds.count(),

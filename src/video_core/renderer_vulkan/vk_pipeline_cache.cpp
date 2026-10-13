@@ -764,7 +764,12 @@ std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode
         const u64 hash{Common::CityHash64(reinterpret_cast<const char*>(code.data()),
                                           (code.size() - 1) * sizeof(u64))};
         if (seen.insert(hash).second) {
-            result.push_back({hash, env.ShaderStage(), std::vector<u64>(code.begin(), code.end())});
+            std::vector<Shader::TextureType> texture_types;
+            for (const auto& [handle, type] : env.TextureTypes()) {
+                texture_types.push_back(type);
+            }
+            result.push_back({hash, env.ShaderStage(), std::vector<u64>(code.begin(), code.end()),
+                              std::move(texture_types), env.CbufValueCount()});
         }
     }};
     VideoCommon::LoadPipelines(

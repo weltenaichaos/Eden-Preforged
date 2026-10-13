@@ -123,6 +123,8 @@ public:
         u64 unique_hash;
         Shader::Stage stage;
         std::vector<u64> code;
+        std::vector<Shader::TextureType> texture_types; ///< Types the game used at runtime
+        size_t cbuf_value_count;                        ///< Constant buffer reads it needed
     };
 
     /// Reads the guest code of every distinct shader stored in a pipeline cache file.

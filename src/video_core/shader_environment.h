@@ -201,6 +201,14 @@ public:
         return code;
     }
 
+    [[nodiscard]] const auto& TextureTypes() const noexcept {
+        return texture_types;
+    }
+
+    [[nodiscard]] size_t CbufValueCount() const noexcept {
+        return cbuf_values.size();
+    }
+
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
 private:
