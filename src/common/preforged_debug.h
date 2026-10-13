@@ -25,7 +25,7 @@ struct DebugOptions {
     unsigned precompile_percent = 100;
     /// Hands the driver a pair's stored code even when the game draws it with another state
     /// than it was compiled with, in case the driver can reuse part of it.
-    bool store_any_state = true;
+    bool store_any_state = false;
     /// Logs memory use every 30 seconds in game.
     bool log_memory = true;
     /// Logs every frame that took more than twice as long as the frame before it.

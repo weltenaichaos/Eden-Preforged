@@ -677,7 +677,7 @@
     <string name="preforged_precompile_percent">Share of game file shaders to compile</string>
     <string name="preforged_precompile_percent_description">Compiles this share of the shader pairs found in the game files, starting with the ones closest to what the game has drawn so far. Compiled pairs are kept on storage and only loaded when the game draws with them, so they don\'t take up memory. A lower share means a shorter first load and more stutter.</string>
     <string name="preforged_store_any_state">Use stored shaders for any state</string>
-    <string name="preforged_store_any_state_description">Hands the driver a shader pair\'s stored code even when the game draws it differently than it was compiled, in case the driver can reuse part of it.</string>
+    <string name="preforged_store_any_state_description">Hands the driver a shader pair\'s stored code even when the game draws it differently than it was compiled, in case the driver can reuse part of it. Off by default: in build 33 this crashed the GPU driver and gave no speedup.</string>
     <string name="preforged_log_memory">Log memory use</string>
     <string name="preforged_log_memory_description">Logs memory use every 30 seconds in game.</string>
     <string name="preforged_log_slow_frames">Log slow frames</string>
