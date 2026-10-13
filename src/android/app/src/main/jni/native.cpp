@@ -272,11 +272,6 @@ void EmulationSession::InitializeSystem(bool reload) {
         m_input_subsystem.Initialize();
     }
 
-    // Read on every game start, so a changed switch only needs the game restarted.
-    Common::Preforged::LoadOptions();
-    Shader::Optimization::SetDriverConstBufferFolding(
-        Common::Preforged::Options().bake_driver_constants);
-
     // Initialize filesystem.
     m_system.SetFilesystem(m_vfs);
     m_system.GetUserChannel().clear();
@@ -308,6 +303,10 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
     m_system.SetShuttingDown(false);
     m_system.ApplySettings();
     Settings::LogSettings();
+    // Read on every game start, so a changed switch only needs the game restarted.
+    Common::Preforged::LoadOptions();
+    Shader::Optimization::SetDriverConstBufferFolding(
+        Common::Preforged::Options().bake_driver_constants);
     m_system.HIDCore().ReloadInputDevices();
     m_system.SetFrontendAppletSet({
         nullptr,                     // Amiibo Settings
@@ -480,24 +479,7 @@ void EmulationSession::RunEmulation() {
 // Memory use and the number of memory mappings, which Android limits to about 65,000; running
 // out of either ends the app without a message.
 void EmulationSession::LogMemoryUse() {
-    long pages_total = 0;
-    long pages_resident = 0;
-    if (std::FILE* statm = std::fopen("/proc/self/statm", "r")) {
-        if (std::fscanf(statm, "%ld %ld", &pages_total, &pages_resident) != 2) {
-            pages_resident = 0;
-        }
-        std::fclose(statm);
-    }
-    size_t mappings = 0;
-    if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
-        for (int c; (c = std::fgetc(maps)) != EOF;) {
-            mappings += c == '\n' ? 1 : 0;
-        }
-        std::fclose(maps);
-    }
-    const long page_size = sysconf(_SC_PAGESIZE);
-    LOG_INFO(Frontend, "[Preforged] memory: {} MiB resident, {} MiB virtual, {} mappings",
-             pages_resident * page_size >> 20, pages_total * page_size >> 20, mappings);
+    Common::Preforged::LogMemoryUse("in game");
     Common::Preforged::LogMappingSummary(6);
 }
 

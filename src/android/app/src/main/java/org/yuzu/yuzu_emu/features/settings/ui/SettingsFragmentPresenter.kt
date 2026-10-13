@@ -1523,6 +1523,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_SCAN_GAME_FILES.key)
                 add(BooleanSetting.PREFORGED_RESCAN_GAME_FILES.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
+                add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
                 add(BooleanSetting.PREFORGED_LOG_SHADER_COMPILES.key)
                 add(BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE.key)
             }

@@ -20,6 +20,9 @@ struct DebugOptions {
     bool precompile_game_shaders = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.
     bool log_shader_compiles = true;
+    /// Share of the game file shader pairs to compile, in percent, most likely first. Every
+    /// compiled pair stays in the driver pipeline cache, which the driver keeps in memory.
+    unsigned precompile_percent = 25;
 };
 
 [[nodiscard]] DebugOptions& Options();
@@ -30,5 +33,8 @@ void LoadOptions();
 /// Logs how many memory mappings the app holds and which files or heaps hold the most, since
 /// Android ends the app once it has about 65,000. Shows the top `top` names.
 void LogMappingSummary(size_t top);
+
+/// Logs resident and virtual memory and the number of mappings, tagged with `when`.
+void LogMemoryUse(const char* when);
 
 } // namespace Common::Preforged

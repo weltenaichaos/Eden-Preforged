@@ -621,8 +621,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
+        ResetPreforgedDriverCacheIfShrunk(base_dir);
+        Common::Preforged::LogMemoryUse("before loading the driver pipeline cache");
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
+        Common::Preforged::LogMemoryUse("after loading the driver pipeline cache");
     }
 
     struct {
@@ -741,8 +744,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    Common::Preforged::LogMemoryUse("after building the played pipelines");
 
     PrecompilePreforgedPairs(base_dir, played_keys, stop_loading, callback);
+    Common::Preforged::LogMemoryUse("after compiling game file pairs");
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -824,6 +829,31 @@ u64 PipelineCache::ShaderStateHash(const GraphicsPipelineCacheKey& key) {
     return Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words));
 }
 
+void PipelineCache::ResetPreforgedDriverCacheIfShrunk(const std::filesystem::path& base_dir) {
+    // The driver pipeline cache keeps every pair compiled on earlier boots and the driver holds
+    // all of it in memory, so when the share goes down the cache has to start over. The played
+    // pipelines are built again from vulkan.bin on this boot and land in the new cache.
+    const auto percent_path{base_dir / "preforged_percent.txt"};
+    const auto warmed_path{base_dir / "preforged_warmed.bin"};
+    const unsigned percent{Common::Preforged::Options().precompile_percent};
+    // Builds before the share existed compiled every pair.
+    unsigned previous{std::filesystem::exists(warmed_path) ? 100u : 0u};
+    {
+        std::ifstream file{percent_path};
+        file >> previous;
+    }
+    if (percent < previous) {
+        std::error_code ec;
+        std::filesystem::remove(warmed_path, ec);
+        std::filesystem::remove(vulkan_pipeline_cache_filename, ec);
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] pre-compile share went from {}% to {}%, starting the driver "
+                 "pipeline cache over",
+                 previous, percent);
+    }
+    std::ofstream{percent_path} << percent;
+}
+
 void PipelineCache::PrecompilePreforgedPairs(
     const std::filesystem::path& base_dir, std::span<const GraphicsPipelineCacheKey> played_keys,
     std::stop_token stop_loading, const VideoCore::DiskResourceLoadCallback& callback) {
@@ -839,14 +869,15 @@ void PipelineCache::PrecompilePreforgedPairs(
 
     // Pairs compiled on earlier boots; the driver's pipeline cache keeps their code.
     const auto warmed_path{base_dir / "preforged_warmed.bin"};
-    std::unordered_set<u64> done;
+    std::unordered_set<u64> warmed;
     {
         std::ifstream file{warmed_path, std::ios::binary};
         u64 id{};
         while (file.read(reinterpret_cast<char*>(&id), sizeof(id))) {
-            done.insert(id);
+            warmed.insert(id);
         }
     }
+    std::unordered_set<u64> played;
 
     // A pair compiled with a state that changes its shaders differently than the game will is
     // compiled again by the driver, so use a state the game drew this vertex shader with, or
@@ -854,7 +885,7 @@ void PipelineCache::PrecompilePreforgedPairs(
     std::unordered_map<u64, const GraphicsPipelineCacheKey*> vertex_templates;
     std::unordered_map<u64, std::pair<size_t, const GraphicsPipelineCacheKey*>> state_counts;
     for (const GraphicsPipelineCacheKey& key : played_keys) {
-        done.insert(pair_id(key.unique_hashes[1], key.unique_hashes[5]));
+        played.insert(pair_id(key.unique_hashes[1], key.unique_hashes[5]));
         if (key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 ||
             key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0) {
             continue;
@@ -877,13 +908,26 @@ void PipelineCache::PrecompilePreforgedPairs(
     }
 
     preforged_pairs.clear();
+    preforged_skipped_pairs.clear();
     preforged_shaders.clear();
     for (const auto& [hash, shader] : programs.shaders) {
         preforged_shaders.insert(hash);
     }
-    std::vector<GraphicsPipelineCacheKey> todo;
+    std::unordered_set<u64> played_fragments;
+    for (const GraphicsPipelineCacheKey& key : played_keys) {
+        played_fragments.insert(key.unique_hashes[5]);
+    }
+    // Pairs that share a shader with what the game drew so far come first, since they belong to
+    // the same areas and effects; a pair whose vertex shader was drawn also gets its real state.
+    std::array<std::vector<GraphicsPipelineCacheKey>, 3> candidates;
+    std::unordered_set<u64> seen;
+    size_t warmed_count{};
     for (const auto& [vertex, fragment] : programs.pairs) {
         if (!programs.shaders.contains(vertex) || !programs.shaders.contains(fragment)) {
+            continue;
+        }
+        const u64 id{pair_id(vertex, fragment)};
+        if (!seen.insert(id).second) {
             continue;
         }
         const auto it{vertex_templates.find(vertex)};
@@ -891,16 +935,54 @@ void PipelineCache::PrecompilePreforgedPairs(
         key.unique_hashes = {};
         key.unique_hashes[1] = vertex;
         key.unique_hashes[5] = fragment;
-        preforged_pairs.try_emplace(pair_id(vertex, fragment), ShaderStateHash(key));
-        if (done.insert(pair_id(vertex, fragment)).second) {
+        if (played.contains(id)) {
+            preforged_pairs.try_emplace(id, ShaderStateHash(key));
+            continue;
+        }
+        if (warmed.contains(id)) {
+            preforged_pairs.try_emplace(id, ShaderStateHash(key));
+            ++warmed_count;
+            continue;
+        }
+        const size_t rank{it != vertex_templates.end() ? 0u
+                          : played_fragments.contains(fragment) ? 1u
+                                                                : 2u};
+        candidates[rank].push_back(key);
+    }
+    const size_t candidate_count{candidates[0].size() + candidates[1].size() +
+                                 candidates[2].size()};
+    // Pairs compiled on earlier boots count against the share, so it doesn't grow every boot.
+    const size_t wanted{((warmed_count + candidate_count) *
+                             Common::Preforged::Options().precompile_percent +
+                         99) /
+                        100};
+    std::vector<GraphicsPipelineCacheKey> todo;
+    for (const auto& rank : candidates) {
+        for (const GraphicsPipelineCacheKey& key : rank) {
+            if (warmed_count + todo.size() >= wanted) {
+                preforged_skipped_pairs.insert(
+                    pair_id(key.unique_hashes[1], key.unique_hashes[5]));
+                continue;
+            }
             todo.push_back(key);
+            preforged_pairs.try_emplace(pair_id(key.unique_hashes[1], key.unique_hashes[5]),
+                                        ShaderStateHash(key));
         }
     }
     LOG_INFO(Render_Vulkan,
-             "[Preforged] {} shader pairs from the game files, {} to compile now, {} states seen",
-             programs.pairs.size(), todo.size(), state_counts.size());
+             "[Preforged] {} shader pairs from the game files, {} already played, {} compiled "
+             "on earlier boots, {} not compiled yet ({} with a played vertex shader, {} with a "
+             "played fragment shader, {} others), {} to compile now at {}%, {} states seen",
+             programs.pairs.size(), played.size(), warmed_count, candidate_count,
+             candidates[0].size(), candidates[1].size(), candidates[2].size(), todo.size(),
+             Common::Preforged::Options().precompile_percent, state_counts.size());
     if (!Common::Preforged::Options().precompile_game_shaders) {
         LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in the settings");
+        return;
+    }
+    if (!use_vulkan_pipeline_cache) {
+        // Without the driver pipeline cache nothing compiled here would be kept.
+        LOG_INFO(Render_Vulkan, "[Preforged] not compiling, the driver pipeline cache is off");
         return;
     }
     if (todo.empty()) {
@@ -1145,9 +1227,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             game_files = fmt::format(
                 "vertex {} fragment {} pair {}", preforged_shaders.contains(vertex) ? "yes" : "no",
                 preforged_shaders.contains(fragment) ? "yes" : "no",
-                pair == preforged_pairs.end()            ? "no"
-                : pair->second == ShaderStateHash(key) ? "yes, same state"
-                                                         : "yes, other state");
+                pair != preforged_pairs.end()
+                    ? (pair->second == ShaderStateHash(key) ? "yes, same state"
+                                                            : "yes, other state")
+                : preforged_skipped_pairs.contains((vertex * 0x9E3779B97F4A7C15ULL) ^ fragment)
+                    ? "skipped by the pre-compile share"
+                    : "no");
         }
         LOG_INFO(Render_Vulkan,
                  "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x} game files: {}",

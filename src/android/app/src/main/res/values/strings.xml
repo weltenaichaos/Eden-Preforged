@@ -665,6 +665,8 @@
     <string name="preforged_precompile_game_shaders_description">Compiles the shader pairs found in the game files while the game loads, so they do not stutter later.</string>
     <string name="preforged_log_shader_compiles">Log shader compiles</string>
     <string name="preforged_log_shader_compiles_description">Logs every shader compile during play with its timing and where its shaders came from.</string>
+    <string name="preforged_precompile_percent">Share of game file shaders to compile</string>
+    <string name="preforged_precompile_percent_description">Compiles this share of the shader pairs found in the game files, starting with the ones closest to what the game has drawn so far. The driver keeps every compiled pair in memory, so a high share can run out of memory. Lowering it starts the driver pipeline cache over on the next game start.</string>
     <string name="preforged_driver_pipeline_cache">Use the driver pipeline cache</string>
     <string name="preforged_driver_pipeline_cache_description">Loads the GPU driver\'s saved pipelines at game start. Off leaves the saved file alone but loads nothing from it, so every pipeline is built by the driver again.</string>
     <string name="flush_by_line">Flush debug logs by line</string>

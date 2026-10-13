@@ -145,6 +145,11 @@ private:
     /// Shader pairs from the game files, with the shader state they were compiled with.
     std::unordered_map<u64, u64> preforged_pairs;
     std::unordered_set<u64> preforged_shaders;
+    /// Shader pairs from the game files left out by the pre-compile share.
+    std::unordered_set<u64> preforged_skipped_pairs;
+
+    /// Deletes the driver pipeline cache when the pre-compile share went down since last boot.
+    void ResetPreforgedDriverCacheIfShrunk(const std::filesystem::path& base_dir);
 
     void PrecompilePreforgedPairs(const std::filesystem::path& base_dir,
                                   std::span<const GraphicsPipelineCacheKey> played_keys,

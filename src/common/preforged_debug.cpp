@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -28,13 +31,39 @@ void LoadOptions() {
     options.precompile_game_shaders =
         Settings::values.preforged_precompile_game_shaders.GetValue();
     options.log_shader_compiles = Settings::values.preforged_log_shader_compiles.GetValue();
+    options.precompile_percent =
+        std::min(Settings::values.preforged_precompile_percent.GetValue(), 100u);
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
              "log compiles {}",
              options.bake_driver_constants, options.scan_game_files, options.rescan_game_files,
              options.precompile_game_shaders, options.log_shader_compiles);
+    LOG_INFO(Common, "[Preforged] pre-compile share {}%", options.precompile_percent);
     LOG_INFO(Common, "[Preforged] driver pipeline cache {}",
              Settings::values.use_vulkan_driver_pipeline_cache.GetValue());
+}
+
+void LogMemoryUse(const char* when) {
+#ifdef __linux__
+    long pages_total = 0;
+    long pages_resident = 0;
+    if (std::FILE* statm = std::fopen("/proc/self/statm", "r")) {
+        if (std::fscanf(statm, "%ld %ld", &pages_total, &pages_resident) != 2) {
+            pages_resident = 0;
+        }
+        std::fclose(statm);
+    }
+    size_t mappings = 0;
+    if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
+        for (int c; (c = std::fgetc(maps)) != EOF;) {
+            mappings += c == '\n' ? 1 : 0;
+        }
+        std::fclose(maps);
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    LOG_INFO(Common, "[Preforged] memory {}: {} MiB resident, {} MiB virtual, {} mappings", when,
+             pages_resident * page_size >> 20, pages_total * page_size >> 20, mappings);
+#endif
 }
 
 void LogMappingSummary(size_t top) {

@@ -286,6 +286,16 @@ abstract class SettingsItem(
                 )
             )
             put(
+                SliderSetting(
+                    IntSetting.PREFORGED_PRECOMPILE_PERCENT,
+                    titleId = R.string.preforged_precompile_percent,
+                    descriptionId = R.string.preforged_precompile_percent_description,
+                    min = 0,
+                    max = 100,
+                    units = "%"
+                )
+            )
+            put(
                 SwitchSetting(
                     BooleanSetting.PREFORGED_LOG_SHADER_COMPILES,
                     titleId = R.string.preforged_log_shader_compiles,
