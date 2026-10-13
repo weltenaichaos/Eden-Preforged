@@ -20,7 +20,8 @@
 
 namespace Shader::Optimization {
 namespace {
-std::atomic_bool fold_driver_const_buffer{true};
+// Off in Eden Preforged: shaders then match ones built from the game files, which lack these values.
+std::atomic_bool fold_driver_const_buffer{false};
 
 // Metaprogramming stuff to get arguments information out of a lambda
 template <typename Func>

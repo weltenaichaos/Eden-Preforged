@@ -521,6 +521,7 @@ public:
             {"real textures", {.textures = true}},
             {"real everything through the guess path", {.cbuf = true, .textures = true, .misc = true}},
         }};
+        Shader::Optimization::SetDriverConstBufferFolding(true);
         size_t real_failed = 0;
         size_t logged = 0;
         for (const auto& shader : shaders) {
@@ -599,7 +600,7 @@ public:
                 ++unfolded_failed;
             }
         }
-        Shader::Optimization::SetDriverConstBufferFolding(true);
+        Shader::Optimization::SetDriverConstBufferFolding(false);
         LOG_INFO(Frontend,
                  "[ShaderScan] without constant buffer 1 folding, all guessed vs runtime: {} "
                  "identical, {} different, {} failed; folding changes {} runtime shaders",
