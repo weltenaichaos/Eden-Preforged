@@ -20,9 +20,9 @@ struct DebugOptions {
     bool precompile_game_shaders = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.
     bool log_shader_compiles = true;
-    /// Share of the game file shader pairs to compile, in percent, most likely first. Every
-    /// compiled pair stays in the driver pipeline cache, which the driver keeps in memory.
-    unsigned precompile_percent = 25;
+    /// Share of the game file shader pairs to compile, in percent, most likely first. Compiled
+    /// pairs are kept on storage and read when the game draws with them.
+    unsigned precompile_percent = 100;
 };
 
 [[nodiscard]] DebugOptions& Options();

@@ -11,7 +11,9 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -148,8 +150,32 @@ private:
     /// Shader pairs from the game files left out by the pre-compile share.
     std::unordered_set<u64> preforged_skipped_pairs;
 
-    /// Deletes the driver pipeline cache when the pre-compile share went down since last boot.
-    void ResetPreforgedDriverCacheIfShrunk(const std::filesystem::path& base_dir);
+    /// Where a compiled pair's driver code sits in the store file on storage.
+    struct PreforgedStoreEntry {
+        u64 offset;
+        u64 state_hash;
+        u32 size;
+    };
+    /// Driver code of the pairs compiled from the game files, one small driver cache per pair,
+    /// kept on storage and read only when the game draws with that pair. Only the index is kept
+    /// in memory.
+    std::filesystem::path preforged_store_path;
+    std::mutex preforged_store_mutex;
+    std::unordered_map<u64, PreforgedStoreEntry> preforged_store;
+    std::ofstream preforged_store_out;
+    std::atomic<size_t> preforged_store_reads{};
+
+    /// Reads the store index, starts the store over for another driver, and clears the driver
+    /// pipeline cache once if earlier builds compiled the game file pairs into it.
+    void OpenPreforgedStore(const std::filesystem::path& base_dir);
+
+    /// Appends the code in `cache` for a pair. Called while compiling, from worker threads.
+    void AppendPreforgedStore(u64 pair_id, u64 state_hash, const vk::PipelineCache& cache);
+
+    /// Reads a pair's driver code from storage when the key draws with a stored pair in the
+    /// state it was compiled with.
+    [[nodiscard]] std::shared_ptr<vk::PipelineCache> LoadPreforgedStoreEntry(
+        const GraphicsPipelineCacheKey& key);
 
     void PrecompilePreforgedPairs(const std::filesystem::path& base_dir,
                                   std::span<const GraphicsPipelineCacheKey> played_keys,
@@ -165,7 +191,7 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel);
+        bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache = {});
 
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                            const ShaderInfo* shader);

@@ -48,7 +48,7 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
     MEMORY_LAYOUT("memory_layout_mode"),
     FSR_SHARPENING_SLIDER("fsr_sharpening_slider"),
     RENDERER_SAMPLE_SHADING("sample_shading_fraction"),
-    PREFORGED_PRECOMPILE_PERCENT("preforged_precompile_percent"),
+    PREFORGED_PRECOMPILE_PERCENT("preforged_compile_share"),
     FAST_CPU_TIME("fast_cpu_time"),
     CPU_TICKS("cpu_ticks"),
     FAST_GPU_TIME("fast_gpu_time"),
