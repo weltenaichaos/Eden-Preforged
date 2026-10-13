@@ -875,10 +875,14 @@ void PipelineCache::PrecompilePreforgedPairs(
         }
     }
 
+    preforged_pairs.clear();
+    preforged_shaders.clear();
+    for (const auto& [hash, shader] : programs.shaders) {
+        preforged_shaders.insert(hash);
+    }
     std::vector<GraphicsPipelineCacheKey> todo;
     for (const auto& [vertex, fragment] : programs.pairs) {
-        if (done.contains(pair_id(vertex, fragment)) || !programs.shaders.contains(vertex) ||
-            !programs.shaders.contains(fragment)) {
+        if (!programs.shaders.contains(vertex) || !programs.shaders.contains(fragment)) {
             continue;
         }
         const auto it{vertex_templates.find(vertex)};
@@ -886,8 +890,10 @@ void PipelineCache::PrecompilePreforgedPairs(
         key.unique_hashes = {};
         key.unique_hashes[1] = vertex;
         key.unique_hashes[5] = fragment;
-        todo.push_back(key);
-        done.insert(pair_id(vertex, fragment));
+        preforged_pairs.try_emplace(pair_id(vertex, fragment), ShaderStateHash(key));
+        if (done.insert(pair_id(vertex, fragment)).second) {
+            todo.push_back(key);
+        }
     }
     LOG_INFO(Render_Vulkan,
              "[Preforged] {} shader pairs from the game files, {} to compile now, {} states seen",
@@ -1124,8 +1130,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Shader timing test: guest shader translation to SPIR-V, done on the GPU thread in game
         const std::chrono::duration<double, std::milli> translate_time{
             std::chrono::steady_clock::now() - translate_start};
-        LOG_INFO(Render_Vulkan, "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x}",
-                 hash, translate_time.count(), fmt::join(key.unique_hashes, ","));
+        // Whether the shaders came from the game files and the pair was compiled ahead of time,
+        // to tell missed pairs from pairs the driver compiled again.
+        std::string game_files{"no list"};
+        if (!preforged_shaders.empty()) {
+            const u64 vertex{key.unique_hashes[1]};
+            const u64 fragment{key.unique_hashes[5]};
+            const auto pair{preforged_pairs.find((vertex * 0x9E3779B97F4A7C15ULL) ^ fragment)};
+            game_files = fmt::format(
+                "vertex {} fragment {} pair {}", preforged_shaders.contains(vertex) ? "yes" : "no",
+                preforged_shaders.contains(fragment) ? "yes" : "no",
+                pair == preforged_pairs.end()            ? "no"
+                : pair->second == ShaderStateHash(key) ? "yes, same state"
+                                                         : "yes, other state");
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x} game files: {}",
+                 hash, translate_time.count(), fmt::join(key.unique_hashes, ","), game_files);
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(

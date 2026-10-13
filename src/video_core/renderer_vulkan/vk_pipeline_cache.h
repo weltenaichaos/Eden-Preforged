@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <memory>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -140,6 +142,10 @@ public:
 private:
     /// Compiles the shader pairs found in the game files that no cached pipeline uses yet, so the
     /// driver keeps their compiled code. Pipelines with other states reuse that code.
+    /// Shader pairs from the game files, with the shader state they were compiled with.
+    std::unordered_map<u64, u64> preforged_pairs;
+    std::unordered_set<u64> preforged_shaders;
+
     void PrecompilePreforgedPairs(const std::filesystem::path& base_dir,
                                   std::span<const GraphicsPipelineCacheKey> played_keys,
                                   std::stop_token stop_loading,
