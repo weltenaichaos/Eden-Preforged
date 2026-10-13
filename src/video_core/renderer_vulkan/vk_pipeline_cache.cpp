@@ -755,7 +755,7 @@ std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode
     const std::filesystem::path& filename, std::stop_token stop_loading) {
     std::vector<CachedShaderCode> result;
     std::unordered_set<u64> seen;
-    const auto add{[&](const FileEnvironment& env) {
+    const auto add{[&](FileEnvironment& env) {
         const std::span<const u64> code{env.Code()};
         if (code.size() < 2) {
             return;
@@ -768,8 +768,12 @@ std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode
             for (const auto& [handle, type] : env.TextureTypes()) {
                 texture_types.push_back(type);
             }
-            result.push_back({hash, env.ShaderStage(), std::vector<u64>(code.begin(), code.end()),
-                              std::move(texture_types), env.CbufValueCount()});
+            std::vector<u64> code_copy(code.begin(), code.end());
+            const size_t cbuf_value_count{env.CbufValueCount()};
+            const Shader::Stage stage{env.ShaderStage()};
+            result.push_back({hash, stage, std::move(code_copy), std::move(texture_types),
+                              cbuf_value_count,
+                              std::make_shared<FileEnvironment>(std::move(env))});
         }
     }};
     VideoCommon::LoadPipelines(
@@ -782,7 +786,7 @@ std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode
         [&](std::ifstream& file, std::vector<FileEnvironment> envs) {
             GraphicsPipelineCacheKey key;
             file.read(reinterpret_cast<char*>(&key), sizeof(key));
-            for (const FileEnvironment& env : envs) {
+            for (FileEnvironment& env : envs) {
                 add(env);
             }
         });

@@ -22,6 +22,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/thread.h"
 #include "common/zstd_compression.h"
 #include "core/core.h"
@@ -31,6 +32,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "jni/shader_file_scan.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
@@ -55,6 +57,7 @@ constexpr size_t MAX_SHADER_SIZE = 0x100000;
 constexpr size_t MAX_EXTRACTED_BYTES = 256ULL << 20;
 constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
 constexpr u64 SELF_BRANCH_B = 0xE2400FFFFF07000FULL;
+constexpr u64 EXIT_VALUE = 0xE30000000007000FULL;
 
 enum class MatchKind : u8 { None, Needle, CodeOnly, Exact };
 
@@ -185,6 +188,7 @@ std::vector<u8> Decompress(std::span<const u8> data) {
 
 struct ExtractedShader {
     Shader::Stage stage;
+    u32 start_address;     ///< Keeps the game's alignment of scheduling words
     std::vector<u64> code; ///< Starts at the program header for graphics stages
 };
 
@@ -211,10 +215,12 @@ std::optional<Shader::Stage> StageFromHeader(const Shader::ProgramHeader& sph) {
 // known: every texture is guessed to be 2D and every constant buffer read returns zero.
 class GuessEnvironment final : public Shader::Environment {
 public:
-    explicit GuessEnvironment(const ExtractedShader& shader) : code{shader.code} {
-        stage = shader.stage;
-        start_address = 0;
-        is_proprietary_driver = true;
+    explicit GuessEnvironment(std::span<const u64> code_, Shader::Stage stage_, u32 start_address_,
+                              u32 texture_bound_)
+        : code{code_}, texture_bound{texture_bound_} {
+        stage = stage_;
+        start_address = start_address_;
+        is_proprietary_driver = texture_bound == 2;
         if (stage != Shader::Stage::Compute) {
             std::memcpy(&sph, code.data(), sizeof(sph));
             local_memory_size = static_cast<u32>(sph.LocalMemorySize()) +
@@ -223,8 +229,8 @@ public:
     }
 
     u64 ReadInstruction(u32 address) override {
-        const size_t index = address / sizeof(u64);
-        if (index >= code.size()) {
+        const size_t index = (address - start_address) / sizeof(u64);
+        if (address < start_address || index >= code.size()) {
             throw Shader::LogicError("Read past the end of the shader");
         }
         return code[index];
@@ -245,7 +251,7 @@ public:
         return 1;
     }
     u32 TextureBoundBuffer() const override {
-        return 2;
+        return texture_bound;
     }
     u32 LocalMemorySize() const override {
         return local_memory_size;
@@ -266,6 +272,7 @@ public:
 
 private:
     std::span<const u64> code;
+    u32 texture_bound;
     u32 local_memory_size = 0;
 };
 
@@ -286,6 +293,21 @@ public:
             filter[(first & ((1u << FILTER_BITS) - 1)) / 64] |= u64{1} << (first % 64);
             needles[NeedleKey(words)].push_back(index);
         }
+        // The constant buffer slot for bindless textures is set once by the game, so the cached
+        // shaders tell which one it uses.
+        std::map<u32, size_t> bounds;
+        for (const auto& shader : shaders) {
+            if (shader.env) {
+                ++bounds[shader.env->TextureBoundBuffer()];
+            }
+        }
+        for (const auto& [bound, count] : bounds) {
+            if (count > bounds[texture_bound]) {
+                texture_bound = bound;
+            }
+        }
+        LOG_INFO(Frontend, "[ShaderScan] game uses constant buffer {} for bindless textures",
+                 texture_bound);
     }
 
     void ScanDir(const FileSys::VirtualDir& dir, const std::string& path, bool shader_files) {
@@ -362,17 +384,23 @@ public:
             LOG_INFO(Frontend, "[ShaderScan] extracted stage {}: {}", stage, count);
         }
         std::map<u32, std::pair<size_t, size_t>> recall;
+        size_t self_branch_recall = 0;
         for (const auto& shader : shaders) {
             auto& entry = recall[static_cast<u32>(shader.stage)];
             ++entry.first;
             if (extracted.contains(shader.unique_hash)) {
                 ++entry.second;
             }
+            if (self_branch_hashes.contains(shader.unique_hash)) {
+                ++self_branch_recall;
+            }
         }
         for (const auto& [stage, counts] : recall) {
             LOG_INFO(Frontend, "[ShaderScan] cached stage {}: {} of {} extracted from game files",
                      stage, counts.second, counts.first);
         }
+        LOG_INFO(Frontend, "[ShaderScan] cached shaders found when ending at the self branch: {}",
+                 self_branch_recall);
     }
 
     // How often the guesses used for game-file shaders match what the game really used.
@@ -403,7 +431,65 @@ public:
         LOG_INFO(Frontend, "[ShaderScan] texture types used: {}", fmt::join(type_counts, ","));
     }
 
-    void TranslateExtracted() const {
+    // Translates each cached shader twice, with what the game really used and with the guesses,
+    // and compares the results. Equal results mean the guesses would have built the same shader.
+    void CompareGuessesWithRuntime() const {
+        const Shader::HostTranslateInfo host_info = MakeHostInfo();
+        Vulkan::ShaderPools pools;
+        const auto translate = [&](Shader::Environment& env) {
+            const u32 cfg_offset =
+                env.StartAddress() +
+                (env.ShaderStage() == Shader::Stage::Compute ? 0 : sizeof(Shader::ProgramHeader));
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset);
+            std::string dump = Shader::IR::DumpProgram(
+                Shader::Maxwell::TranslateProgram(pools.inst, pools.block, env, cfg, host_info));
+            pools.ReleaseContents();
+            return dump;
+        };
+        size_t same = 0;
+        size_t different = 0;
+        size_t real_failed = 0;
+        size_t guess_failed = 0;
+        size_t logged = 0;
+        for (const auto& shader : shaders) {
+            if (!shader.env) {
+                continue;
+            }
+            std::string real;
+            try {
+                real = translate(*shader.env);
+            } catch (const std::exception&) {
+                pools.ReleaseContents();
+                ++real_failed;
+                continue;
+            }
+            try {
+                GuessEnvironment guess{shader.code, shader.stage, shader.env->StartAddress(),
+                                       texture_bound};
+                if (translate(guess) == real) {
+                    ++same;
+                } else {
+                    ++different;
+                    if (logged++ < 5) {
+                        LOG_INFO(Frontend,
+                                 "[ShaderScan] guess differs for {:016x} stage {}: {} textures, "
+                                 "{} constant buffer reads",
+                                 shader.unique_hash, static_cast<u32>(shader.stage),
+                                 shader.texture_types.size(), shader.cbuf_value_count);
+                    }
+                }
+            } catch (const std::exception&) {
+                pools.ReleaseContents();
+                ++guess_failed;
+            }
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] guesses vs runtime on cached shaders: {} identical, {} different, "
+                 "{} guess failed, {} runtime failed",
+                 same, different, guess_failed, real_failed);
+    }
+
+    static Shader::HostTranslateInfo MakeHostInfo() {
         Shader::HostTranslateInfo host_info{
             .support_float64 = false,
             .support_float16 = true,
@@ -411,6 +497,11 @@ public:
             .support_snorm_render_buffer = true,
         };
         host_info.ApplyDescriptorLimitPolicy();
+        return host_info;
+    }
+
+    void TranslateExtracted() const {
+        const Shader::HostTranslateInfo host_info = MakeHostInfo();
         Vulkan::ShaderPools pools;
         std::map<u32, std::pair<size_t, size_t>> by_stage;
         std::map<std::string, size_t> errors;
@@ -424,9 +515,10 @@ public:
             auto& counts = by_stage[static_cast<u32>(shader.stage)];
             ++counts.first;
             try {
-                GuessEnvironment env{shader};
+                GuessEnvironment env{shader.code, shader.stage, shader.start_address, texture_bound};
                 const u32 cfg_offset =
-                    shader.stage == Shader::Stage::Compute ? 0 : sizeof(Shader::ProgramHeader);
+                    shader.start_address +
+                    (shader.stage == Shader::Stage::Compute ? 0 : sizeof(Shader::ProgramHeader));
                 Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset);
                 void(Shader::Maxwell::TranslateProgram(pools.inst, pools.block, env, cfg,
                                                        host_info));
@@ -649,10 +741,15 @@ private:
         }
         Shader::ProgramHeader sph;
         std::memcpy(&sph, data.data() + start, sizeof(sph));
-        const Shader::Stage stage = StageFromHeader(sph).value_or(Shader::Stage::Compute);
+        const auto header_stage = StageFromHeader(sph);
+        const Shader::Stage stage = header_stage.value_or(Shader::Stage::Compute);
         const size_t limit = std::min(data.size(), start + MAX_SHADER_SIZE);
+        std::optional<size_t> exit_size;
         for (size_t pos = start; pos + sizeof(u64) <= limit; pos += sizeof(u64)) {
             const u64 inst = Load64(data.data() + pos);
+            if (texture_bound != 2 && inst == EXIT_VALUE && !exit_size) {
+                exit_size = pos - start + sizeof(u64);
+            }
             if (inst != SELF_BRANCH_A && inst != SELF_BRANCH_B) {
                 continue;
             }
@@ -660,15 +757,22 @@ private:
             if (size == 0) {
                 return;
             }
-            const u64 hash =
-                Common::CityHash64(reinterpret_cast<const char*>(data.data() + start), size);
+            const auto* const bytes = reinterpret_cast<const char*>(data.data() + start);
+            self_branch_hashes.insert(Common::CityHash64(bytes, size));
+            // Like the emulator: unless the game uses the official driver's texture slot, the
+            // shader ends after its first exit instruction.
+            const size_t hashed = exit_size.value_or(size);
+            const u64 hash = Common::CityHash64(bytes, hashed);
             if (extracted.contains(hash)) {
                 return;
             }
-            std::vector<u64> code(size / sizeof(u64) + 1);
-            std::memcpy(code.data(), data.data() + start, code.size() * sizeof(u64));
+            std::vector<u64> code(hashed / sizeof(u64) + 1);
+            std::memcpy(code.data(), data.data() + start,
+                        std::min(code.size() * sizeof(u64), data.size() - start));
             extracted_bytes += code.size() * sizeof(u64);
-            extracted.emplace(hash, ExtractedShader{stage, std::move(code)});
+            // Game code places the program header 0x30 bytes after the code header.
+            const u32 start_address = header_stage ? 0x30 : 0;
+            extracted.emplace(hash, ExtractedShader{stage, start_address, std::move(code)});
             return;
         }
     }
@@ -728,6 +832,8 @@ private:
     size_t bytes_scanned = 0;
     std::map<u32, size_t> logged_per_stage;
     std::unordered_map<u64, ExtractedShader> extracted;
+    std::unordered_set<u64> self_branch_hashes;
+    u32 texture_bound = 2;
     size_t extracted_bytes = 0;
     size_t code_headers = 0;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
@@ -739,7 +845,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done_v2";
+    const auto done_marker = shader_dir / "shader_scan_done_v3";
     std::error_code error;
     if (std::filesystem::exists(done_marker, error)) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
@@ -786,7 +892,20 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     }
     scanner.ReportExtraction();
     scanner.ReportGuessAccuracy();
-    scanner.TranslateExtracted();
+    {
+        // The translator logs every instruction it cannot decode, which floods the log when it
+        // reads data that is not a shader. Keep those classes quiet while testing.
+        Common::Log::Filter quiet;
+        quiet.ParseFilterString(Settings::values.log_filter.GetValue());
+        quiet.SetClassLevel(Common::Log::Class::Debug, Common::Log::Level::Count);
+        quiet.SetClassLevel(Common::Log::Class::Shader, Common::Log::Level::Count);
+        Common::Log::SetGlobalFilter(quiet);
+        scanner.CompareGuessesWithRuntime();
+        scanner.TranslateExtracted();
+        Common::Log::Filter normal;
+        normal.ParseFilterString(Settings::values.log_filter.GetValue());
+        Common::Log::SetGlobalFilter(normal);
+    }
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - start_time);
     LOG_INFO(Frontend, "[ShaderScan] finished in {} s{}", seconds.count(),
