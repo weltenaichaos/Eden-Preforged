@@ -451,7 +451,8 @@ void EmulationSession::RunEmulation() {
 
     auto last_memory_log = std::chrono::steady_clock::now();
     while (true) {
-        if (std::chrono::steady_clock::now() - last_memory_log > std::chrono::seconds{30}) {
+        if (Common::Preforged::Options().log_memory &&
+            std::chrono::steady_clock::now() - last_memory_log > std::chrono::seconds{30}) {
             last_memory_log = std::chrono::steady_clock::now();
             LogMemoryUse();
         }
@@ -479,8 +480,14 @@ void EmulationSession::RunEmulation() {
 // Memory use and the number of memory mappings, which Android limits to about 65,000; running
 // out of either ends the app without a message.
 void EmulationSession::LogMemoryUse() {
+    const auto start = std::chrono::steady_clock::now();
     Common::Preforged::LogMemoryUse("in game");
     Common::Preforged::LogMappingSummary(6);
+    // Reading the mapping list briefly blocks other threads from changing memory mappings, so
+    // log how long it took to tell whether it lines up with slow frames.
+    LOG_INFO(Frontend, "[Preforged] memory log took {:.1f} ms",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                 .count());
 }
 
 void EmulationSession::RequestDiskShaderCacheReload(u64 program_id) {

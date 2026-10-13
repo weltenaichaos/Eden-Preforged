@@ -304,6 +304,20 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_MEMORY,
+                    titleId = R.string.preforged_log_memory,
+                    descriptionId = R.string.preforged_log_memory_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_SLOW_FRAMES,
+                    titleId = R.string.preforged_log_slow_frames,
+                    descriptionId = R.string.preforged_log_slow_frames_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description

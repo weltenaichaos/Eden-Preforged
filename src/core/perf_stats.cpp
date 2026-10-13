@@ -16,6 +16,8 @@
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
+#include "common/preforged_debug.h"
 #include "common/settings.h"
 #include "core/perf_stats.h"
 
@@ -79,7 +81,15 @@ void PerfStats::EndSystemFrame() {
     accumulated_frametime += frame_time;
     system_frames += 1;
 
-    previous_frame_length = frame_end - previous_frame_end;
+    const auto frame_length = frame_end - previous_frame_end;
+    // A frame that took more than twice as long as the one before it shows up as a stutter.
+    if (Common::Preforged::Options().log_slow_frames && system_frames > 1 &&
+        frame_length > std::chrono::milliseconds{50} && frame_length > previous_frame_length * 2) {
+        LOG_INFO(Render, "[Preforged] slow frame: {:.1f} ms, the frame before took {:.1f} ms",
+                 std::chrono::duration<double, std::milli>(frame_length).count(),
+                 std::chrono::duration<double, std::milli>(previous_frame_length).count());
+    }
+    previous_frame_length = frame_length;
     previous_frame_end = frame_end;
 }
 

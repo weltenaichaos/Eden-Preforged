@@ -33,12 +33,15 @@ void LoadOptions() {
     options.log_shader_compiles = Settings::values.preforged_log_shader_compiles.GetValue();
     options.precompile_percent =
         std::min(Settings::values.preforged_precompile_percent.GetValue(), 100u);
+    options.log_memory = Settings::values.preforged_log_memory.GetValue();
+    options.log_slow_frames = Settings::values.preforged_log_slow_frames.GetValue();
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
              "log compiles {}",
              options.bake_driver_constants, options.scan_game_files, options.rescan_game_files,
              options.precompile_game_shaders, options.log_shader_compiles);
-    LOG_INFO(Common, "[Preforged] pre-compile share {}%", options.precompile_percent);
+    LOG_INFO(Common, "[Preforged] pre-compile share {}%, log memory {}, log slow frames {}",
+             options.precompile_percent, options.log_memory, options.log_slow_frames);
     LOG_INFO(Common, "[Preforged] driver pipeline cache {}",
              Settings::values.use_vulkan_driver_pipeline_cache.GetValue());
 }

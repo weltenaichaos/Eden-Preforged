@@ -23,6 +23,10 @@ struct DebugOptions {
     /// Share of the game file shader pairs to compile, in percent, most likely first. Compiled
     /// pairs are kept on storage and read when the game draws with them.
     unsigned precompile_percent = 100;
+    /// Logs memory use and mappings every 30 seconds in game.
+    bool log_memory = true;
+    /// Logs every frame that took more than twice as long as the frame before it.
+    bool log_slow_frames = true;
 };
 
 [[nodiscard]] DebugOptions& Options();

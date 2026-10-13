@@ -676,6 +676,10 @@
     <string name="preforged_log_shader_compiles_description">Logs every shader compile during play with its timing and where its shaders came from.</string>
     <string name="preforged_precompile_percent">Share of game file shaders to compile</string>
     <string name="preforged_precompile_percent_description">Compiles this share of the shader pairs found in the game files, starting with the ones closest to what the game has drawn so far. Compiled pairs are kept on storage and only loaded when the game draws with them, so they don\'t take up memory. A lower share means a shorter first load and more stutter.</string>
+    <string name="preforged_log_memory">Log memory use</string>
+    <string name="preforged_log_memory_description">Logs memory use and memory mappings every 30 seconds in game. Reading the mappings briefly holds up the emulator, so turn this off if it lines up with stutters.</string>
+    <string name="preforged_log_slow_frames">Log slow frames</string>
+    <string name="preforged_log_slow_frames_description">Logs every frame that took over 50 ms and more than twice as long as the frame before it, so stutters show up in the log with their time.</string>
     <string name="preforged_driver_pipeline_cache">Use the driver pipeline cache</string>
     <string name="preforged_driver_pipeline_cache_description">Loads the GPU driver\'s saved pipelines at game start. Off leaves the saved file alone but loads nothing from it, so every pipeline is built by the driver again.</string>
     <string name="flush_by_line">Flush debug logs by line</string>
