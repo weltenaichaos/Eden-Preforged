@@ -36,6 +36,7 @@
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 namespace {
@@ -565,6 +566,44 @@ public:
         }
         LOG_INFO(Frontend, "[ShaderScan] runtime translation failed for {} cached shaders",
                  real_failed);
+
+        // Without baking constant buffer 1 into the shader, translation no longer depends on
+        // values only known while the game runs.
+        Shader::Optimization::SetDriverConstBufferFolding(false);
+        size_t unfolded_same = 0;
+        size_t unfolded_different = 0;
+        size_t unfolded_failed = 0;
+        size_t changed_by_folding = 0;
+        for (const auto& shader : shaders) {
+            if (!shader.env) {
+                continue;
+            }
+            try {
+                const std::string real = translate(*shader.env);
+                GuessEnvironment guess{shader.code,   shader.stage,     shader.env->StartAddress(),
+                                       texture_bound, driver_constants};
+                if (translate(guess) == real) {
+                    ++unfolded_same;
+                } else {
+                    ++unfolded_different;
+                }
+                Shader::Optimization::SetDriverConstBufferFolding(true);
+                const std::string folded = translate(*shader.env);
+                Shader::Optimization::SetDriverConstBufferFolding(false);
+                if (folded != real) {
+                    ++changed_by_folding;
+                }
+            } catch (const std::exception&) {
+                Shader::Optimization::SetDriverConstBufferFolding(false);
+                pools.ReleaseContents();
+                ++unfolded_failed;
+            }
+        }
+        Shader::Optimization::SetDriverConstBufferFolding(true);
+        LOG_INFO(Frontend,
+                 "[ShaderScan] without constant buffer 1 folding, all guessed vs runtime: {} "
+                 "identical, {} different, {} failed; folding changes {} runtime shaders",
+                 unfolded_same, unfolded_different, unfolded_failed, changed_by_folding);
     }
 
     static Shader::HostTranslateInfo MakeHostInfo() {
@@ -925,7 +964,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done_v4";
+    const auto done_marker = shader_dir / "shader_scan_done_v5";
     std::error_code error;
     if (std::filesystem::exists(done_marker, error)) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",

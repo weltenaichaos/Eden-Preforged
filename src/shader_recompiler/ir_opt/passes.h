@@ -18,6 +18,8 @@ namespace Shader::Optimization {
 void CollectShaderInfoPass(Environment& env, IR::Program& program);
 void ConditionalBarrierPass(IR::Program& program);
 void ConstantPropagationPass(Environment& env, IR::Program& program);
+/// Whether constant buffer 1 reads are replaced by their current values on proprietary drivers.
+void SetDriverConstBufferFolding(bool enabled);
 void DeadCodeEliminationPass(IR::Program& program);
 void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateInfo& host_info);
 void IdentityRemovalPass(IR::Program& program);
