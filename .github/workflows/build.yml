@@ -15,6 +15,8 @@ jobs:
     name: Android APK
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,3 +54,27 @@ jobs:
           path: artifacts/*.apk
           if-no-files-found: error
 
+
+      # The in-app updater installs whatever this release holds, so every finished build replaces
+      # it unless a newer build already did.
+      - name: Publish as the newest test build
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD: ${{ github.run_number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          current=$(gh release view preforged-latest --json assets --jq '.assets[].name' 2>/dev/null \
+            | sed -n 's/.*build-\([0-9]*\)\.apk$/\1/p' | head -1)
+          if [ -n "$current" ] && [ "$current" -ge "$BUILD" ]; then
+            echo "Build $current is already published"
+            exit 0
+          fi
+          apk="eden-preforged-build-$BUILD.apk"
+          cp "$(ls artifacts/*.apk | head -1)" "$apk"
+          printf 'Build %s from %s\n\n%s\n' "$BUILD" "$BRANCH" "$(git log -1 --format=%s "$HEAD_SHA")" > notes.txt
+          gh release delete preforged-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create preforged-latest "$apk" --prerelease --target "$HEAD_SHA" \
+            --title "Build $BUILD" --notes-file notes.txt
