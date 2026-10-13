@@ -52,6 +52,7 @@ constexpr size_t MAX_DECOMPRESSED = 256ULL << 20;
 constexpr u32 FILTER_BITS = 22;
 constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
+constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 NVN_CODE_MAGIC = 0x12345678;
 constexpr size_t NVN_CODE_HEADER_SIZE = 0x30;
 constexpr size_t MAX_SHADER_SIZE = 0x100000;
@@ -186,6 +187,11 @@ std::vector<u8> Decompress(std::span<const u8> data) {
     }
     return {};
 }
+
+struct HeaderInfo {
+    u64 hash;
+    Shader::Stage stage;
+};
 
 struct ExtractedShader {
     Shader::Stage stage;
@@ -607,6 +613,144 @@ public:
                  unfolded_same, unfolded_different, unfolded_failed, changed_by_folding);
     }
 
+    // Checks how the game's files keep the vertex and fragment shaders that the played
+    // pipelines combine, to learn which shaders to pair when compiling ahead of time.
+    void ReportPairing(const std::vector<Vulkan::GraphicsPipelineCacheKey>& keys) const {
+        struct Occurrence {
+            u32 file;
+            size_t index;
+            u64 offset;
+        };
+        std::unordered_map<u64, std::vector<Occurrence>> occurrences;
+        std::vector<std::vector<HeaderInfo>> ordered(headers.size());
+        std::vector<std::vector<u64>> offsets(headers.size());
+        for (u32 file = 0; file < headers.size(); ++file) {
+            for (const auto& [offset, header] : headers[file]) {
+                occurrences[header.hash].push_back({file, ordered[file].size(), offset});
+                ordered[file].push_back(header);
+                offsets[file].push_back(offset);
+            }
+        }
+        std::map<std::string, size_t> layout;
+        std::unordered_set<u64> pairs;
+        std::unordered_set<u64> shader_states;
+        std::unordered_map<u64, std::unordered_set<u64>> states_per_pair;
+        size_t vertex_fragment = 0;
+        size_t other_layouts = 0;
+        size_t both_extracted = 0;
+        size_t same_file = 0;
+        size_t next_fragment = 0;
+        size_t previous_vertex = 0;
+        size_t logged_same = 0;
+        size_t logged_apart = 0;
+        for (const auto& key : keys) {
+            const u64 vertex = key.unique_hashes[1];
+            const u64 fragment = key.unique_hashes[5];
+            const bool others = key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 ||
+                                key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0;
+            if (vertex == 0 || fragment == 0 || others) {
+                ++other_layouts;
+                continue;
+            }
+            ++vertex_fragment;
+            const u64 pair = Mix(vertex) ^ fragment;
+            pairs.insert(pair);
+            const u64 shader_state = Vulkan::PipelineCache::ShaderStateHash(key);
+            shader_states.insert(shader_state);
+            states_per_pair[pair].insert(shader_state);
+            const auto vertex_it = occurrences.find(vertex);
+            const auto fragment_it = occurrences.find(fragment);
+            if (vertex_it == occurrences.end() || fragment_it == occurrences.end()) {
+                continue;
+            }
+            ++both_extracted;
+            std::optional<std::pair<Occurrence, Occurrence>> best;
+            for (const Occurrence& v : vertex_it->second) {
+                for (const Occurrence& f : fragment_it->second) {
+                    if (v.file != f.file) {
+                        continue;
+                    }
+                    const auto distance = [](const Occurrence& a, const Occurrence& b) {
+                        return a.index > b.index ? a.index - b.index : b.index - a.index;
+                    };
+                    if (!best || distance(v, f) < distance(best->first, best->second)) {
+                        best = std::pair{v, f};
+                    }
+                }
+            }
+            if (!best) {
+                if (logged_apart++ < 5) {
+                    LOG_INFO(Frontend,
+                             "[ShaderScan] pair {:016x}+{:016x} in different files: {} and {}",
+                             vertex, fragment, file_names[vertex_it->second[0].file],
+                             file_names[fragment_it->second[0].file]);
+                }
+                continue;
+            }
+            ++same_file;
+            const auto& [v, f] = *best;
+            const auto diff = static_cast<std::ptrdiff_t>(f.index) -
+                              static_cast<std::ptrdiff_t>(v.index);
+            ++layout[diff >= -4 && diff <= 4 ? fmt::format("{:+d}", diff)
+                                             : (diff > 0 ? ">+4" : "<-4")];
+            const auto& list = ordered[v.file];
+            for (size_t i = v.index + 1; i < list.size(); ++i) {
+                if (list[i].stage == Shader::Stage::Fragment) {
+                    next_fragment += list[i].hash == fragment ? 1 : 0;
+                    break;
+                }
+            }
+            for (size_t i = f.index; i-- > 0;) {
+                if (list[i].stage == Shader::Stage::VertexB) {
+                    previous_vertex += list[i].hash == vertex ? 1 : 0;
+                    break;
+                }
+            }
+            if (logged_same++ < 10) {
+                LOG_INFO(Frontend,
+                         "[ShaderScan] pair {:016x}+{:016x} in {}: vertex #{} at 0x{:x}, "
+                         "fragment #{} at 0x{:x}",
+                         vertex, fragment, file_names[v.file], v.index, v.offset, f.index,
+                         f.offset);
+            }
+        }
+        size_t multi_state_pairs = 0;
+        for (const auto& [pair, states] : states_per_pair) {
+            multi_state_pairs += states.size() > 1 ? 1 : 0;
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] pipelines: {} vertex+fragment, {} other layouts; {} distinct "
+                 "pairs, {} distinct shader states, {} pairs used with several states",
+                 vertex_fragment, other_layouts, pairs.size(), shader_states.size(),
+                 multi_state_pairs);
+        LOG_INFO(Frontend,
+                 "[ShaderScan] pairing: {} with both shaders extracted, {} in one file, {} where "
+                 "the fragment is the next one after the vertex, {} where the vertex is the "
+                 "last one before the fragment",
+                 both_extracted, same_file, next_fragment, previous_vertex);
+        for (const auto& [diff, count] : layout) {
+            LOG_INFO(Frontend, "[ShaderScan] fragment position relative to vertex {}: {}", diff,
+                     count);
+        }
+        // Shows the order of stages in the file with the most code headers.
+        size_t biggest = 0;
+        for (size_t file = 0; file < ordered.size(); ++file) {
+            if (ordered[file].size() > ordered[biggest].size()) {
+                biggest = file;
+            }
+        }
+        if (!ordered.empty()) {
+            std::string stages;
+            for (size_t i = 0; i < std::min<size_t>(ordered[biggest].size(), 120); ++i) {
+                stages += ordered[biggest][i].stage == Shader::Stage::VertexB    ? 'V'
+                          : ordered[biggest][i].stage == Shader::Stage::Fragment ? 'F'
+                                                                                 : '?';
+            }
+            LOG_INFO(Frontend, "[ShaderScan] stage order in {} ({} headers): {}",
+                     file_names[biggest], ordered[biggest].size(), stages);
+        }
+    }
+
     static Shader::HostTranslateInfo MakeHostInfo() {
         Shader::HostTranslateInfo host_info{
             .support_float64 = false,
@@ -809,6 +953,12 @@ private:
         }
         size_t hits = 0;
         size_t terminators = 0;
+        const auto [file_it, inserted] = file_ids.try_emplace(name, file_names.size());
+        if (inserted) {
+            file_names.push_back(name);
+            headers.emplace_back();
+        }
+        const u32 file_id = file_it->second;
         const size_t end = data.size() - NEEDLE_WORDS * sizeof(u64);
         for (size_t pos = 0; pos <= end; pos += 4) {
             if ((pos & 0xFFFFF) == 0 && Stopped()) {
@@ -819,7 +969,12 @@ private:
                 ++terminators;
             }
             if (static_cast<u32>(first) == NVN_CODE_MAGIC) {
-                Extract(data, pos + NVN_CODE_HEADER_SIZE);
+                Extract(data, pos + NVN_CODE_HEADER_SIZE, file_id, base_offset + pos);
+            }
+            if (static_cast<u32>(first) == BNSH_MAGIC && bnsh_logged < 10) {
+                ++bnsh_logged;
+                LOG_INFO(Frontend, "[ShaderScan] BNSH container in {} at 0x{:x}", name,
+                         base_offset + pos);
             }
             const u64 mixed = Mix(first);
             if ((filter[(mixed & ((1u << FILTER_BITS) - 1)) / 64] & (u64{1} << (mixed % 64))) ==
@@ -853,7 +1008,7 @@ private:
 
     // Takes the shader that follows an NVN code header, using the same end marker and hash as the
     // emulator uses for shaders the game uploads.
-    void Extract(std::span<const u8> data, size_t start) {
+    void Extract(std::span<const u8> data, size_t start, u32 file_id, u64 file_offset) {
         ++code_headers;
         if (start + SPH_SIZE + sizeof(u64) > data.size() || extracted_bytes > MAX_EXTRACTED_BYTES) {
             return;
@@ -882,6 +1037,7 @@ private:
             // shader ends after its first exit instruction.
             const size_t hashed = exit_size.value_or(size);
             const u64 hash = Common::CityHash64(bytes, hashed);
+            headers[file_id].emplace(file_offset, HeaderInfo{hash, stage});
             if (extracted.contains(hash)) {
                 return;
             }
@@ -952,6 +1108,11 @@ private:
     std::map<u32, size_t> logged_per_stage;
     std::unordered_map<u64, ExtractedShader> extracted;
     std::unordered_set<u64> self_branch_hashes;
+    std::unordered_map<std::string, u32> file_ids;
+    std::vector<std::string> file_names;
+    /// Code headers of each file by offset, in the order the game stores them.
+    std::vector<std::map<u64, HeaderInfo>> headers;
+    size_t bnsh_logged = 0;
     u32 texture_bound = 2;
     DriverConstants driver_constants;
     size_t extracted_bytes = 0;
@@ -965,7 +1126,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done_v5";
+    const auto done_marker = shader_dir / "shader_scan_done_v6";
     std::error_code error;
     if (std::filesystem::exists(done_marker, error)) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
@@ -982,8 +1143,9 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
                  error.message());
         return;
     }
+    std::vector<Vulkan::GraphicsPipelineCacheKey> graphics_keys;
     std::vector<CachedShaderCode> shaders =
-        Vulkan::PipelineCache::ReadCachedShaderCode(copy, stop);
+        Vulkan::PipelineCache::ReadCachedShaderCode(copy, stop, &graphics_keys);
     std::filesystem::remove(copy, error);
     if (shaders.empty()) {
         LOG_INFO(Frontend, "[ShaderScan] pipeline cache has no shaders");
@@ -1011,6 +1173,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         scanner.Report("all files");
     }
     scanner.ReportExtraction();
+    scanner.ReportPairing(graphics_keys);
     scanner.ReportGuessAccuracy();
     {
         // The translator logs every instruction it cannot decode, which floods the log when it

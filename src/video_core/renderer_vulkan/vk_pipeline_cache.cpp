@@ -752,7 +752,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 }
 
 std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode(
-    const std::filesystem::path& filename, std::stop_token stop_loading) {
+    const std::filesystem::path& filename, std::stop_token stop_loading,
+    std::vector<GraphicsPipelineCacheKey>* graphics_keys) {
     std::vector<CachedShaderCode> result;
     std::unordered_set<u64> seen;
     const auto add{[&](FileEnvironment& env) {
@@ -787,11 +788,33 @@ std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode
         [&](std::ifstream& file, std::vector<FileEnvironment> envs) {
             GraphicsPipelineCacheKey key;
             file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            if (graphics_keys) {
+                graphics_keys->push_back(key);
+            }
             for (FileEnvironment& env : envs) {
                 add(env);
             }
         });
     return result;
+}
+
+u64 PipelineCache::ShaderStateHash(const GraphicsPipelineCacheKey& key) {
+    const FixedPipelineState& state{key.state};
+    std::array<u32, 8 + Maxwell::NumVertexAttributes> words{};
+    words[0] = static_cast<u32>(state.topology.Value());
+    words[1] = state.topology == Maxwell::PrimitiveTopology::Points ? state.point_size : 0;
+    words[2] = state.xfb_enabled;
+    words[3] = state.ndc_minus_one_to_one;
+    words[4] = state.alpha_test_func;
+    words[5] = state.alpha_test_ref;
+    words[6] = state.attachment0_dual_source_blend;
+    words[7] = static_cast<u32>(state.msaa_mode.Value());
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        words[8 + index] = static_cast<u32>(
+            state.dynamic_vertex_input ? AttributeType(state, index)
+                                       : CastAttributeType(state.attributes[index]));
+    }
+    return Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words));
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {

@@ -131,7 +131,11 @@ public:
     /// Reads the guest code of every distinct shader stored in a pipeline cache file.
     /// Pass a private copy of the file: a damaged file is deleted while it is read.
     [[nodiscard]] static std::vector<CachedShaderCode> ReadCachedShaderCode(
-        const std::filesystem::path& filename, std::stop_token stop_loading);
+        const std::filesystem::path& filename, std::stop_token stop_loading,
+        std::vector<GraphicsPipelineCacheKey>* graphics_keys = nullptr);
+
+    /// Hashes the parts of a pipeline's state that change the translated shaders.
+    [[nodiscard]] static u64 ShaderStateHash(const GraphicsPipelineCacheKey& key);
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
