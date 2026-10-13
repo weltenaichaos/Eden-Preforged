@@ -1524,6 +1524,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_RESCAN_GAME_FILES.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
                 add(BooleanSetting.PREFORGED_LOG_SHADER_COMPILES.key)
+                add(BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE.key)
             }
 
             add(HeaderSetting(R.string.gpu))

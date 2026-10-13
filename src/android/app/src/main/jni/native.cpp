@@ -498,6 +498,7 @@ void EmulationSession::LogMemoryUse() {
     const long page_size = sysconf(_SC_PAGESIZE);
     LOG_INFO(Frontend, "[Preforged] memory: {} MiB resident, {} MiB virtual, {} mappings",
              pages_resident * page_size >> 20, pages_total * page_size >> 20, mappings);
+    Common::Preforged::LogMappingSummary(6);
 }
 
 void EmulationSession::RequestDiskShaderCacheReload(u64 program_id) {

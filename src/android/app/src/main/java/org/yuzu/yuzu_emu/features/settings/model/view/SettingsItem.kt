@@ -294,6 +294,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
+                    titleId = R.string.preforged_driver_pipeline_cache,
+                    descriptionId = R.string.preforged_driver_pipeline_cache_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.DEBUG_FLUSH_BY_LINE,
                     titleId = R.string.flush_by_line,
                     descriptionId = R.string.flush_by_line_description

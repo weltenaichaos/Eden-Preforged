@@ -1368,8 +1368,8 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         std::vector<char> cache_data(cache_size);
         file.read(cache_data.data(), cache_size);
 
-        LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+        LOG_INFO(Render_Vulkan, "Loaded Vulkan driver pipeline cache: {} MiB from {}",
+                 cache_size >> 20, Common::FS::PathToUTF8String(filename));
 
         return create_pipeline_cache(cache_size, cache_data.data());
 

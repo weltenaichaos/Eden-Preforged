@@ -86,6 +86,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_RESCAN_GAME_FILES("preforged_rescan_game_files"),
     PREFORGED_PRECOMPILE_GAME_SHADERS("preforged_precompile_game_shaders"),
     PREFORGED_LOG_SHADER_COMPILES("preforged_log_shader_compiles"),
+    USE_VULKAN_DRIVER_PIPELINE_CACHE("use_vulkan_driver_pipeline_cache"),
     EXTENDED_LOGGING("extended_logging"),
     DONT_SHOW_DRIVER_SHADER_WARNING("dont_show_driver_shader_warning"),
     ENABLE_OVERLAY("enable_overlay"),

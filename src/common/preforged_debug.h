@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstddef>
+
 namespace Common::Preforged {
 
 /// Switches for testing Eden Preforged without a new build, set in the debug settings.
@@ -24,5 +26,9 @@ struct DebugOptions {
 
 /// Takes the switches from the settings and logs them. Call when a game starts.
 void LoadOptions();
+
+/// Logs how many memory mappings the app holds and which files or heaps hold the most, since
+/// Android ends the app once it has about 65,000. Shows the top `top` names.
+void LogMappingSummary(size_t top);
 
 } // namespace Common::Preforged

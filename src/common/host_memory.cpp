@@ -51,6 +51,7 @@
 
 #endif // ^^^ POSIX ^^^
 
+#include <atomic>
 #include <mutex>
 #include <random>
 
@@ -59,6 +60,7 @@
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/preforged_debug.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -644,6 +646,14 @@ public:
         }
 #endif
         int ret = mprotect(virtual_base + virtual_offset, length, flags);
+        if (ret != 0) {
+            const int error = errno;
+            static std::atomic_bool summary_logged{false};
+            if (!summary_logged.exchange(true)) {
+                Common::Preforged::LogMappingSummary(20);
+            }
+            errno = error;
+        }
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
 
