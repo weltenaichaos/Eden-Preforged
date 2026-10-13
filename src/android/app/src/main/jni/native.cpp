@@ -92,7 +92,14 @@ extern "C" {
 #include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_amiibo.h"
 #include "jni/native.h"
+#include <cstdio>
+#include <unistd.h>
+
+#include "jni/crash_report.h"
 #include "jni/shader_file_scan.h"
+#include "common/fs/fs_paths.h"
+#include "common/preforged_debug.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/frame_gen/lossless_dll.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -260,9 +267,16 @@ void EmulationSession::InitializeSystem(bool reload) {
         Common::Log::Initialize();
         Common::Log::SetColorConsoleBackendEnabled(true);
         Common::Log::Start();
+        InstallCrashReport(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / LOG_FILE);
 
         m_input_subsystem.Initialize();
     }
+
+    // Read on every game start, so a changed switch only needs the game restarted.
+    Common::Preforged::LoadOptions(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) /
+                                   "preforged_debug.ini");
+    Shader::Optimization::SetDriverConstBufferFolding(
+        Common::Preforged::Options().bake_driver_constants);
 
     // Initialize filesystem.
     m_system.SetFilesystem(m_vfs);
@@ -437,7 +451,12 @@ void EmulationSession::RunEmulation() {
         m_system.InitializeDebugger();
     }
 
+    auto last_memory_log = std::chrono::steady_clock::now();
     while (true) {
+        if (std::chrono::steady_clock::now() - last_memory_log > std::chrono::seconds{30}) {
+            last_memory_log = std::chrono::steady_clock::now();
+            LogMemoryUse();
+        }
         std::optional<u64> reload_title;
         {
             [[maybe_unused]] std::unique_lock lock(m_mutex);
@@ -457,6 +476,29 @@ void EmulationSession::RunEmulation() {
 
     // Reset current applet ID.
     m_applet_id = static_cast<int>(Service::AM::AppletId::Application);
+}
+
+// Memory use and the number of memory mappings, which Android limits to about 65,000; running
+// out of either ends the app without a message.
+void EmulationSession::LogMemoryUse() {
+    long pages_total = 0;
+    long pages_resident = 0;
+    if (std::FILE* statm = std::fopen("/proc/self/statm", "r")) {
+        if (std::fscanf(statm, "%ld %ld", &pages_total, &pages_resident) != 2) {
+            pages_resident = 0;
+        }
+        std::fclose(statm);
+    }
+    size_t mappings = 0;
+    if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
+        for (int c; (c = std::fgetc(maps)) != EOF;) {
+            mappings += c == '\n' ? 1 : 0;
+        }
+        std::fclose(maps);
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    LOG_INFO(Frontend, "[Preforged] memory: {} MiB resident, {} MiB virtual, {} mappings",
+             pages_resident * page_size >> 20, pages_total * page_size >> 20, mappings);
 }
 
 void EmulationSession::RequestDiskShaderCacheReload(u64 program_id) {

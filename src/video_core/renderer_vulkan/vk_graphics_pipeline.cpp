@@ -14,6 +14,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "common/preforged_debug.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
@@ -311,7 +312,8 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
-                in_game = worker_thread != nullptr] {
+                in_game = worker_thread != nullptr &&
+                          Common::Preforged::Options().log_shader_compiles] {
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
         try {

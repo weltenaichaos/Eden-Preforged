@@ -32,6 +32,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/preforged_shaders.h"
+#include "common/preforged_debug.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -898,6 +899,10 @@ void PipelineCache::PrecompilePreforgedPairs(
     LOG_INFO(Render_Vulkan,
              "[Preforged] {} shader pairs from the game files, {} to compile now, {} states seen",
              programs.pairs.size(), todo.size(), state_counts.size());
+    if (!Common::Preforged::Options().precompile_game_shaders) {
+        LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in preforged_debug.ini");
+        return;
+    }
     if (todo.empty()) {
         return;
     }
@@ -1126,7 +1131,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
-    if (build_in_parallel) {
+    if (build_in_parallel && Common::Preforged::Options().log_shader_compiles) {
         // Shader timing test: guest shader translation to SPIR-V, done on the GPU thread in game
         const std::chrono::duration<double, std::milli> translate_time{
             std::chrono::steady_clock::now() - translate_start};

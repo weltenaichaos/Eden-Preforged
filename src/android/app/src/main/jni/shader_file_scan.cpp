@@ -24,6 +24,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/preforged_debug.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "common/zstd_compression.h"
@@ -1330,7 +1331,12 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
                             fmt::format("{:016x}", program_id);
     const auto done_marker = shader_dir / "shader_scan_done_v8";
     std::error_code error;
-    if (std::filesystem::exists(done_marker, error)) {
+    const auto& options = Common::Preforged::Options();
+    if (!options.scan_game_files) {
+        LOG_INFO(Frontend, "[ShaderScan] switched off in preforged_debug.ini");
+        return;
+    }
+    if (std::filesystem::exists(done_marker, error) && !options.rescan_game_files) {
         LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
                  Common::FS::PathToUTF8String(done_marker));
         return;

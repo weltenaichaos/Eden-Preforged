@@ -97,6 +97,8 @@ add_library(
     scm_rev.h
     scope_exit.h
     scratch_buffer.h
+    preforged_debug.cpp
+    preforged_debug.h
     settings.cpp
     settings.h
     settings_common.cpp
