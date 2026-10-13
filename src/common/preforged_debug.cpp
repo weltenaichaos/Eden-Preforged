@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #ifdef __linux__
+#include <malloc.h>
 #include <unistd.h>
 #endif
 #include <string>
@@ -33,6 +34,7 @@ void LoadOptions() {
     options.log_shader_compiles = Settings::values.preforged_log_shader_compiles.GetValue();
     options.precompile_percent =
         std::min(Settings::values.preforged_precompile_percent.GetValue(), 100u);
+    options.store_any_state = Settings::values.preforged_store_any_state.GetValue();
     options.log_memory = Settings::values.preforged_log_memory.GetValue();
     options.log_slow_frames = Settings::values.preforged_log_slow_frames.GetValue();
     LOG_INFO(Common,
@@ -40,13 +42,16 @@ void LoadOptions() {
              "log compiles {}",
              options.bake_driver_constants, options.scan_game_files, options.rescan_game_files,
              options.precompile_game_shaders, options.log_shader_compiles);
-    LOG_INFO(Common, "[Preforged] pre-compile share {}%, log memory {}, log slow frames {}",
-             options.precompile_percent, options.log_memory, options.log_slow_frames);
+    LOG_INFO(Common,
+             "[Preforged] pre-compile share {}%, stored code for any state {}, log memory {}, "
+             "log slow frames {}",
+             options.precompile_percent, options.store_any_state, options.log_memory,
+             options.log_slow_frames);
     LOG_INFO(Common, "[Preforged] driver pipeline cache {}",
              Settings::values.use_vulkan_driver_pipeline_cache.GetValue());
 }
 
-void LogMemoryUse(const char* when) {
+void LogMemoryUse(const char* when, bool count_mappings) {
 #ifdef __linux__
     long pages_total = 0;
     long pages_resident = 0;
@@ -56,16 +61,26 @@ void LogMemoryUse(const char* when) {
         }
         std::fclose(statm);
     }
-    size_t mappings = 0;
-    if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
-        for (int c; (c = std::fgetc(maps)) != EOF;) {
-            mappings += c == '\n' ? 1 : 0;
+    // Counting mappings reads the whole mapping list, which holds up threads that change memory
+    // mappings for up to a few hundred milliseconds, so it is left out during play.
+    std::string mappings{"not counted"};
+    if (count_mappings) {
+        size_t count = 0;
+        if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
+            for (int c; (c = std::fgetc(maps)) != EOF;) {
+                count += c == '\n' ? 1 : 0;
+            }
+            std::fclose(maps);
         }
-        std::fclose(maps);
+        mappings = std::to_string(count);
     }
+    const struct mallinfo heap = mallinfo();
     const long page_size = sysconf(_SC_PAGESIZE);
-    LOG_INFO(Common, "[Preforged] memory {}: {} MiB resident, {} MiB virtual, {} mappings", when,
-             pages_resident * page_size >> 20, pages_total * page_size >> 20, mappings);
+    LOG_INFO(Common,
+             "[Preforged] memory {}: {} MiB resident, {} MiB virtual, {} MiB in malloc, {} "
+             "mappings",
+             when, pages_resident * page_size >> 20, pages_total * page_size >> 20,
+             static_cast<size_t>(heap.uordblks) >> 20, mappings);
 #endif
 }
 

@@ -304,6 +304,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_STORE_ANY_STATE,
+                    titleId = R.string.preforged_store_any_state,
+                    descriptionId = R.string.preforged_store_any_state_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.PREFORGED_LOG_MEMORY,
                     titleId = R.string.preforged_log_memory,
                     descriptionId = R.string.preforged_log_memory_description

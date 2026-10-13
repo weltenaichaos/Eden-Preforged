@@ -23,7 +23,10 @@ struct DebugOptions {
     /// Share of the game file shader pairs to compile, in percent, most likely first. Compiled
     /// pairs are kept on storage and read when the game draws with them.
     unsigned precompile_percent = 100;
-    /// Logs memory use and mappings every 30 seconds in game.
+    /// Hands the driver a pair's stored code even when the game draws it with another state
+    /// than it was compiled with, in case the driver can reuse part of it.
+    bool store_any_state = true;
+    /// Logs memory use every 30 seconds in game.
     bool log_memory = true;
     /// Logs every frame that took more than twice as long as the frame before it.
     bool log_slow_frames = true;
@@ -38,7 +41,8 @@ void LoadOptions();
 /// Android ends the app once it has about 65,000. Shows the top `top` names.
 void LogMappingSummary(size_t top);
 
-/// Logs resident and virtual memory and the number of mappings, tagged with `when`.
-void LogMemoryUse(const char* when);
+/// Logs resident, virtual and malloc memory, tagged with `when`, and the number of mappings
+/// when `count_mappings` is set, which briefly holds up other threads.
+void LogMemoryUse(const char* when, bool count_mappings = true);
 
 } // namespace Common::Preforged

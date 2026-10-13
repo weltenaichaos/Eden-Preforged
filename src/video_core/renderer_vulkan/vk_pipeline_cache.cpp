@@ -953,9 +953,10 @@ std::shared_ptr<vk::PipelineCache> PipelineCache::LoadPreforgedStoreEntry(
         entry = it->second;
         path = preforged_store_path;
     }
-    // Code compiled for another state would mostly be compiled again, and the driver pipeline
-    // cache keeps what is compiled for this one.
-    if (entry.state_hash != ShaderStateHash(key)) {
+    // With another state the driver may have to compile parts again, and those then don't
+    // land in the driver pipeline cache, so this can be switched off.
+    if (entry.state_hash != ShaderStateHash(key) &&
+        !Common::Preforged::Options().store_any_state) {
         return {};
     }
     std::vector<char> data(entry.size);

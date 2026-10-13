@@ -934,6 +934,7 @@ struct Values {
     Setting<bool> preforged_rescan_game_files{linkage, false, "preforged_rescan_game_files", Category::Miscellaneous};
     Setting<bool> preforged_precompile_game_shaders{linkage, true, "preforged_precompile_game_shaders", Category::Miscellaneous};
     Setting<bool> preforged_log_shader_compiles{linkage, true, "preforged_log_shader_compiles", Category::Miscellaneous};
+    Setting<bool> preforged_store_any_state{linkage, true, "preforged_store_any_state", Category::Miscellaneous};
     Setting<bool> preforged_log_memory{linkage, true, "preforged_log_memory", Category::Miscellaneous};
     Setting<bool> preforged_log_slow_frames{linkage, true, "preforged_log_slow_frames", Category::Miscellaneous};
     Setting<u32, true> preforged_precompile_percent{linkage, 100, 0, 100, "preforged_compile_share", Category::Miscellaneous, Specialization::Scalar};
