@@ -832,7 +832,8 @@ u64 PipelineCache::ShaderStateHash(const GraphicsPipelineCacheKey& key) {
 
 namespace {
 constexpr std::array<char, 4> PREFORGED_STORE_MAGIC{'P', 'F', 'D', 'S'};
-constexpr u32 PREFORGED_STORE_VERSION = 1;
+// Version 2 records what each pair was translated to, so stored code is matched by SPIR-V.
+constexpr u32 PREFORGED_STORE_VERSION = 2;
 
 struct PreforgedStoreHeader {
     std::array<char, 4> magic;
@@ -844,9 +845,97 @@ struct PreforgedStoreHeader {
 struct PreforgedStoreRecord {
     u64 pair_id;
     u64 state_hash;
+    u64 code_hash;
     u32 size;
     u32 reserved;
+    PipelineCache::PreforgedShaderInputs inputs;
 };
+
+PipelineCache::PreforgedShaderInputs MakePreforgedInputs(const GraphicsPipelineCacheKey& key,
+                                                         const Shader::Info& vertex_info) {
+    const FixedPipelineState& state{key.state};
+    PipelineCache::PreforgedShaderInputs inputs{};
+    inputs.attributes.fill(0xFF);
+    for (size_t index = 0; index < inputs.attributes.size(); ++index) {
+        if (!vertex_info.loads.Generic(index)) {
+            continue;
+        }
+        inputs.attributes[index] = static_cast<u8>(
+            state.dynamic_vertex_input ? AttributeType(state, index)
+                                       : CastAttributeType(state.attributes[index]));
+    }
+    inputs.points = state.topology == Maxwell::PrimitiveTopology::Points;
+    inputs.point_size = inputs.points ? state.point_size : 0;
+    inputs.xfb = state.xfb_enabled != 0;
+    inputs.ndc_minus_one_to_one = state.ndc_minus_one_to_one != 0;
+    inputs.alpha_test_func = static_cast<u8>(state.alpha_test_func.Value());
+    inputs.alpha_test_ref = state.alpha_test_ref;
+    inputs.dual_source_blend = state.attachment0_dual_source_blend != 0;
+    inputs.early_z = state.early_z != 0;
+    inputs.y_negate = state.y_negate != 0;
+    return inputs;
+}
+
+std::string_view AttributeTypeName(u8 type) {
+    switch (static_cast<Shader::AttributeType>(type)) {
+    case Shader::AttributeType::Float:
+        return "float";
+    case Shader::AttributeType::SignedInt:
+        return "int";
+    case Shader::AttributeType::UnsignedInt:
+        return "uint";
+    case Shader::AttributeType::SignedScaled:
+        return "int scaled";
+    case Shader::AttributeType::UnsignedScaled:
+        return "uint scaled";
+    case Shader::AttributeType::Disabled:
+        return "off";
+    }
+    return "?";
+}
+
+/// Lists what differs between the inputs a pair was compiled with and the ones the game uses.
+std::string DescribeInputDifference(const PipelineCache::PreforgedShaderInputs& stored,
+                                    const PipelineCache::PreforgedShaderInputs& game) {
+    std::vector<std::string> parts;
+    for (size_t index = 0; index < stored.attributes.size(); ++index) {
+        if (stored.attributes[index] != game.attributes[index]) {
+            parts.push_back(fmt::format("attribute {} {} instead of {}", index,
+                                        AttributeTypeName(game.attributes[index]),
+                                        AttributeTypeName(stored.attributes[index])));
+        }
+    }
+    if (stored.points != game.points || stored.point_size != game.point_size) {
+        parts.emplace_back("point size");
+    }
+    if (stored.xfb != game.xfb) {
+        parts.emplace_back("transform feedback");
+    }
+    if (stored.ndc_minus_one_to_one != game.ndc_minus_one_to_one) {
+        parts.emplace_back("depth range");
+    }
+    if (stored.alpha_test_func != game.alpha_test_func) {
+        parts.push_back(fmt::format("alpha test {} instead of {}", game.alpha_test_func,
+                                    stored.alpha_test_func));
+    } else if (stored.alpha_test_ref != game.alpha_test_ref) {
+        parts.emplace_back("alpha test reference");
+    }
+    if (stored.dual_source_blend != game.dual_source_blend) {
+        parts.emplace_back("dual source blend");
+    }
+    if (stored.early_z != game.early_z) {
+        parts.emplace_back("early depth test");
+    }
+    if (stored.y_negate != game.y_negate) {
+        parts.emplace_back("y flip");
+    }
+    if (parts.empty()) {
+        // Same state, so what the game files guessed for the shaders, such as texture types,
+        // differs from what the game uses.
+        return "same state, shader guesses differ";
+    }
+    return fmt::format("{}", fmt::join(parts, ", "));
+}
 } // Anonymous namespace
 
 void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
@@ -890,13 +979,16 @@ void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
                     break;
                 }
                 preforged_store.insert_or_assign(
-                    record.pair_id, PreforgedStoreEntry{offset, record.state_hash, record.size});
+                    record.pair_id,
+                    PreforgedStoreEntry{offset, record.state_hash, record.size,
+                                        PreforgedCode{record.code_hash, record.inputs}});
                 valid_end = offset + record.size;
                 bytes += record.size;
                 file.seekg(static_cast<std::streamoff>(valid_end));
             }
         } else if (file) {
-            LOG_INFO(Render_Vulkan, "[Preforged] pair store is from another driver, starting over");
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] pair store is from another driver or build, starting over");
         }
     }
     if (valid_end == 0) {
@@ -911,7 +1003,7 @@ void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
              preforged_store.size(), bytes >> 20);
 }
 
-void PipelineCache::AppendPreforgedStore(u64 pair_id, u64 state_hash,
+void PipelineCache::AppendPreforgedStore(u64 pair_id, u64 state_hash, const PreforgedCode& code,
                                          const vk::PipelineCache& cache) {
     size_t size{};
     if (cache.Read(&size, nullptr) != VK_SUCCESS || size == 0) {
@@ -925,18 +1017,19 @@ void PipelineCache::AppendPreforgedStore(u64 pair_id, u64 state_hash,
     if (!preforged_store_out.is_open()) {
         return;
     }
-    const PreforgedStoreRecord record{pair_id, state_hash, static_cast<u32>(size), 0};
+    const PreforgedStoreRecord record{
+        pair_id, state_hash, code.code_hash, static_cast<u32>(size), 0, code.inputs};
     const u64 offset{static_cast<u64>(preforged_store_out.tellp()) + sizeof(record)};
     preforged_store_out.write(reinterpret_cast<const char*>(&record), sizeof(record));
     preforged_store_out.write(data.data(), size);
     if (preforged_store_out) {
-        preforged_store.insert_or_assign(pair_id,
-                                         PreforgedStoreEntry{offset, state_hash, record.size});
+        preforged_store.insert_or_assign(
+            pair_id, PreforgedStoreEntry{offset, state_hash, record.size, code});
     }
 }
 
 std::shared_ptr<vk::PipelineCache> PipelineCache::LoadPreforgedStoreEntry(
-    const GraphicsPipelineCacheKey& key) {
+    const GraphicsPipelineCacheKey& key, const PreforgedCode& code, std::string& match) {
     if (key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 ||
         key.unique_hashes[4] != 0 || key.unique_hashes[1] == 0 || key.unique_hashes[5] == 0) {
         return {};
@@ -948,16 +1041,22 @@ std::shared_ptr<vk::PipelineCache> PipelineCache::LoadPreforgedStoreEntry(
         std::scoped_lock lock{preforged_store_mutex};
         const auto it{preforged_store.find(pair_id)};
         if (it == preforged_store.end()) {
+            match = "not stored";
             return {};
         }
         entry = it->second;
         path = preforged_store_path;
     }
-    // With another state the driver may have to compile parts again, and those then don't
-    // land in the driver pipeline cache, so this can be switched off.
-    if (entry.state_hash != ShaderStateHash(key) &&
-        !Common::Preforged::Options().store_any_state) {
-        return {};
+    // Driver code only helps when the driver gets the same SPIR-V. Handing it code for other
+    // SPIR-V crashed the driver, so that stays behind its switch.
+    if (entry.code.code_hash == code.code_hash) {
+        match = "same code";
+    } else {
+        match = fmt::format("other code: {}",
+                            DescribeInputDifference(entry.code.inputs, code.inputs));
+        if (!Common::Preforged::Options().store_any_state) {
+            return {};
+        }
     }
     std::vector<char> data(entry.size);
     std::ifstream file{path, std::ios::binary};
@@ -1144,11 +1243,12 @@ void PipelineCache::PrecompilePreforgedPairs(
                         .pInitialData = nullptr,
                     }))};
                 ShaderPools pools;
-                built =
-                    CreateGraphicsPipeline(pools, key, envs, nullptr, false, cache) != nullptr;
+                PreforgedCode code;
+                built = CreateGraphicsPipeline(pools, key, envs, nullptr, false, cache, &code) !=
+                        nullptr;
                 if (built) {
                     AppendPreforgedStore(pair_id(key.unique_hashes[1], key.unique_hashes[5]),
-                                         ShaderStateHash(key), *cache);
+                                         ShaderStateHash(key), code, *cache);
                 }
             } catch (const std::exception& e) {
                 LOG_DEBUG(Render_Vulkan, "[Preforged] pair failed: {}", e.what());
@@ -1246,7 +1346,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-    bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache) try {
+    bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache,
+    PreforgedCode* code_out) try {
     const auto translate_start{std::chrono::steady_clock::now()};
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
@@ -1303,6 +1404,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
+    PreforgedCode preforged_code;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
          ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -1320,6 +1422,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
         device.SaveShader(code);
+        preforged_code.code_hash =
+            (preforged_code.code_hash * 0x9E3779B97F4A7C15ULL) ^
+            Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+                               code.size() * sizeof(u32));
         modules[stage_index] = BuildShader(device, code);
 
         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
@@ -1346,9 +1452,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    if (uses_vertex_b && !uses_vertex_a) {
+        preforged_code.inputs = MakePreforgedInputs(key, programs[1].info);
+    }
+    if (code_out) {
+        *code_out = preforged_code;
+    }
     const bool given_build_cache{build_cache != nullptr};
+    std::string store_match{"not stored"};
     if (!build_cache) {
-        build_cache = LoadPreforgedStoreEntry(key);
+        build_cache = LoadPreforgedStoreEntry(key, preforged_code, store_match);
     }
     if (build_in_parallel && Common::Preforged::Options().log_shader_compiles) {
         // Shader timing test: guest shader translation to SPIR-V, done on the GPU thread in game
@@ -1364,12 +1477,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             game_files = fmt::format(
                 "vertex {} fragment {} pair {}", preforged_shaders.contains(vertex) ? "yes" : "no",
                 preforged_shaders.contains(fragment) ? "yes" : "no",
-                pair != preforged_pairs.end()
-                    ? (pair->second == ShaderStateHash(key) ? "yes, same state"
-                                                            : "yes, other state")
+                pair != preforged_pairs.end() ? fmt::format("yes, {}", store_match)
                 : preforged_skipped_pairs.contains((vertex * 0x9E3779B97F4A7C15ULL) ^ fragment)
-                    ? "skipped by the pre-compile share"
-                    : "no");
+                    ? std::string{"skipped by the pre-compile share"}
+                    : std::string{"no"});
         }
         LOG_INFO(Render_Vulkan,
                  "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x} game files: {}, "

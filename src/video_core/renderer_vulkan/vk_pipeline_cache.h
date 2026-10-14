@@ -14,6 +14,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -150,11 +151,37 @@ private:
     /// Shader pairs from the game files left out by the pre-compile share.
     std::unordered_set<u64> preforged_skipped_pairs;
 
+public:
+    /// The parts of a pipeline's state that change the SPIR-V of a vertex and fragment pair.
+    struct PreforgedShaderInputs {
+        /// Type of each attribute the vertex shader reads, 0xFF for attributes it doesn't read.
+        std::array<u8, 32> attributes;
+        u32 point_size;
+        u32 alpha_test_ref;
+        u8 points;
+        u8 xfb;
+        u8 ndc_minus_one_to_one;
+        u8 alpha_test_func;
+        u8 dual_source_blend;
+        u8 early_z;
+        u8 y_negate;
+        u8 reserved;
+
+        bool operator==(const PreforgedShaderInputs&) const = default;
+    };
+    /// What a vertex and fragment pair was translated to.
+    struct PreforgedCode {
+        u64 code_hash{};
+        PreforgedShaderInputs inputs{};
+    };
+
+private:
     /// Where a compiled pair's driver code sits in the store file on storage.
     struct PreforgedStoreEntry {
         u64 offset;
         u64 state_hash;
         u32 size;
+        PreforgedCode code;
     };
     /// Driver code of the pairs compiled from the game files, one small driver cache per pair,
     /// kept on storage and read only when the game draws with that pair. Only the index is kept
@@ -170,12 +197,13 @@ private:
     void OpenPreforgedStore(const std::filesystem::path& base_dir);
 
     /// Appends the code in `cache` for a pair. Called while compiling, from worker threads.
-    void AppendPreforgedStore(u64 pair_id, u64 state_hash, const vk::PipelineCache& cache);
+    void AppendPreforgedStore(u64 pair_id, u64 state_hash, const PreforgedCode& code,
+                              const vk::PipelineCache& cache);
 
-    /// Reads a pair's driver code from storage when the key draws with a stored pair in the
-    /// state it was compiled with.
+    /// Reads a pair's driver code from storage when the key draws with a stored pair that was
+    /// translated to the same SPIR-V. `match` tells how the stored pair compares, for the log.
     [[nodiscard]] std::shared_ptr<vk::PipelineCache> LoadPreforgedStoreEntry(
-        const GraphicsPipelineCacheKey& key);
+        const GraphicsPipelineCacheKey& key, const PreforgedCode& code, std::string& match);
 
     void PrecompilePreforgedPairs(const std::filesystem::path& base_dir,
                                   std::span<const GraphicsPipelineCacheKey> played_keys,
@@ -191,7 +219,8 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache = {});
+        bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache = {},
+        PreforgedCode* code_out = nullptr);
 
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                            const ShaderInfo* shader);
