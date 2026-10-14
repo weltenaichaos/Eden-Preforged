@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <vector>
@@ -84,7 +85,8 @@ public:
         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        std::shared_ptr<vk::PipelineCache> build_cache = {});
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     bool SupportsAlphaToCoverage() const noexcept {
@@ -151,6 +153,9 @@ private:
     TextureCache& texture_cache;
     BufferCache& buffer_cache;
     vk::PipelineCache& pipeline_cache;
+    /// Driver cache used instead of pipeline_cache for the build, then let go of. Holds code
+    /// compiled ahead of time from the game files, read from storage for just this pipeline.
+    std::shared_ptr<vk::PipelineCache> build_cache;
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;

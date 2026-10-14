@@ -259,6 +259,79 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_BAKE_DRIVER_CONSTANTS,
+                    titleId = R.string.preforged_bake_driver_constants,
+                    descriptionId = R.string.preforged_bake_driver_constants_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_SCAN_GAME_FILES,
+                    titleId = R.string.preforged_scan_game_files,
+                    descriptionId = R.string.preforged_scan_game_files_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_RESCAN_GAME_FILES,
+                    titleId = R.string.preforged_rescan_game_files,
+                    descriptionId = R.string.preforged_rescan_game_files_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS,
+                    titleId = R.string.preforged_precompile_game_shaders,
+                    descriptionId = R.string.preforged_precompile_game_shaders_description
+                )
+            )
+            put(
+                SliderSetting(
+                    IntSetting.PREFORGED_PRECOMPILE_PERCENT,
+                    titleId = R.string.preforged_precompile_percent,
+                    descriptionId = R.string.preforged_precompile_percent_description,
+                    min = 0,
+                    max = 100,
+                    units = "%"
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_SHADER_COMPILES,
+                    titleId = R.string.preforged_log_shader_compiles,
+                    descriptionId = R.string.preforged_log_shader_compiles_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_STORE_ANY_STATE,
+                    titleId = R.string.preforged_store_any_state,
+                    descriptionId = R.string.preforged_store_any_state_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_MEMORY,
+                    titleId = R.string.preforged_log_memory,
+                    descriptionId = R.string.preforged_log_memory_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_SLOW_FRAMES,
+                    titleId = R.string.preforged_log_slow_frames,
+                    descriptionId = R.string.preforged_log_slow_frames_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
+                    titleId = R.string.preforged_driver_pipeline_cache,
+                    descriptionId = R.string.preforged_driver_pipeline_cache_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.DEBUG_FLUSH_BY_LINE,
                     titleId = R.string.flush_by_line,
                     descriptionId = R.string.flush_by_line_description

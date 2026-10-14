@@ -92,6 +92,14 @@ extern "C" {
 #include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_amiibo.h"
 #include "jni/native.h"
+#include <cstdio>
+#include <unistd.h>
+
+#include "jni/crash_report.h"
+#include "jni/shader_file_scan.h"
+#include "common/fs/fs_paths.h"
+#include "common/preforged_debug.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/frame_gen/lossless_dll.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -259,6 +267,7 @@ void EmulationSession::InitializeSystem(bool reload) {
         Common::Log::Initialize();
         Common::Log::SetColorConsoleBackendEnabled(true);
         Common::Log::Start();
+        InstallCrashReport(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / LOG_FILE);
 
         m_input_subsystem.Initialize();
     }
@@ -294,6 +303,10 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
     m_system.SetShuttingDown(false);
     m_system.ApplySettings();
     Settings::LogSettings();
+    // Read on every game start, so a changed switch only needs the game restarted.
+    Common::Preforged::LoadOptions();
+    Shader::Optimization::SetDriverConstBufferFolding(
+        Common::Preforged::Options().bake_driver_constants);
     m_system.HIDCore().ReloadInputDevices();
     m_system.SetFrontendAppletSet({
         nullptr,                     // Amiibo Settings
@@ -409,6 +422,19 @@ void EmulationSession::RunEmulation() {
         m_is_running = true;
     }
 
+    // Runs before the game starts: the game's file layers are not safe to read from two threads.
+    // Runs before the disk cache loads, which compiles the shader pairs the scan finds.
+    LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
+    RunShaderFileScan(m_system, m_system.GetApplicationProcessProgramID(), std::stop_token{},
+                      [](std::size_t done, std::size_t total) {
+                          LoadDiskCacheProgress(VideoCore::LoadCallbackStage::ScanGameFiles,
+                                                static_cast<int>(done), static_cast<int>(total));
+                      });
+    // The loading screen stays up while the disk cache loads right after.
+    if (!Settings::values.use_disk_shader_cache.GetValue()) {
+        LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
+    }
+
     // Load the disk shader cache.
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
@@ -423,7 +449,13 @@ void EmulationSession::RunEmulation() {
         m_system.InitializeDebugger();
     }
 
+    auto last_memory_log = std::chrono::steady_clock::now();
     while (true) {
+        if (Common::Preforged::Options().log_memory &&
+            std::chrono::steady_clock::now() - last_memory_log > std::chrono::seconds{30}) {
+            last_memory_log = std::chrono::steady_clock::now();
+            LogMemoryUse();
+        }
         std::optional<u64> reload_title;
         {
             [[maybe_unused]] std::unique_lock lock(m_mutex);
@@ -443,6 +475,16 @@ void EmulationSession::RunEmulation() {
 
     // Reset current applet ID.
     m_applet_id = static_cast<int>(Service::AM::AppletId::Application);
+}
+
+// Memory use and the number of memory mappings, which Android limits to about 65,000; running
+// out of either ends the app without a message.
+void EmulationSession::LogMemoryUse() {
+    const auto start = std::chrono::steady_clock::now();
+    Common::Preforged::LogMemoryUse("in game", false);
+    LOG_INFO(Frontend, "[Preforged] memory log took {:.1f} ms",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                 .count());
 }
 
 void EmulationSession::RequestDiskShaderCacheReload(u64 program_id) {

@@ -14,6 +14,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "common/preforged_debug.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
@@ -256,9 +257,10 @@ GraphicsPipeline::GraphicsPipeline(
     Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
-    const std::array<const Shader::Info*, NUM_STAGES>& infos)
+    const std::array<const Shader::Info*, NUM_STAGES>& infos,
+    std::shared_ptr<vk::PipelineCache> build_cache_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
-      pipeline_cache(pipeline_cache_), scheduler{scheduler_},
+      pipeline_cache(pipeline_cache_), build_cache{std::move(build_cache_)}, scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
     if (shader_notify) {
@@ -311,12 +313,14 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
-                in_game = worker_thread != nullptr] {
+                in_game = worker_thread != nullptr &&
+                          Common::Preforged::Options().log_shader_compiles] {
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
         try {
             const auto driver_start{std::chrono::steady_clock::now()};
             MakePipeline(render_pass);
+            build_cache.reset();
             if (in_game) {
                 // Shader timing test: the driver's own compile of the finished pipeline
                 const std::chrono::duration<double, std::milli> driver_time{
@@ -326,6 +330,7 @@ GraphicsPipeline::GraphicsPipeline(
             }
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
+            build_cache.reset();
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -1103,7 +1108,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .subpass = 0,
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
-    }, *pipeline_cache);
+    }, build_cache ? **build_cache : *pipeline_cache);
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

@@ -18,6 +18,10 @@ add_library(yuzu-android SHARED
     android_config.h
     native_input.cpp
     native_post_processing.cpp
+    crash_report.cpp
+    crash_report.h
+    shader_file_scan.cpp
+    shader_file_scan.h
 )
 
 set_property(TARGET yuzu-android PROPERTY IMPORTED_LOCATION ${FFmpeg_LIBRARY_DIR})

@@ -654,6 +654,36 @@
     <string name="fastmem">Fastmem</string>
 
     <string name="log">Logging</string>
+    <string name="preforged_header">Eden Preforged</string>
+    <string name="preforged_update">Update Eden Preforged</string>
+    <string name="preforged_update_description">Downloads and installs the newest test build</string>
+    <string name="preforged_update_installed">Installed: build %1$d</string>
+    <string name="preforged_update_checking">Looking for a newer build…</string>
+    <string name="preforged_update_check_failed">Couldn\'t reach GitHub to look for a newer build. Check the internet connection and try again.</string>
+    <string name="preforged_update_newest">Build %1$d is installed, which is the newest.</string>
+    <string name="preforged_update_available">Build %1$d is available. You have build %2$d.\n\n%3$s</string>
+    <string name="preforged_update_install">Install</string>
+    <string name="preforged_update_downloading">Downloading build %1$d</string>
+    <string name="preforged_bake_driver_constants">Bake constant buffer into shaders</string>
+    <string name="preforged_bake_driver_constants_description">Bakes constant buffer 1 values into shaders like upstream Eden. Off lets shaders from the game files match the game\'s own. Restart the game after changing.</string>
+    <string name="preforged_scan_game_files">Search game files for shaders</string>
+    <string name="preforged_scan_game_files_description">Searches each game\'s files for shaders once, on its first start.</string>
+    <string name="preforged_rescan_game_files">Search game files on every start</string>
+    <string name="preforged_rescan_game_files_description">Repeats the game file search on every start while on. Takes a few minutes.</string>
+    <string name="preforged_precompile_game_shaders">Compile shaders from game files</string>
+    <string name="preforged_precompile_game_shaders_description">Compiles the shader pairs found in the game files while the game loads, so they do not stutter later.</string>
+    <string name="preforged_log_shader_compiles">Log shader compiles</string>
+    <string name="preforged_log_shader_compiles_description">Logs every shader compile during play with its timing and where its shaders came from.</string>
+    <string name="preforged_precompile_percent">Share of game file shaders to compile</string>
+    <string name="preforged_precompile_percent_description">Compiles this share of the shader pairs found in the game files, starting with the ones closest to what the game has drawn so far. Compiled pairs are kept on storage and only loaded when the game draws with them, so they don\'t take up memory. A lower share means a shorter first load and more stutter.</string>
+    <string name="preforged_store_any_state">Use stored shaders for any state</string>
+    <string name="preforged_store_any_state_description">Hands the driver a shader pair\'s stored code even when the game draws it differently than it was compiled, in case the driver can reuse part of it. Off by default: in build 33 this crashed the GPU driver and gave no speedup.</string>
+    <string name="preforged_log_memory">Log memory use</string>
+    <string name="preforged_log_memory_description">Logs memory use every 30 seconds in game.</string>
+    <string name="preforged_log_slow_frames">Log slow frames</string>
+    <string name="preforged_log_slow_frames_description">Logs every frame that took over 50 ms and more than twice as long as the frame before it, so stutters show up in the log with their time.</string>
+    <string name="preforged_driver_pipeline_cache">Use the driver pipeline cache</string>
+    <string name="preforged_driver_pipeline_cache_description">Loads the GPU driver\'s saved pipelines at game start. Off leaves the saved file alone but loads nothing from it, so every pipeline is built by the driver again.</string>
     <string name="flush_by_line">Flush debug logs by line</string>
     <string name="flush_by_line_description">Flushes debugging logs on each line written, making debugging easier in cases of crashing or freezing.</string>
     <string name="extended_logging">Enable extended logging</string>
@@ -1244,6 +1274,8 @@
 
     <!-- Disk shader cache -->
     <string name="building_shaders">Building shaders</string>
+    <string name="scanning_game_files">Searching game files for shaders (first start only)</string>
+    <string name="precompiling_game_shaders">Compiling shaders from game files (first start only)</string>
 
     <!-- App options -->
     <string name="change_app_theme">Change app theme</string>

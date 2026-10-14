@@ -66,6 +66,7 @@ public:
 
 private:
     static void LoadDiskCacheProgress(VideoCore::LoadCallbackStage stage, int progress, int max);
+    static void LogMemoryUse();
     static void OnEmulationStopped(Core::SystemResultStatus result);
     static void ChangeProgram(std::size_t program_index);
     void ReloadDiskShaderCache(u64 program_id);

@@ -425,7 +425,12 @@ void SetColorConsoleBackendEnabled(bool enabled) {
 
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) {
     if (logging_instance && logging_instance->filter.CheckMessage(log_class, log_level)) {
+#ifdef __ANDROID__
+        // Eden Preforged: Android apps die without warning, so keep every line a crash leaves.
+        auto const flush = true;
+#else
         auto const flush = ::Settings::values.log_flush_line.GetValue();
+#endif
         char buffer[BUFSIZ];
         auto result = fmt::vformat_to_n(buffer, sizeof(buffer) - 1, format, args);
         Entry e{
