@@ -33,6 +33,9 @@ struct DebugOptions {
     /// Logs which allocation sizes fill the malloc heap and which mappings the app holds, each
     /// time the heap grows past another 2 GiB. Walking the heap holds up the emulator a moment.
     bool log_allocation_sizes = true;
+    /// Records a sample of the heap allocations with the code that made them, and logs which
+    /// code holds the most memory with every memory log. Costs a little speed.
+    bool track_allocations = true;
 };
 
 [[nodiscard]] DebugOptions& Options();

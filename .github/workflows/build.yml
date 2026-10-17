@@ -48,6 +48,19 @@ jobs:
           chmod +x .ci/android/build.sh
           .ci/android/build.sh --target standard --build-type Release
 
+      # Function names for the offsets in crash reports and heap logs. The APK only keeps the
+      # exported ones.
+      - name: Keep the native library's symbols
+        continue-on-error: true
+        run: |
+          lib=$(find src/android -name libyuzu-android.so -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+          echo "Largest native library: $lib"
+          ls -la "$lib"
+          "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-debug -o libyuzu-android-symbols.so "$lib"
+          xz -T0 -6 libyuzu-android-symbols.so
+          ls -la libyuzu-android-symbols.so.xz
+
       - uses: actions/upload-artifact@v4
         with:
           name: eden-preforged-android
@@ -74,7 +87,12 @@ jobs:
           fi
           apk="eden-preforged-build-$BUILD.apk"
           cp "$(ls artifacts/*.apk | head -1)" "$apk"
+          set -- "$apk"
+          if [ -f libyuzu-android-symbols.so.xz ]; then
+            cp libyuzu-android-symbols.so.xz "eden-preforged-build-$BUILD-symbols.so.xz"
+            set -- "$@" "eden-preforged-build-$BUILD-symbols.so.xz"
+          fi
           printf 'Build %s from %s\n\n%s\n' "$BUILD" "$BRANCH" "$(git log -1 --format=%s "$HEAD_SHA")" > notes.txt
           gh release delete preforged-latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create preforged-latest "$apk" --prerelease --target "$HEAD_SHA" \
+          gh release create preforged-latest "$@" --prerelease --target "$HEAD_SHA" \
             --title "Build $BUILD" --notes-file notes.txt

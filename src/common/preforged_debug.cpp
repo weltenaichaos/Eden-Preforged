@@ -17,6 +17,7 @@
 
 #include "common/logging.h"
 #include "common/preforged_debug.h"
+#include "common/preforged_heap_profile.h"
 #include "common/settings.h"
 
 namespace Common::Preforged {
@@ -40,6 +41,7 @@ void LoadOptions() {
     options.log_memory = Settings::values.preforged_log_memory.GetValue();
     options.log_slow_frames = Settings::values.preforged_log_slow_frames.GetValue();
     options.log_allocation_sizes = Settings::values.preforged_log_allocation_sizes.GetValue();
+    options.track_allocations = Settings::values.preforged_track_allocations.GetValue();
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
              "log compiles {}",
@@ -50,9 +52,15 @@ void LoadOptions() {
              "log slow frames {}",
              options.precompile_percent, options.store_any_state, options.log_memory,
              options.log_slow_frames);
-    LOG_INFO(Common, "[Preforged] driver pipeline cache {}, log allocation sizes {}",
+    LOG_INFO(Common,
+             "[Preforged] driver pipeline cache {}, log allocation sizes {}, track allocations {}",
              Settings::values.use_vulkan_driver_pipeline_cache.GetValue(),
-             options.log_allocation_sizes);
+             options.log_allocation_sizes, options.track_allocations);
+    if (options.track_allocations) {
+        HeapProfile::Start();
+    } else if (HeapProfile::Sampling()) {
+        HeapProfile::Stop();
+    }
 }
 
 void LogMemoryUse(const char* when, bool count_mappings) {
@@ -85,6 +93,7 @@ void LogMemoryUse(const char* when, bool count_mappings) {
              "mappings",
              when, pages_resident * page_size >> 20, pages_total * page_size >> 20,
              static_cast<size_t>(heap.uordblks) >> 20, mappings);
+    HeapProfile::Log(when, 6);
 
     // Each time the heap grows past another 2 GiB, log what fills it.
     static size_t next_report = size_t{2} << 30;

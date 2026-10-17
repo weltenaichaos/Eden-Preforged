@@ -332,6 +332,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_TRACK_ALLOCATIONS,
+                    titleId = R.string.preforged_track_allocations,
+                    descriptionId = R.string.preforged_track_allocations_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description
