@@ -91,6 +91,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_LOG_SLOW_FRAMES("preforged_log_slow_frames"),
     PREFORGED_LOG_ALLOCATION_SIZES("preforged_log_allocation_sizes"),
     PREFORGED_TRACK_ALLOCATIONS("preforged_track_allocations"),
+    PREFORGED_TRACK_DRIVER_MEMORY("preforged_track_driver_memory"),
     USE_VULKAN_DRIVER_PIPELINE_CACHE("use_vulkan_driver_pipeline_cache"),
     EXTENDED_LOGGING("extended_logging"),
     DONT_SHOW_DRIVER_SHADER_WARNING("dont_show_driver_shader_warning"),

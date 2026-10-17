@@ -1530,6 +1530,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_LOG_SLOW_FRAMES.key)
                 add(BooleanSetting.PREFORGED_LOG_ALLOCATION_SIZES.key)
                 add(BooleanSetting.PREFORGED_TRACK_ALLOCATIONS.key)
+                add(BooleanSetting.PREFORGED_TRACK_DRIVER_MEMORY.key)
                 add(BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE.key)
             }
 

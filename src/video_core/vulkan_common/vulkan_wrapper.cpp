@@ -5,13 +5,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
+#ifdef __ANDROID__
+#include <malloc.h>
+#endif
+
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/preforged_heap_profile.h"
+#include "common/settings.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -19,6 +28,78 @@
 namespace Vulkan::vk {
 
 namespace {
+
+#ifdef __ANDROID__
+namespace HeapProfile = Common::Preforged::HeapProfile;
+
+void* AllocateHost(size_t size, size_t alignment) {
+    if (alignment <= alignof(std::max_align_t)) {
+        return std::malloc(size);
+    }
+    void* pointer = nullptr;
+    return posix_memalign(&pointer, alignment, size) == 0 ? pointer : nullptr;
+}
+
+void NoteHost(void* pointer, size_t size, VkSystemAllocationScope scope, void* caller) {
+    HeapProfile::NoteAllocation(pointer, size, HeapProfile::Kind::Driver,
+                                static_cast<unsigned>(scope), reinterpret_cast<uintptr_t>(caller));
+}
+
+[[gnu::noinline]] VKAPI_ATTR void* VKAPI_CALL HostAllocation(void*, size_t size, size_t alignment,
+                                                             VkSystemAllocationScope scope) {
+    void* const pointer = AllocateHost(size, alignment);
+    NoteHost(pointer, size, scope, __builtin_return_address(0));
+    return pointer;
+}
+
+[[gnu::noinline]] VKAPI_ATTR void* VKAPI_CALL HostReallocation(void*, void* original, size_t size,
+                                                               size_t alignment,
+                                                               VkSystemAllocationScope scope) {
+    void* const caller = __builtin_return_address(0);
+    if (original == nullptr) {
+        void* const pointer = AllocateHost(size, alignment);
+        NoteHost(pointer, size, scope, caller);
+        return pointer;
+    }
+    if (size == 0) {
+        HeapProfile::NoteFree(original);
+        std::free(original);
+        return nullptr;
+    }
+    if (alignment <= alignof(std::max_align_t)) {
+        HeapProfile::NoteFree(original);
+        void* const pointer = std::realloc(original, size);
+        NoteHost(pointer, size, scope, caller);
+        return pointer;
+    }
+    // realloc does not keep larger alignments, so move the memory by hand.
+    void* const pointer = AllocateHost(size, alignment);
+    if (pointer == nullptr) {
+        return nullptr;
+    }
+    std::memcpy(pointer, original, std::min(size, malloc_usable_size(original)));
+    HeapProfile::NoteFree(original);
+    std::free(original);
+    NoteHost(pointer, size, scope, caller);
+    return pointer;
+}
+
+VKAPI_ATTR void VKAPI_CALL HostFree(void*, void* memory) {
+    if (memory != nullptr) {
+        HeapProfile::NoteFree(memory);
+        std::free(memory);
+    }
+}
+
+constexpr VkAllocationCallbacks HOST_CALLBACKS{
+    .pUserData = nullptr,
+    .pfnAllocation = HostAllocation,
+    .pfnReallocation = HostReallocation,
+    .pfnFree = HostFree,
+    .pfnInternalAllocation = nullptr,
+    .pfnInternalFree = nullptr,
+};
+#endif
 
 template <typename Func>
 void SortPhysicalDevices(std::vector<VkPhysicalDevice>& devices, const InstanceDispatch& dld,
@@ -335,12 +416,22 @@ const char* Exception::what() const noexcept {
     return string_VkResult(result);
 }
 
+const VkAllocationCallbacks* HostAllocator() {
+#ifdef __ANDROID__
+    // Read once, so everything is destroyed with the callbacks it was created with.
+    static const bool enabled = Settings::values.preforged_track_driver_memory.GetValue();
+    return enabled ? &HOST_CALLBACKS : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
 void Destroy(VkInstance instance, const InstanceDispatch& dld) noexcept {
-    dld.vkDestroyInstance(instance, nullptr);
+    dld.vkDestroyInstance(instance, HostAllocator());
 }
 
 void Destroy(VkDevice device, const InstanceDispatch& dld) noexcept {
-    dld.vkDestroyDevice(device, nullptr);
+    dld.vkDestroyDevice(device, HostAllocator());
 }
 
 void Destroy(VkDevice device, VkBuffer handle, const DeviceDispatch& dld) noexcept {
@@ -482,7 +573,7 @@ Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char
         .ppEnabledExtensionNames = extensions.data(),
     };
     VkInstance instance;
-    Check(dispatch.vkCreateInstance(&ci, nullptr, &instance));
+    Check(dispatch.vkCreateInstance(&ci, HostAllocator(), &instance));
     if (!Proc(dispatch.vkDestroyInstance, dispatch, "vkDestroyInstance", instance)) {
         // We successfully created an instance but the destroy function couldn't be loaded.
         // This is a good moment to panic.
@@ -675,7 +766,7 @@ Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreate
         .pEnabledFeatures = nullptr,
     };
     VkDevice device;
-    Check(dispatch.vkCreateDevice(physical_device, &ci, nullptr, &device));
+    Check(dispatch.vkCreateDevice(physical_device, &ci, HostAllocator(), &device));
     Load(device, dispatch);
     return Device(device, dispatch);
 }
