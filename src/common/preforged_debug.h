@@ -30,6 +30,9 @@ struct DebugOptions {
     bool log_memory = true;
     /// Logs every frame that took more than twice as long as the frame before it.
     bool log_slow_frames = true;
+    /// Logs which allocation sizes fill the malloc heap and which mappings the app holds, each
+    /// time the heap grows past another 2 GiB. Walking the heap holds up the emulator a moment.
+    bool log_allocation_sizes = true;
 };
 
 [[nodiscard]] DebugOptions& Options();
@@ -44,5 +47,9 @@ void LogMappingSummary(size_t top);
 /// Logs resident, virtual and malloc memory, tagged with `when`, and the number of mappings
 /// when `count_mappings` is set, which briefly holds up other threads.
 void LogMemoryUse(const char* when, bool count_mappings = true);
+
+/// Logs the allocation sizes that hold the most malloc memory, tagged with `when`. Walks the
+/// whole heap, which holds up every thread that allocates while it runs.
+void LogAllocationSizes(const char* when);
 
 } // namespace Common::Preforged

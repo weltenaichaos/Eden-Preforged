@@ -937,6 +937,7 @@ struct Values {
     Setting<bool> preforged_store_any_state{linkage, false, "preforged_reuse_other_state", Category::Miscellaneous};
     Setting<bool> preforged_log_memory{linkage, true, "preforged_log_memory", Category::Miscellaneous};
     Setting<bool> preforged_log_slow_frames{linkage, true, "preforged_log_slow_frames", Category::Miscellaneous};
+    Setting<bool> preforged_log_allocation_sizes{linkage, true, "preforged_log_allocation_sizes", Category::Miscellaneous};
     Setting<u32, true> preforged_precompile_percent{linkage, 100, 0, 100, "preforged_compile_share", Category::Miscellaneous, Specialization::Scalar};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};

@@ -200,6 +200,14 @@ private:
     void AppendPreforgedStore(u64 pair_id, u64 state_hash, const PreforgedCode& code,
                               const vk::PipelineCache& cache);
 
+    /// How often the game feeds each dynamic attribute type (off, float, int, uint) at each
+    /// attribute when a played vertex shader reads it. Counted while the played pipelines build.
+    std::array<std::array<size_t, 4>, 32> preforged_attribute_votes{};
+
+    /// Counts the attribute types a played pipeline's vertex shader reads. Called under a lock.
+    void CountPreforgedAttributeTypes(const GraphicsPipelineCacheKey& key,
+                                      const PreforgedCode& code);
+
     /// Reads a pair's driver code from storage when the key draws with a stored pair that was
     /// translated to the same SPIR-V. `match` tells how the stored pair compares, for the log.
     [[nodiscard]] std::shared_ptr<vk::PipelineCache> LoadPreforgedStoreEntry(

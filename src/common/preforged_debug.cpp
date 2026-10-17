@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #ifdef __linux__
@@ -37,6 +39,7 @@ void LoadOptions() {
     options.store_any_state = Settings::values.preforged_store_any_state.GetValue();
     options.log_memory = Settings::values.preforged_log_memory.GetValue();
     options.log_slow_frames = Settings::values.preforged_log_slow_frames.GetValue();
+    options.log_allocation_sizes = Settings::values.preforged_log_allocation_sizes.GetValue();
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
              "log compiles {}",
@@ -47,8 +50,9 @@ void LoadOptions() {
              "log slow frames {}",
              options.precompile_percent, options.store_any_state, options.log_memory,
              options.log_slow_frames);
-    LOG_INFO(Common, "[Preforged] driver pipeline cache {}",
-             Settings::values.use_vulkan_driver_pipeline_cache.GetValue());
+    LOG_INFO(Common, "[Preforged] driver pipeline cache {}, log allocation sizes {}",
+             Settings::values.use_vulkan_driver_pipeline_cache.GetValue(),
+             options.log_allocation_sizes);
 }
 
 void LogMemoryUse(const char* when, bool count_mappings) {
@@ -81,6 +85,70 @@ void LogMemoryUse(const char* when, bool count_mappings) {
              "mappings",
              when, pages_resident * page_size >> 20, pages_total * page_size >> 20,
              static_cast<size_t>(heap.uordblks) >> 20, mappings);
+
+    // Each time the heap grows past another 2 GiB, log what fills it.
+    static size_t next_report = size_t{2} << 30;
+    if (Options().log_allocation_sizes && static_cast<size_t>(heap.uordblks) >= next_report) {
+        while (next_report <= static_cast<size_t>(heap.uordblks)) {
+            next_report += size_t{2} << 30;
+        }
+        LogAllocationSizes(when);
+        // Large allocations each get their own mapping, and the app ends once it holds about
+        // 65,000 of them, so show which mappings it holds at the same moments.
+        LogMappingSummary(12);
+    }
+#endif
+}
+
+void LogAllocationSizes(const char* when) {
+#ifdef __ANDROID__
+    // Android's allocator lists how many live allocations it holds of each size.
+    char* text = nullptr;
+    size_t length = 0;
+    std::FILE* stream = open_memstream(&text, &length);
+    if (!stream) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const int result = malloc_info(0, stream);
+    std::fclose(stream);
+    const std::chrono::duration<double, std::milli> took = std::chrono::steady_clock::now() - start;
+    if (result != 0 || !text) {
+        std::free(text);
+        LOG_INFO(Common, "[Preforged] allocation sizes {}: not available", when);
+        return;
+    }
+    struct Size {
+        size_t size;
+        size_t count;
+    };
+    std::vector<Size> sizes;
+    size_t total_bytes = 0;
+    size_t total_count = 0;
+    for (const char* line = text; (line = std::strstr(line, "<alloc size=\"")) != nullptr;) {
+        size_t size = 0;
+        size_t count = 0;
+        if (std::sscanf(line, "<alloc size=\"%zu\" count=\"%zu\"", &size, &count) == 2) {
+            sizes.push_back({size, count});
+            total_bytes += size * count;
+            total_count += count;
+        }
+        ++line;
+    }
+    std::free(text);
+    std::sort(sizes.begin(), sizes.end(), [](const Size& a, const Size& b) {
+        return a.size * a.count > b.size * b.count;
+    });
+    LOG_INFO(Common,
+             "[Preforged] allocation sizes {}: {} MiB in {} small allocations, listed in {:.0f} ms "
+             "(larger allocations have their own mappings)",
+             when, total_bytes >> 20, total_count, took.count());
+    for (size_t index = 0; index < std::min<size_t>(sizes.size(), 20); ++index) {
+        LOG_INFO(Common, "[Preforged]   {} bytes x {} = {} MiB", sizes[index].size,
+                 sizes[index].count, (sizes[index].size * sizes[index].count) >> 20);
+    }
+#else
+    LOG_INFO(Common, "[Preforged] allocation sizes {}: not available", when);
 #endif
 }
 

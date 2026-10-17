@@ -325,6 +325,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_ALLOCATION_SIZES,
+                    titleId = R.string.preforged_log_allocation_sizes,
+                    descriptionId = R.string.preforged_log_allocation_sizes_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description

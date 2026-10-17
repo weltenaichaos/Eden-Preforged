@@ -682,6 +682,8 @@
     <string name="preforged_log_memory_description">Logs memory use every 30 seconds in game.</string>
     <string name="preforged_log_slow_frames">Log slow frames</string>
     <string name="preforged_log_slow_frames_description">Logs every frame that took over 50 ms and more than twice as long as the frame before it, so stutters show up in the log with their time.</string>
+    <string name="preforged_log_allocation_sizes">Log what fills memory</string>
+    <string name="preforged_log_allocation_sizes_description">Each time the app\'s memory grows past another 2 GB, logs which allocation sizes hold the most of it. The game pauses for a moment while it is counted.</string>
     <string name="preforged_driver_pipeline_cache">Use the driver pipeline cache</string>
     <string name="preforged_driver_pipeline_cache_description">Loads the GPU driver\'s saved pipelines at game start. Off leaves the saved file alone but loads nothing from it, so every pipeline is built by the driver again.</string>
     <string name="flush_by_line">Flush debug logs by line</string>

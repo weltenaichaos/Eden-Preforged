@@ -644,6 +644,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // are only built once. Only touched from this thread while the cache file is parsed.
     std::unordered_set<GraphicsPipelineCacheKey> queued_graphics_keys;
     std::vector<GraphicsPipelineCacheKey> played_keys;
+    preforged_attribute_votes = {};
     size_t retargeted_graphics{};
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
@@ -716,12 +717,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             for (auto& env : envs_) {
                 env_ptrs.push_back(&env);
             }
+            PreforgedCode code;
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
-                                                 state.statistics.get(), false)};
+                                                 state.statistics.get(), false, {}, &code)};
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
                 graphics_cache.emplace(key, std::move(pipeline));
+                CountPreforgedAttributeTypes(key, code);
             }
             ++state.built;
             if (state.has_loaded) {
@@ -1028,6 +1031,19 @@ void PipelineCache::AppendPreforgedStore(u64 pair_id, u64 state_hash, const Pref
     }
 }
 
+void PipelineCache::CountPreforgedAttributeTypes(const GraphicsPipelineCacheKey& key,
+                                                 const PreforgedCode& code) {
+    if (!key.state.dynamic_vertex_input || key.unique_hashes[0] != 0 ||
+        key.unique_hashes[1] == 0) {
+        return;
+    }
+    for (size_t index = 0; index < code.inputs.attributes.size(); ++index) {
+        if (code.inputs.attributes[index] != 0xFF) {
+            ++preforged_attribute_votes[index][key.state.DynamicAttributeType(index)];
+        }
+    }
+}
+
 std::shared_ptr<vk::PipelineCache> PipelineCache::LoadPreforgedStoreEntry(
     const GraphicsPipelineCacheKey& key, const PreforgedCode& code, std::string& match) {
     if (key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 ||
@@ -1088,28 +1104,16 @@ void PipelineCache::PrecompilePreforgedPairs(
     }};
 
     // Pairs compiled on earlier boots, whose driver code is in the store on storage.
-    // A stored pair whose vertex shader reads an attribute that was off when it was compiled is
-    // compiled again: in game those attributes come from buffers, which changes the SPIR-V.
-    // Without dynamic vertex input the attributes can't be turned on, so this only applies with it.
-    const bool dynamic_vertex_input{std::ranges::any_of(
-        played_keys, [](const GraphicsPipelineCacheKey& key) {
-            return key.state.dynamic_vertex_input != 0;
-        })};
-    std::unordered_set<u64> warmed;
-    size_t stored_with_off_attributes{};
+    // Pairs compiled on earlier boots, with the attribute types their vertex shader was
+    // compiled with. A pair whose types differ from what would be guessed now is compiled again.
+    std::unordered_map<u64, std::array<u8, 32>> warmed;
     {
         std::scoped_lock lock{preforged_store_mutex};
         for (const auto& [id, entry] : preforged_store) {
-            const auto& attributes{entry.code.inputs.attributes};
-            if (dynamic_vertex_input &&
-                std::ranges::find(attributes, static_cast<u8>(Shader::AttributeType::Disabled)) !=
-                    attributes.end()) {
-                ++stored_with_off_attributes;
-                continue;
-            }
-            warmed.insert(id);
+            warmed.emplace(id, entry.code.inputs.attributes);
         }
     }
+    size_t stored_with_other_attributes{};
     std::unordered_set<u64> played;
 
     // A pair compiled with a state that changes its shaders differently than the game will is
@@ -1140,35 +1144,54 @@ void PipelineCache::PrecompilePreforgedPairs(
         }
     }
 
-    // The type the game feeds most often at each attribute, for attributes the template leaves
-    // off. Only the attributes a shader reads change its SPIR-V, so turning on the others is
-    // harmless. With dynamic vertex input the types aren't part of the pipeline's vertex input.
-    std::array<std::array<size_t, 4>, Maxwell::NumVertexAttributes> attribute_votes{};
-    for (const GraphicsPipelineCacheKey& key : played_keys) {
-        if (!key.state.dynamic_vertex_input) {
-            continue;
-        }
-        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
-            ++attribute_votes[index][key.state.DynamicAttributeType(index)];
-        }
-    }
-    const auto fill_off_attributes{[&attribute_votes](GraphicsPipelineCacheKey& key) {
+    // Each attribute gets the type the game feeds most often when a played vertex shader reads
+    // it, off included. Only the attributes a shader reads change its SPIR-V, so the others don't
+    // matter, and with dynamic vertex input the types aren't part of the pipeline's vertex input.
+    // An attribute no played shader reads stays as the template has it, or float if it's off.
+    const auto votes{preforged_attribute_votes};
+    const auto guess_attributes{[&votes](GraphicsPipelineCacheKey& key) {
         if (!key.state.dynamic_vertex_input) {
             return;
         }
         for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
-            if (key.state.DynamicAttributeType(index) != 0) {
-                continue;
-            }
-            const auto& votes{attribute_votes[index]};
-            u64 type{1}; // float
-            for (u64 candidate = 2; candidate < 4; ++candidate) {
-                if (votes[candidate] > votes[type]) {
-                    type = candidate;
+            const auto& counts{votes[index]};
+            u64 type{key.state.DynamicAttributeType(index) != 0 ? key.state.DynamicAttributeType(index)
+                                                                : 1};
+            if (counts[0] + counts[1] + counts[2] + counts[3] != 0) {
+                type = 0;
+                for (u64 candidate = 1; candidate < 4; ++candidate) {
+                    if (counts[candidate] > counts[type]) {
+                        type = candidate;
+                    }
                 }
             }
+            key.state.attribute_types &= ~(u64{3} << (index * 2));
             key.state.attribute_types |= type << (index * 2);
         }
+    }};
+    {
+        static constexpr std::array<const char*, 4> names{"off", "float", "int", "uint"};
+        std::vector<std::string> parts;
+        for (size_t index = 0; index < votes.size(); ++index) {
+            const auto& counts{votes[index]};
+            if (counts[0] + counts[1] + counts[2] + counts[3] == 0) {
+                continue;
+            }
+            parts.push_back(fmt::format("{}: {} off {} float {} int {} uint", index, counts[0],
+                                        counts[1], counts[2], counts[3]));
+        }
+        LOG_INFO(Render_Vulkan, "[Preforged] attribute types played shaders read: {}",
+                 parts.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(parts, "; ")));
+    }
+    const auto same_attributes{[](const std::array<u8, 32>& stored,
+                                  const GraphicsPipelineCacheKey& key) {
+        for (size_t index = 0; index < stored.size(); ++index) {
+            if (stored[index] != 0xFF &&
+                stored[index] != static_cast<u8>(AttributeType(key.state, index))) {
+                return false;
+            }
+        }
+        return true;
     }};
 
     preforged_pairs.clear();
@@ -1199,15 +1222,18 @@ void PipelineCache::PrecompilePreforgedPairs(
         key.unique_hashes = {};
         key.unique_hashes[1] = vertex;
         key.unique_hashes[5] = fragment;
-        fill_off_attributes(key);
+        guess_attributes(key);
         if (played.contains(id)) {
             preforged_pairs.try_emplace(id, ShaderStateHash(key));
             continue;
         }
-        if (warmed.contains(id)) {
-            preforged_pairs.try_emplace(id, ShaderStateHash(key));
-            ++warmed_count;
-            continue;
+        if (const auto stored{warmed.find(id)}; stored != warmed.end()) {
+            if (!key.state.dynamic_vertex_input || same_attributes(stored->second, key)) {
+                preforged_pairs.try_emplace(id, ShaderStateHash(key));
+                ++warmed_count;
+                continue;
+            }
+            ++stored_with_other_attributes;
         }
         const size_t rank{it != vertex_templates.end() ? 0u
                           : played_fragments.contains(fragment) ? 1u
@@ -1238,11 +1264,11 @@ void PipelineCache::PrecompilePreforgedPairs(
              "[Preforged] {} shader pairs from the game files, {} already played, {} compiled "
              "on earlier boots, {} not compiled yet ({} with a played vertex shader, {} with a "
              "played fragment shader, {} others), {} to compile now at {}%, {} states seen, {} "
-             "stored pairs compiled again because they read attributes that were off",
+             "stored pairs compiled again with other attribute types",
              programs.pairs.size(), played.size(), warmed_count, candidate_count,
              candidates[0].size(), candidates[1].size(), candidates[2].size(), todo.size(),
              Common::Preforged::Options().precompile_percent, state_counts.size(),
-             stored_with_off_attributes);
+             stored_with_other_attributes);
     if (!Common::Preforged::Options().precompile_game_shaders) {
         LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in the settings");
         return;
