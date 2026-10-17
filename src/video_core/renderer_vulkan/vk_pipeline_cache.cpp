@@ -1088,10 +1088,25 @@ void PipelineCache::PrecompilePreforgedPairs(
     }};
 
     // Pairs compiled on earlier boots, whose driver code is in the store on storage.
+    // A stored pair whose vertex shader reads an attribute that was off when it was compiled is
+    // compiled again: in game those attributes come from buffers, which changes the SPIR-V.
+    // Without dynamic vertex input the attributes can't be turned on, so this only applies with it.
+    const bool dynamic_vertex_input{std::ranges::any_of(
+        played_keys, [](const GraphicsPipelineCacheKey& key) {
+            return key.state.dynamic_vertex_input != 0;
+        })};
     std::unordered_set<u64> warmed;
+    size_t stored_with_off_attributes{};
     {
         std::scoped_lock lock{preforged_store_mutex};
         for (const auto& [id, entry] : preforged_store) {
+            const auto& attributes{entry.code.inputs.attributes};
+            if (dynamic_vertex_input &&
+                std::ranges::find(attributes, static_cast<u8>(Shader::AttributeType::Disabled)) !=
+                    attributes.end()) {
+                ++stored_with_off_attributes;
+                continue;
+            }
             warmed.insert(id);
         }
     }
@@ -1125,6 +1140,37 @@ void PipelineCache::PrecompilePreforgedPairs(
         }
     }
 
+    // The type the game feeds most often at each attribute, for attributes the template leaves
+    // off. Only the attributes a shader reads change its SPIR-V, so turning on the others is
+    // harmless. With dynamic vertex input the types aren't part of the pipeline's vertex input.
+    std::array<std::array<size_t, 4>, Maxwell::NumVertexAttributes> attribute_votes{};
+    for (const GraphicsPipelineCacheKey& key : played_keys) {
+        if (!key.state.dynamic_vertex_input) {
+            continue;
+        }
+        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+            ++attribute_votes[index][key.state.DynamicAttributeType(index)];
+        }
+    }
+    const auto fill_off_attributes{[&attribute_votes](GraphicsPipelineCacheKey& key) {
+        if (!key.state.dynamic_vertex_input) {
+            return;
+        }
+        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+            if (key.state.DynamicAttributeType(index) != 0) {
+                continue;
+            }
+            const auto& votes{attribute_votes[index]};
+            u64 type{1}; // float
+            for (u64 candidate = 2; candidate < 4; ++candidate) {
+                if (votes[candidate] > votes[type]) {
+                    type = candidate;
+                }
+            }
+            key.state.attribute_types |= type << (index * 2);
+        }
+    }};
+
     preforged_pairs.clear();
     preforged_skipped_pairs.clear();
     preforged_shaders.clear();
@@ -1153,6 +1199,7 @@ void PipelineCache::PrecompilePreforgedPairs(
         key.unique_hashes = {};
         key.unique_hashes[1] = vertex;
         key.unique_hashes[5] = fragment;
+        fill_off_attributes(key);
         if (played.contains(id)) {
             preforged_pairs.try_emplace(id, ShaderStateHash(key));
             continue;
@@ -1190,10 +1237,12 @@ void PipelineCache::PrecompilePreforgedPairs(
     LOG_INFO(Render_Vulkan,
              "[Preforged] {} shader pairs from the game files, {} already played, {} compiled "
              "on earlier boots, {} not compiled yet ({} with a played vertex shader, {} with a "
-             "played fragment shader, {} others), {} to compile now at {}%, {} states seen",
+             "played fragment shader, {} others), {} to compile now at {}%, {} states seen, {} "
+             "stored pairs compiled again because they read attributes that were off",
              programs.pairs.size(), played.size(), warmed_count, candidate_count,
              candidates[0].size(), candidates[1].size(), candidates[2].size(), todo.size(),
-             Common::Preforged::Options().precompile_percent, state_counts.size());
+             Common::Preforged::Options().precompile_percent, state_counts.size(),
+             stored_with_off_attributes);
     if (!Common::Preforged::Options().precompile_game_shaders) {
         LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in the settings");
         return;
