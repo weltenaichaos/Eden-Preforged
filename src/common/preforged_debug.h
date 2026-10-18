@@ -19,6 +19,8 @@ struct DebugOptions {
     bool scan_game_files = true;
     /// Searches the game files again on every start while on.
     bool rescan_game_files = false;
+    /// Unpacks the compressed parts of Unreal Engine packages during the game file search.
+    bool unpack_unreal_packages = true;
     /// Compiles the shader pairs found in the game files while the game loads.
     bool precompile_game_shaders = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.

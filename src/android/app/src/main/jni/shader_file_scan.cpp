@@ -34,6 +34,7 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "jni/shader_file_scan.h"
+#include "jni/unreal_package.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -53,6 +54,8 @@ constexpr size_t MAX_WHOLE_FILE = 64ULL << 20;
 constexpr size_t CHUNK_SIZE = 64ULL << 20;
 constexpr size_t CHUNK_OVERLAP = 1ULL << 20;
 constexpr size_t MAX_DECOMPRESSED = 256ULL << 20;
+/// Unreal packages up to this size are read whole, so their compressed parts can be unpacked.
+constexpr size_t MAX_WHOLE_PACKAGE = 384ULL << 20;
 constexpr u32 FILTER_BITS = 22;
 constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
@@ -478,6 +481,35 @@ public:
         }
         LOG_INFO(Frontend, "[ShaderScan] files with hits: {}, shaders in them (estimate): {}",
                  hits_per_file.size(), total_terminators);
+    }
+
+    void ReportUnreal() const {
+        const auto& stats = unreal_stats;
+        if (stats.packages == 0) {
+            return;
+        }
+        std::string blocks;
+        for (size_t method = 0; method < Preforged::Unreal::METHOD_COUNT; ++method) {
+            if (stats.blocks[method] != 0) {
+                blocks += fmt::format(
+                    "{}{} {}", blocks.empty() ? "" : ", ",
+                    Preforged::Unreal::MethodName(static_cast<Preforged::Unreal::Method>(method)),
+                    stats.blocks[method]);
+            }
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal packages: {} ({} with compressed parts), {} compressed "
+                 "parts, blocks: {}; {} MiB packed unpacked into {} MiB",
+                 stats.packages, stats.compressed_packages, stats.parts,
+                 blocks.empty() ? std::string{"none"} : blocks, stats.packed_bytes >> 20,
+                 stats.unpacked_bytes >> 20);
+        for (const std::string& example : stats.header_examples) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal package header: {}", example);
+        }
+        for (const std::string& example : stats.unknown_examples) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal block packed with an unknown method: {}",
+                     example);
+        }
     }
 
     void ReportExtraction() const {
@@ -958,7 +990,13 @@ private:
             return;
         }
         ++files_scanned;
-        if (size <= MAX_WHOLE_FILE) {
+        bool whole = size <= MAX_WHOLE_FILE;
+        if (!whole && size <= MAX_WHOLE_PACKAGE &&
+            Common::Preforged::Options().unpack_unreal_packages) {
+            const std::vector<u8> start = file->ReadBytes(4, 0);
+            whole = Preforged::Unreal::IsPackage(start);
+        }
+        if (whole) {
             const std::vector<u8> data = file->ReadAllBytes();
             bytes_scanned += data.size();
             ScanBuffer(data, name, 0);
@@ -982,6 +1020,21 @@ private:
         if (std::vector<u8> decompressed = Decompress(data); !decompressed.empty()) {
             ScanBuffer(decompressed, name, depth + 1);
             return;
+        }
+        // Unreal Engine packages keep their contents in compressed parts. Search what they
+        // unpack to, in pieces like large files.
+        if (Common::Preforged::Options().unpack_unreal_packages &&
+            Preforged::Unreal::IsPackage(data)) {
+            const std::string unpacked_name = name + " (unpacked)";
+            const bool unpacked = Preforged::Unreal::Unpack(
+                data, CHUNK_SIZE, CHUNK_OVERLAP, unreal_stats,
+                [&](std::span<const u8> piece, u64 offset) {
+                    SearchShaders(piece, unpacked_name, offset);
+                    return !Stopped();
+                });
+            if (unpacked) {
+                return;
+            }
         }
         if (data.size() >= 0x14 && std::memcmp(data.data(), "SARC", 4) == 0 &&
             ScanSarc(data, name, depth)) {
@@ -1319,6 +1372,7 @@ private:
     DriverConstants driver_constants;
     size_t extracted_bytes = 0;
     size_t code_headers = 0;
+    Preforged::Unreal::Stats unreal_stats;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
@@ -1329,7 +1383,8 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    const auto done_marker = shader_dir / "shader_scan_done_v8";
+    // v9: runs once more for every game, since it now unpacks Unreal Engine packages.
+    const auto done_marker = shader_dir / "shader_scan_done_v9";
     std::error_code error;
     const auto& options = Common::Preforged::Options();
     if (!options.scan_game_files) {
@@ -1382,6 +1437,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         scanner.ScanDir(root, "", false);
         scanner.Report("all files");
     }
+    scanner.ReportUnreal();
     scanner.ReportExtraction();
     scanner.ReportPairing(graphics_keys);
     scanner.ReportGuessAccuracy();

@@ -692,6 +692,8 @@
     <string name="preforged_precompile_cpu_code_description">Saves a list of the CPU code the game compiles while you play, and compiles that code while the game loads the next time, so it doesn\'t stutter compiling it again. The first session with this on records the list. Only for games that can\'t run natively. Takes effect when a game starts.</string>
     <string name="preforged_start_after_loading">Start the game after loading</string>
     <string name="preforged_start_after_loading_description">Starts running the game only once the game file search, the shaders and the CPU code have loaded. Off starts it while they load, which can corrupt what the game reads from its files during the game file search. Takes effect when a game starts.</string>
+    <string name="preforged_unpack_unreal_packages">Unpack Unreal Engine packages</string>
+    <string name="preforged_unpack_unreal_packages_description">During the game file search, unpacks the compressed parts of Unreal Engine packages (zlib, LZO, LZ4 and zstd) and searches them for shaders. Games built on the engine keep their shaders in these packages. Takes effect at the next game file search.</string>
     <string name="preforged_limit_gpu_lag">Limit how far ahead of the GPU Eden runs</string>
     <string name="preforged_limit_gpu_lag_description">Waits for the GPU once it has 32 batches of work left to finish. Every waiting batch holds command buffers and queries that the GPU driver keeps in memory, and Eden never frees them, so without the limit, scenes that send many small batches can fill the memory until the app closes. Takes effect when a game starts.</string>
     <string name="preforged_merge_gpu_work">Merge GPU work while the GPU is behind</string>

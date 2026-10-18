@@ -60,6 +60,7 @@ void LoadOptions() {
     options.start_after_loading = Settings::values.preforged_start_after_loading.GetValue();
     options.limit_gpu_lag = Settings::values.preforged_limit_gpu_lag.GetValue();
     options.merge_gpu_work = Settings::values.preforged_merge_gpu_work.GetValue();
+    options.unpack_unreal_packages = Settings::values.preforged_unpack_unreal_packages.GetValue();
     FrameStats::SetEnabled(options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
@@ -80,8 +81,9 @@ void LoadOptions() {
              options.precompile_cpu_code, options.start_after_loading);
     LOG_INFO(Common,
              "[Preforged] limit GPU lag {} (at most {} submits), merge GPU work {} (from {} "
-             "submits left)",
-             options.limit_gpu_lag, MaxGpuLag, options.merge_gpu_work, MergeGpuLag);
+             "submits left), unpack Unreal packages {}",
+             options.limit_gpu_lag, MaxGpuLag, options.merge_gpu_work, MergeGpuLag,
+             options.unpack_unreal_packages);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {

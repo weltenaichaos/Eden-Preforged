@@ -22,12 +22,15 @@ add_library(yuzu-android SHARED
     crash_report.h
     shader_file_scan.cpp
     shader_file_scan.h
+    unreal_package.cpp
+    unreal_package.h
 )
 
 set_property(TARGET yuzu-android PROPERTY IMPORTED_LOCATION ${FFmpeg_LIBRARY_DIR})
 
 target_link_libraries(yuzu-android PRIVATE audio_core common core input_common frontend_common video_core)
 target_link_libraries(yuzu-android PRIVATE android camera2ndk EGL glad jnigraphics log GLESv2)
+target_link_libraries(yuzu-android PRIVATE ZLIB::ZLIB)
 if (ARCHITECTURE_arm64)
     target_link_libraries(yuzu-android PRIVATE adrenotools)
 endif()

@@ -1522,6 +1522,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_BAKE_DRIVER_CONSTANTS.key)
                 add(BooleanSetting.PREFORGED_SCAN_GAME_FILES.key)
                 add(BooleanSetting.PREFORGED_RESCAN_GAME_FILES.key)
+                add(BooleanSetting.PREFORGED_UNPACK_UNREAL_PACKAGES.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
                 add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_CPU_CODE.key)
