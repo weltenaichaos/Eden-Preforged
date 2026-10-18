@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install NDK and CMake
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q glslang-tools
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;28.2.13676358" "cmake;3.31.6" "platforms;android-36"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .cache/cpm
+          key: android-${{ hashFiles('src/android/**/*.kts', 'cpmfile.json') }}
+          restore-keys: android-
+
+      - name: Build
+        run: |
+          chmod +x .ci/android/build.sh
+          .ci/android/build.sh --target standard --build-type Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eden-preforged-android
+          path: artifacts/*.apk
+          if-no-files-found: error
+
