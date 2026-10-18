@@ -23,6 +23,7 @@
 #include "common/preforged_debug.h"
 #include "common/preforged_frame_stats.h"
 #include "common/scope_exit.h"
+#include "common/settings.h"
 #include "common/thread.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/preforged_cpu_code.h"
@@ -142,6 +143,21 @@ u64 HashCode(Kernel::KProcess& process, u64 start, u64 end, std::size_t& executa
     return hash;
 }
 
+/// Whether the process's CPU cores are ArmDynarmic64, chosen as KProcess::InitializeInterfaces
+/// does, since the build has no RTTI for a dynamic_cast.
+bool UsesDynarmic64(const Kernel::KProcess& process) {
+#ifdef HAS_NCE
+    if (process.IsApplication() && Settings::IsNceEnabled()) {
+        return false;
+    }
+#endif
+    return process.Is64Bit();
+}
+
+ArmDynarmic64* GetJit(Kernel::KProcess& process, std::size_t core) {
+    return static_cast<ArmDynarmic64*>(process.GetArmInterface(core));
+}
+
 /// Writes the blocks recorded since the last call.
 void Flush(State& s) {
     std::vector<u64> batch;
@@ -220,7 +236,7 @@ void Start(System& system) {
         LOG_INFO(Core_ARM, "[Preforged] CPU code pre-compile only works for 64-bit games");
         return;
     }
-    if (dynamic_cast<ArmDynarmic64*>(process->GetArmInterface(0)) == nullptr) {
+    if (!UsesDynarmic64(*process) || GetJit(*process, 0) == nullptr) {
         LOG_INFO(Core_ARM, "[Preforged] the game runs natively (NCE), no CPU code to compile");
         return;
     }
@@ -301,7 +317,7 @@ void Start(System& system) {
         if (job.locations.empty()) {
             continue;
         }
-        job.jit = dynamic_cast<ArmDynarmic64*>(process->GetArmInterface(core));
+        job.jit = GetJit(*process, core);
         if (job.jit == nullptr || !job.jit->BeginCompileAhead()) {
             LOG_WARNING(Core_ARM, "[Preforged] CPU core {} already runs, skipping its {} blocks",
                         core, job.locations.size());
