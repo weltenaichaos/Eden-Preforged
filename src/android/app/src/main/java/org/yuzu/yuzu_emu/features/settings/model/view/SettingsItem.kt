@@ -311,6 +311,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_INPUT_TYPES_PER_SHADER,
+                    titleId = R.string.preforged_input_types_per_shader,
+                    descriptionId = R.string.preforged_input_types_per_shader_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.PREFORGED_LOG_MEMORY,
                     titleId = R.string.preforged_log_memory,
                     descriptionId = R.string.preforged_log_memory_description

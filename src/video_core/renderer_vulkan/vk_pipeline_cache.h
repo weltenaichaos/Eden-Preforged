@@ -182,6 +182,8 @@ private:
         u64 state_hash;
         u32 size;
         PreforgedCode code;
+        /// Attributes whose type was read from the vertex shader's code, one bit each.
+        u32 code_typed{};
     };
     /// Driver code of the pairs compiled from the game files, one small driver cache per pair,
     /// kept on storage and read only when the game draws with that pair. Only the index is kept
@@ -197,8 +199,9 @@ private:
     void OpenPreforgedStore(const std::filesystem::path& base_dir);
 
     /// Appends the code in `cache` for a pair. Called while compiling, from worker threads.
+    /// `code_typed` has a bit for each attribute whose type was read from the shader's code.
     void AppendPreforgedStore(u64 pair_id, u64 state_hash, const PreforgedCode& code,
-                              const vk::PipelineCache& cache);
+                              u32 code_typed, const vk::PipelineCache& cache);
 
     /// How often the game feeds each dynamic attribute type (off, float, int, uint) at each
     /// attribute when a played vertex shader reads it. Counted while the played pipelines build.

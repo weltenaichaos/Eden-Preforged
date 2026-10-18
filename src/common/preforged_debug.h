@@ -33,6 +33,10 @@ struct DebugOptions {
     /// Hands the driver a pair's stored code even when the game draws it with another state
     /// than it was compiled with, in case the driver can reuse part of it.
     bool store_any_state = false;
+    /// Compiles each vertex shader from the game files with its own attribute types: the types
+    /// the game drew it with, or for a shader the game hasn't drawn, float or an integer type by
+    /// what its code does with each attribute. Off gives every shader the most common types.
+    bool input_types_per_shader = true;
     /// Logs memory use every 30 seconds in game.
     bool log_memory = true;
     /// Logs every frame that took more than twice as long as the frame before it, with what ran

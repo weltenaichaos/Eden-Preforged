@@ -1526,6 +1526,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_UNPACK_OODLE.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
                 add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
+                add(BooleanSetting.PREFORGED_INPUT_TYPES_PER_SHADER.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_CPU_CODE.key)
                 add(BooleanSetting.PREFORGED_START_AFTER_LOADING.key)
                 add(BooleanSetting.PREFORGED_LIMIT_GPU_LAG.key)

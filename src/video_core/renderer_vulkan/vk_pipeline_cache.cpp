@@ -837,7 +837,9 @@ u64 PipelineCache::ShaderStateHash(const GraphicsPipelineCacheKey& key) {
 namespace {
 constexpr std::array<char, 4> PREFORGED_STORE_MAGIC{'P', 'F', 'D', 'S'};
 // Version 2 records what each pair was translated to, so stored code is matched by SPIR-V.
-constexpr u32 PREFORGED_STORE_VERSION = 2;
+// Version 3 compiles each vertex shader with its own attribute types; pairs stored by earlier
+// builds have the most common types, so the store starts over once.
+constexpr u32 PREFORGED_STORE_VERSION = 3;
 
 struct PreforgedStoreHeader {
     std::array<char, 4> magic;
@@ -851,7 +853,9 @@ struct PreforgedStoreRecord {
     u64 state_hash;
     u64 code_hash;
     u32 size;
-    u32 reserved;
+    /// A bit for each attribute whose type was read from the vertex shader's code. Earlier builds
+    /// wrote 0 here.
+    u32 code_typed;
     PipelineCache::PreforgedShaderInputs inputs;
 };
 
@@ -940,6 +944,221 @@ std::string DescribeInputDifference(const PipelineCache::PreforgedShaderInputs& 
     }
     return fmt::format("{}", fmt::join(parts, ", "));
 }
+
+/// What a vertex shader's code does with an attribute it reads: float math, or it takes the bits
+/// as an integer. The game feeds an attribute an integer type when the shader works on its bits
+/// as an integer, and a float type when the shader does float math with it.
+constexpr u8 INPUT_USED_AS_FLOAT = 1;
+constexpr u8 INPUT_USED_AS_INTEGER = 2;
+
+struct InputUse {
+    /// INPUT_USED_AS_FLOAT and INPUT_USED_AS_INTEGER for each attribute, both when the code does
+    /// both, neither when it only passes the value on.
+    std::array<u8, 32> kinds{};
+    /// A bit for each attribute the shader reads.
+    u32 read{};
+};
+
+/// Whether an instruction does float math with a float value it takes.
+bool IsFloatMath(Shader::IR::Opcode opcode) {
+    using Shader::IR::Opcode;
+    switch (opcode) {
+    case Opcode::FPAbs32:
+    case Opcode::FPAdd32:
+    case Opcode::FPFma32:
+    case Opcode::FPMax32:
+    case Opcode::FPMin32:
+    case Opcode::FPMul32:
+    case Opcode::FPNeg32:
+    case Opcode::FPRecip32:
+    case Opcode::FPRecipSqrt32:
+    case Opcode::FPSqrt:
+    case Opcode::FPSin:
+    case Opcode::FPExp2:
+    case Opcode::FPCos:
+    case Opcode::FPLog2:
+    case Opcode::FPSaturate32:
+    case Opcode::FPClamp32:
+    case Opcode::FPRoundEven32:
+    case Opcode::FPFloor32:
+    case Opcode::FPCeil32:
+    case Opcode::FPTrunc32:
+    case Opcode::FPOrdEqual32:
+    case Opcode::FPUnordEqual32:
+    case Opcode::FPOrdNotEqual32:
+    case Opcode::FPUnordNotEqual32:
+    case Opcode::FPOrdLessThan32:
+    case Opcode::FPUnordLessThan32:
+    case Opcode::FPOrdGreaterThan32:
+    case Opcode::FPUnordGreaterThan32:
+    case Opcode::FPOrdLessThanEqual32:
+    case Opcode::FPUnordLessThanEqual32:
+    case Opcode::FPOrdGreaterThanEqual32:
+    case Opcode::FPUnordGreaterThanEqual32:
+    case Opcode::FPIsNan32:
+    case Opcode::ConvertS16F32:
+    case Opcode::ConvertS32F32:
+    case Opcode::ConvertS64F32:
+    case Opcode::ConvertU16F32:
+    case Opcode::ConvertU32F32:
+    case Opcode::ConvertU64F32:
+    case Opcode::ConvertF16F32:
+    case Opcode::ConvertF64F32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Whether an instruction works on the bits of a 32-bit value it takes as an integer: integer
+/// math, integer to float conversion, or an offset or address, as in a constant buffer read
+/// indexed by a bone number.
+bool IsIntegerMath(Shader::IR::Opcode opcode) {
+    using Shader::IR::Opcode;
+    switch (opcode) {
+    case Opcode::IAdd32:
+    case Opcode::ISub32:
+    case Opcode::IMul32:
+    case Opcode::SDiv32:
+    case Opcode::UDiv32:
+    case Opcode::INeg32:
+    case Opcode::IAbs32:
+    case Opcode::ShiftLeftLogical32:
+    case Opcode::ShiftRightLogical32:
+    case Opcode::ShiftRightArithmetic32:
+    case Opcode::BitwiseAnd32:
+    case Opcode::BitwiseOr32:
+    case Opcode::BitwiseXor32:
+    case Opcode::BitwiseNot32:
+    case Opcode::BitFieldInsert:
+    case Opcode::BitFieldSExtract:
+    case Opcode::BitFieldUExtract:
+    case Opcode::BitReverse32:
+    case Opcode::BitCount32:
+    case Opcode::FindSMsb32:
+    case Opcode::FindUMsb32:
+    case Opcode::SMin32:
+    case Opcode::UMin32:
+    case Opcode::SMax32:
+    case Opcode::UMax32:
+    case Opcode::SClamp32:
+    case Opcode::UClamp32:
+    case Opcode::SLessThan:
+    case Opcode::ULessThan:
+    case Opcode::IEqual:
+    case Opcode::SLessThanEqual:
+    case Opcode::ULessThanEqual:
+    case Opcode::SGreaterThan:
+    case Opcode::UGreaterThan:
+    case Opcode::INotEqual:
+    case Opcode::SGreaterThanEqual:
+    case Opcode::UGreaterThanEqual:
+    case Opcode::ConvertF32S8:
+    case Opcode::ConvertF32S16:
+    case Opcode::ConvertF32S32:
+    case Opcode::ConvertF32U8:
+    case Opcode::ConvertF32U16:
+    case Opcode::ConvertF32U32:
+    case Opcode::GetCbufU8:
+    case Opcode::GetCbufS8:
+    case Opcode::GetCbufU16:
+    case Opcode::GetCbufS16:
+    case Opcode::GetCbufU32:
+    case Opcode::GetCbufF32:
+    case Opcode::GetCbufU32x2:
+    case Opcode::LoadLocal:
+    case Opcode::LoadStorage32:
+    case Opcode::LoadStorage64:
+    case Opcode::LoadStorage128:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Reads from a translated vertex shader whether it does float math with each attribute it
+/// reads or works on its bits as an integer. Each read is followed through bit casts, selects
+/// and phis to the instructions that use it.
+InputUse InputUseFromCode(const Shader::IR::Program& program) {
+    using Shader::IR::Inst;
+    using Shader::IR::Opcode;
+    InputUse use{};
+    for (size_t index = 0; index < use.kinds.size(); ++index) {
+        use.read |= program.info.loads.Generic(index) ? 1u << index : 0u;
+    }
+    std::unordered_map<const Inst*, std::vector<const Inst*>> users;
+    std::vector<std::pair<const Inst*, u32>> reads;
+    for (const Shader::IR::Block* const block : program.blocks) {
+        for (const Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == Opcode::GetAttribute) {
+                const Shader::IR::Value attribute{inst.Arg(0)};
+                if (attribute.Type() == Shader::IR::Type::Attribute &&
+                    Shader::IR::IsGeneric(attribute.Attribute())) {
+                    reads.emplace_back(&inst,
+                                       Shader::IR::GenericAttributeIndex(attribute.Attribute()));
+                }
+            }
+            for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+                if (const Inst* const producer{inst.Arg(arg).TryInstRecursive()}) {
+                    users[producer].push_back(&inst);
+                }
+            }
+        }
+    }
+    for (const auto& [read, index] : reads) {
+        // Each value the read flows into, and whether it holds the bits as an integer.
+        std::vector<std::pair<const Inst*, bool>> work{{read, false}};
+        std::unordered_set<const Inst*> visited{read};
+        while (!work.empty()) {
+            const auto [value, bits] = work.back();
+            work.pop_back();
+            const auto it{users.find(value)};
+            if (it == users.end()) {
+                continue;
+            }
+            for (const Inst* const user : it->second) {
+                const Opcode opcode{user->GetOpcode()};
+                const bool same{opcode == Opcode::Phi || opcode == Opcode::Identity ||
+                                opcode == (bits ? Opcode::SelectU32 : Opcode::SelectF32)};
+                const bool cast{opcode == (bits ? Opcode::BitCastF32U32 : Opcode::BitCastU32F32)};
+                if (same || cast) {
+                    if (visited.insert(user).second) {
+                        work.emplace_back(user, cast ? !bits : bits);
+                    }
+                    continue;
+                }
+                if (bits ? IsIntegerMath(opcode) : IsFloatMath(opcode)) {
+                    use.kinds[index] |= bits ? INPUT_USED_AS_INTEGER : INPUT_USED_AS_FLOAT;
+                }
+            }
+        }
+    }
+    return use;
+}
+
+/// Gives each attribute whose use the code makes clear float, or an integer type (the integer
+/// type the game feeds more often there, else unsigned). Attributes the guess turned off stay
+/// off. Returns a bit for each attribute it typed.
+u32 ApplyInputUse(GraphicsPipelineCacheKey& key, const InputUse& use,
+                  const std::array<std::array<size_t, 4>, 32>& votes) {
+    u32 typed{};
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        const u8 kind{use.kinds[index]};
+        const u64 current{key.state.DynamicAttributeType(index)};
+        if (((use.read >> index) & 1) == 0 || current == 0 ||
+            (kind != INPUT_USED_AS_FLOAT && kind != INPUT_USED_AS_INTEGER)) {
+            continue;
+        }
+        u64 type{1};
+        if (kind == INPUT_USED_AS_INTEGER) {
+            type = current != 1 ? current : votes[index][2] > votes[index][3] ? 2 : 3;
+        }
+        key.state.attribute_types &= ~(u64{3} << (index * 2));
+        key.state.attribute_types |= type << (index * 2);
+        typed |= 1u << index;
+    }
+    return typed;
+}
 } // Anonymous namespace
 
 void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
@@ -985,7 +1204,8 @@ void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
                 preforged_store.insert_or_assign(
                     record.pair_id,
                     PreforgedStoreEntry{offset, record.state_hash, record.size,
-                                        PreforgedCode{record.code_hash, record.inputs}});
+                                        PreforgedCode{record.code_hash, record.inputs},
+                                        record.code_typed});
                 valid_end = offset + record.size;
                 bytes += record.size;
                 file.seekg(static_cast<std::streamoff>(valid_end));
@@ -1008,7 +1228,7 @@ void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
 }
 
 void PipelineCache::AppendPreforgedStore(u64 pair_id, u64 state_hash, const PreforgedCode& code,
-                                         const vk::PipelineCache& cache) {
+                                         u32 code_typed, const vk::PipelineCache& cache) {
     size_t size{};
     if (cache.Read(&size, nullptr) != VK_SUCCESS || size == 0) {
         return;
@@ -1022,13 +1242,13 @@ void PipelineCache::AppendPreforgedStore(u64 pair_id, u64 state_hash, const Pref
         return;
     }
     const PreforgedStoreRecord record{
-        pair_id, state_hash, code.code_hash, static_cast<u32>(size), 0, code.inputs};
+        pair_id, state_hash, code.code_hash, static_cast<u32>(size), code_typed, code.inputs};
     const u64 offset{static_cast<u64>(preforged_store_out.tellp()) + sizeof(record)};
     preforged_store_out.write(reinterpret_cast<const char*>(&record), sizeof(record));
     preforged_store_out.write(data.data(), size);
     if (preforged_store_out) {
         preforged_store.insert_or_assign(
-            pair_id, PreforgedStoreEntry{offset, state_hash, record.size, code});
+            pair_id, PreforgedStoreEntry{offset, state_hash, record.size, code, code_typed});
     }
 }
 
@@ -1104,14 +1324,24 @@ void PipelineCache::PrecompilePreforgedPairs(
         return (vertex * 0x9E3779B97F4A7C15ULL) ^ fragment;
     }};
 
-    // Pairs compiled on earlier boots, whose driver code is in the store on storage.
+    // Each vertex shader gets its own attribute types: the types the game drew it with, or for a
+    // shader it hasn't drawn yet, float or integer by what its code does with each attribute.
+    // Off gives every shader the type the game feeds most often at each attribute.
+    const bool per_shader_types{Common::Preforged::Options().input_types_per_shader};
+
     // Pairs compiled on earlier boots, with the attribute types their vertex shader was
     // compiled with. A pair whose types differ from what would be guessed now is compiled again.
-    std::unordered_map<u64, std::array<u8, 32>> warmed;
+    // Types that were read from the shader's code stay as they are.
+    struct Warmed {
+        std::array<u8, 32> attributes;
+        u32 code_typed;
+    };
+    std::unordered_map<u64, Warmed> warmed;
     {
         std::scoped_lock lock{preforged_store_mutex};
         for (const auto& [id, entry] : preforged_store) {
-            warmed.emplace(id, entry.code.inputs.attributes);
+            warmed.emplace(id, Warmed{entry.code.inputs.attributes,
+                                      per_shader_types ? entry.code_typed : 0u});
         }
     }
     size_t stored_with_other_attributes{};
@@ -1121,6 +1351,7 @@ void PipelineCache::PrecompilePreforgedPairs(
     // compiled again by the driver, so use a state the game drew this vertex shader with, or
     // else the state most of its pipelines use.
     std::unordered_map<u64, const GraphicsPipelineCacheKey*> vertex_templates;
+    std::unordered_map<u64, const GraphicsPipelineCacheKey*> played_pair_keys;
     std::unordered_map<u64, std::pair<size_t, const GraphicsPipelineCacheKey*>> state_counts;
     for (const GraphicsPipelineCacheKey& key : played_keys) {
         played.insert(pair_id(key.unique_hashes[1], key.unique_hashes[5]));
@@ -1128,6 +1359,7 @@ void PipelineCache::PrecompilePreforgedPairs(
             key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0) {
             continue;
         }
+        played_pair_keys.try_emplace(pair_id(key.unique_hashes[1], key.unique_hashes[5]), &key);
         vertex_templates.try_emplace(key.unique_hashes[1], &key);
         auto& [count, example] = state_counts[ShaderStateHash(key)];
         ++count;
@@ -1183,10 +1415,10 @@ void PipelineCache::PrecompilePreforgedPairs(
         LOG_INFO(Render_Vulkan, "[Preforged] attribute types played shaders read: {}",
                  parts.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(parts, "; ")));
     }
-    const auto same_attributes{[](const std::array<u8, 32>& stored,
+    const auto same_attributes{[](const std::array<u8, 32>& stored, u32 trusted,
                                   const GraphicsPipelineCacheKey& key) {
         for (size_t index = 0; index < stored.size(); ++index) {
-            if (stored[index] != 0xFF &&
+            if (stored[index] != 0xFF && ((trusted >> index) & 1) == 0 &&
                 stored[index] != static_cast<u8>(AttributeType(key.state, index))) {
                 return false;
             }
@@ -1206,9 +1438,16 @@ void PipelineCache::PrecompilePreforgedPairs(
     }
     // Pairs that share a shader with what the game drew so far come first, since they belong to
     // the same areas and effects; a pair whose vertex shader was drawn also gets its real state.
-    std::array<std::vector<GraphicsPipelineCacheKey>, 3> candidates;
+    struct Candidate {
+        GraphicsPipelineCacheKey key;
+        /// The attribute types are the ones the game drew the vertex shader with.
+        bool drawn_types;
+    };
+    std::array<std::vector<Candidate>, 3> candidates;
     std::unordered_set<u64> seen;
     size_t warmed_count{};
+    size_t played_not_stored{};
+    size_t played_other_attributes{};
     for (const auto& [vertex, fragment] : programs.pairs) {
         if (!programs.shaders.contains(vertex) || !programs.shaders.contains(fragment)) {
             continue;
@@ -1218,17 +1457,38 @@ void PipelineCache::PrecompilePreforgedPairs(
             continue;
         }
         const auto it{vertex_templates.find(vertex)};
+        const bool drawn_types{per_shader_types && it != vertex_templates.end()};
         GraphicsPipelineCacheKey key{it != vertex_templates.end() ? *it->second : *common_template};
         key.unique_hashes = {};
         key.unique_hashes[1] = vertex;
         key.unique_hashes[5] = fragment;
-        guess_attributes(key);
+        if (!drawn_types) {
+            guess_attributes(key);
+        }
         if (played.contains(id)) {
             preforged_pairs.try_emplace(id, ShaderStateHash(key));
+            // The game draws a pair with more states as it goes, and each new one looks for the
+            // pair's stored code. Without stored code, or with code compiled with other attribute
+            // types than the game drew the pair with, the driver compiles the new state in full,
+            // so the pair is compiled with the state the game drew.
+            if (per_shader_types) {
+                const auto stored{warmed.find(id)};
+                const auto drawn{played_pair_keys.find(id)};
+                if (drawn != played_pair_keys.end() &&
+                    (stored == warmed.end() ||
+                     (drawn->second->state.dynamic_vertex_input &&
+                      !same_attributes(stored->second.attributes, 0, *drawn->second)))) {
+                    ++(stored == warmed.end() ? played_not_stored : played_other_attributes);
+                    candidates[0].push_back(Candidate{*drawn->second, true});
+                }
+            }
             continue;
         }
         if (const auto stored{warmed.find(id)}; stored != warmed.end()) {
-            if (!key.state.dynamic_vertex_input || same_attributes(stored->second, key)) {
+            // Types the game drew the vertex shader with count over types read from its code.
+            const u32 trusted{drawn_types ? 0u : stored->second.code_typed};
+            if (!key.state.dynamic_vertex_input ||
+                same_attributes(stored->second.attributes, trusted, key)) {
                 preforged_pairs.try_emplace(id, ShaderStateHash(key));
                 ++warmed_count;
                 continue;
@@ -1238,7 +1498,7 @@ void PipelineCache::PrecompilePreforgedPairs(
         const size_t rank{it != vertex_templates.end() ? 0u
                           : played_fragments.contains(fragment) ? 1u
                                                                 : 2u};
-        candidates[rank].push_back(key);
+        candidates[rank].push_back(Candidate{key, drawn_types});
     }
     const size_t candidate_count{candidates[0].size() + candidates[1].size() +
                                  candidates[2].size()};
@@ -1247,15 +1507,16 @@ void PipelineCache::PrecompilePreforgedPairs(
                              Common::Preforged::Options().precompile_percent +
                          99) /
                         100};
-    std::vector<GraphicsPipelineCacheKey> todo;
+    std::vector<Candidate> todo;
     for (const auto& rank : candidates) {
-        for (const GraphicsPipelineCacheKey& key : rank) {
+        for (const Candidate& candidate : rank) {
+            const GraphicsPipelineCacheKey& key{candidate.key};
             if (warmed_count + todo.size() >= wanted) {
                 preforged_skipped_pairs.insert(
                     pair_id(key.unique_hashes[1], key.unique_hashes[5]));
                 continue;
             }
-            todo.push_back(key);
+            todo.push_back(candidate);
             preforged_pairs.try_emplace(pair_id(key.unique_hashes[1], key.unique_hashes[5]),
                                         ShaderStateHash(key));
         }
@@ -1269,6 +1530,12 @@ void PipelineCache::PrecompilePreforgedPairs(
              candidates[0].size(), candidates[1].size(), candidates[2].size(), todo.size(),
              Common::Preforged::Options().precompile_percent, state_counts.size(),
              stored_with_other_attributes);
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] attribute types per vertex shader {}: {} drawn vertex shaders keep "
+             "the types the game drew them with; played pairs to compile with the state the "
+             "game drew: {} not stored yet, {} stored with other attribute types",
+             per_shader_types, per_shader_types ? vertex_templates.size() : 0,
+             played_not_stored, played_other_attributes);
     if (!Common::Preforged::Options().precompile_game_shaders) {
         LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in the settings");
         return;
@@ -1288,15 +1555,123 @@ void PipelineCache::PrecompilePreforgedPairs(
         size_t slow{};
         double total_ms{};
         std::vector<u64> warmed;
+        // Attribute types read from the vertex shaders' code, counted once per vertex shader.
+        size_t typed_shaders{};
+        size_t typed_attributes{};
+        size_t typed_changed{};
+        size_t typed_unclear{};
+        size_t typed_failed{};
+        size_t typed_pairs{};
+        // The same reading on vertex shaders the game drew, against the types it drew them with.
+        size_t check_shaders{};
+        size_t check_agree{};
+        size_t check_differ{};
+        size_t check_off{};
+        size_t check_unclear{};
+        std::vector<std::string> check_examples;
+        std::unordered_map<u64, InputUse> input_uses;
     } state;
+
+    // Reads, once per vertex shader, what its code does with each attribute, and counts how that
+    // compares with the types it is compiled with.
+    const auto input_use_of{[this, &state](u64 hash, const VideoCommon::PreforgedShader& shader,
+                                           u32 texture_bound, const GraphicsPipelineCacheKey& key,
+                                           bool drawn_types) {
+        {
+            std::scoped_lock lock{state.mutex};
+            if (const auto it{state.input_uses.find(hash)}; it != state.input_uses.end()) {
+                return it->second;
+            }
+        }
+        InputUse use{};
+        bool translated{};
+        try {
+            VideoCommon::PreforgedEnvironment env{shader.code, shader.stage, shader.start_address,
+                                                  texture_bound};
+            ShaderPools pools;
+            const u32 cfg_offset{
+                static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+            const Shader::IR::Program program{
+                TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+            use = InputUseFromCode(program);
+            translated = true;
+        } catch (const std::exception& e) {
+            LOG_DEBUG(Render_Vulkan, "[Preforged] vertex shader {:016x} failed: {}", hash,
+                      e.what());
+        }
+        std::scoped_lock lock{state.mutex};
+        const auto [it, is_new]{state.input_uses.try_emplace(hash, use)};
+        if (!is_new) {
+            return it->second;
+        }
+        if (!translated) {
+            ++state.typed_failed;
+            return use;
+        }
+        if (drawn_types) {
+            ++state.check_shaders;
+        } else {
+            ++state.typed_shaders;
+        }
+        for (size_t index = 0; index < use.kinds.size(); ++index) {
+            if (((use.read >> index) & 1) == 0) {
+                continue;
+            }
+            const u8 kind{use.kinds[index]};
+            const u32 type{key.state.DynamicAttributeType(index)};
+            const bool clear{kind == INPUT_USED_AS_FLOAT || kind == INPUT_USED_AS_INTEGER};
+            if (!drawn_types) {
+                if (!clear || type == 0) {
+                    ++state.typed_unclear;
+                    continue;
+                }
+                ++state.typed_attributes;
+                state.typed_changed += (kind == INPUT_USED_AS_FLOAT) != (type == 1) ? 1 : 0;
+                continue;
+            }
+            if (type == 0) {
+                ++state.check_off;
+            } else if (!clear) {
+                ++state.check_unclear;
+            } else if ((kind == INPUT_USED_AS_FLOAT) == (type == 1)) {
+                ++state.check_agree;
+            } else {
+                ++state.check_differ;
+                if (state.check_examples.size() < 8) {
+                    state.check_examples.push_back(
+                        fmt::format("{:016x} attribute {} drawn as {}, code reads it as {}", hash,
+                                    index, type == 1 ? "float" : type == 2 ? "int" : "uint",
+                                    kind == INPUT_USED_AS_FLOAT ? "float" : "integer"));
+                }
+            }
+        }
+        return use;
+    }};
+
     const auto start{std::chrono::steady_clock::now()};
     callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, todo.size());
-    for (const GraphicsPipelineCacheKey& key : todo) {
-        workers.QueueWork([this, key, programs_ptr, pair_id, total = todo.size(), &state,
-                           &callback] {
+    for (const Candidate& candidate : todo) {
+        workers.QueueWork([this, candidate, programs_ptr, pair_id, per_shader_types, &votes,
+                           &input_use_of, total = todo.size(), &state, &callback] {
             const VideoCommon::PreforgedPrograms& shared{**programs_ptr};
+            GraphicsPipelineCacheKey key{candidate.key};
             const auto& vertex{shared.shaders.at(key.unique_hashes[1])};
             const auto& fragment{shared.shaders.at(key.unique_hashes[5])};
+            // A vertex shader the game hasn't drawn yet gets float or an integer type at each
+            // attribute by what its code does with it; one it drew keeps the types it drew.
+            u32 code_typed{};
+            if (per_shader_types && key.state.dynamic_vertex_input) {
+                const InputUse use{input_use_of(key.unique_hashes[1], vertex,
+                                                shared.texture_bound, key, candidate.drawn_types)};
+                if (!candidate.drawn_types) {
+                    code_typed = ApplyInputUse(key, use, votes);
+                }
+            }
+            if (code_typed != 0) {
+                std::scoped_lock lock{state.mutex};
+                ++state.typed_pairs;
+            }
             VideoCommon::PreforgedEnvironment vertex_env{vertex.code, vertex.stage,
                                                          vertex.start_address,
                                                          shared.texture_bound};
@@ -1323,7 +1698,7 @@ void PipelineCache::PrecompilePreforgedPairs(
                         nullptr;
                 if (built) {
                     AppendPreforgedStore(pair_id(key.unique_hashes[1], key.unique_hashes[5]),
-                                         ShaderStateHash(key), code, *cache);
+                                         ShaderStateHash(key), code, code_typed, *cache);
                 }
             } catch (const std::exception& e) {
                 LOG_DEBUG(Render_Vulkan, "[Preforged] pair failed: {}", e.what());
@@ -1354,6 +1729,24 @@ void PipelineCache::PrecompilePreforgedPairs(
              "average per pair)",
              state.warmed.size(), seconds.count(), state.failed, state.slow,
              state.warmed.empty() ? 0.0 : state.total_ms / state.warmed.size());
+    if (per_shader_types) {
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] attribute types from the code of {} vertex shaders the game hasn't "
+                 "drawn: {} attributes set to float or integer by the code, {} of them other "
+                 "than the most common type, {} unclear (both or neither in the code, or off); "
+                 "{} pairs got types from the code; {} vertex shaders failed to translate",
+                 state.typed_shaders, state.typed_attributes, state.typed_changed,
+                 state.typed_unclear, state.typed_pairs, state.typed_failed);
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] check on {} vertex shaders the game drew: the code gives the type "
+                 "the game drew for {} attributes, another type for {}, {} were off in the game, "
+                 "{} unclear in the code",
+                 state.check_shaders, state.check_agree, state.check_differ, state.check_off,
+                 state.check_unclear);
+        for (const std::string& example : state.check_examples) {
+            LOG_INFO(Render_Vulkan, "[Preforged]   other type: {}", example);
+        }
+    }
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {

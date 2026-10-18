@@ -52,6 +52,8 @@ void LoadOptions() {
     options.precompile_percent =
         std::min(Settings::values.preforged_precompile_percent.GetValue(), 100u);
     options.store_any_state = Settings::values.preforged_store_any_state.GetValue();
+    options.input_types_per_shader =
+        Settings::values.preforged_input_types_per_shader.GetValue();
     options.log_memory = Settings::values.preforged_log_memory.GetValue();
     options.log_slow_frames = Settings::values.preforged_log_slow_frames.GetValue();
     options.log_allocation_sizes = Settings::values.preforged_log_allocation_sizes.GetValue();
@@ -69,10 +71,10 @@ void LoadOptions() {
              options.bake_driver_constants, options.scan_game_files, options.rescan_game_files,
              options.precompile_game_shaders, options.log_shader_compiles);
     LOG_INFO(Common,
-             "[Preforged] pre-compile share {}%, stored code for any state {}, log memory {}, "
-             "log slow frames {}",
-             options.precompile_percent, options.store_any_state, options.log_memory,
-             options.log_slow_frames);
+             "[Preforged] pre-compile share {}%, stored code for any state {}, attribute types "
+             "per vertex shader {}, log memory {}, log slow frames {}",
+             options.precompile_percent, options.store_any_state, options.input_types_per_shader,
+             options.log_memory, options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] driver pipeline cache {}, log allocation sizes {}, track allocations {}, "
              "track driver memory {}, pre-compile CPU code {}, start after loading {}",

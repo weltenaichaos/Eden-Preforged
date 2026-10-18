@@ -676,6 +676,8 @@
     <string name="preforged_log_shader_compiles_description">Logs every shader compile during play with its timing and where its shaders came from.</string>
     <string name="preforged_precompile_percent">Share of game file shaders to compile</string>
     <string name="preforged_precompile_percent_description">Compiles this share of the shader pairs found in the game files, starting with the ones closest to what the game has drawn so far. Compiled pairs are kept on storage and only loaded when the game draws with them, so they don\'t take up memory. A lower share means a shorter first load and more stutter.</string>
+    <string name="preforged_input_types_per_shader">Vertex input types per shader</string>
+    <string name="preforged_input_types_per_shader_description">Compiles each vertex shader from the game files with its own input types (float or integer). A shader the game already drew keeps the types it drew it with. For one it hasn\'t drawn yet, the type is read from what its code does with each input. Off gives every shader the type the game uses most often, which made Breath of the Wild compile shaders again during play. Takes effect when a game starts.</string>
     <string name="preforged_store_any_state">Use stored shaders for any state</string>
     <string name="preforged_store_any_state_description">Hands the driver a shader pair\'s stored code even when the game draws it differently than it was compiled, in case the driver can reuse part of it. Off by default: in build 33 this crashed the GPU driver and gave no speedup.</string>
     <string name="preforged_log_memory">Log memory use</string>

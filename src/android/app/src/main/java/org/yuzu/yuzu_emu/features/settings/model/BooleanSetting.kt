@@ -87,6 +87,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_PRECOMPILE_GAME_SHADERS("preforged_precompile_game_shaders"),
     PREFORGED_LOG_SHADER_COMPILES("preforged_log_shader_compiles"),
     PREFORGED_STORE_ANY_STATE("preforged_reuse_other_state"),
+    PREFORGED_INPUT_TYPES_PER_SHADER("preforged_input_types_per_shader"),
     PREFORGED_LOG_MEMORY("preforged_log_memory"),
     PREFORGED_LOG_SLOW_FRAMES("preforged_log_slow_frames"),
     PREFORGED_LOG_ALLOCATION_SIZES("preforged_log_allocation_sizes"),
