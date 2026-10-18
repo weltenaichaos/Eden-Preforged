@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -76,5 +77,78 @@ bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& 
 /// Unpacks LZO1X data into exactly `out.size()` bytes. Returns false when the data is not
 /// LZO1X data of that size. Exposed for tests.
 [[nodiscard]] bool DecompressLzo1x(std::span<const u8> in, std::span<u8> out);
+
+/// What the shader search reads from the header of an Unreal Engine 3 package.
+struct Summary {
+    u32 version = 0;  ///< Engine file version
+    u32 licensee = 0; ///< Version of the game's own changes to the format
+    u32 header_size = 0;
+    u32 name_count = 0;
+    u32 name_offset = 0;
+    u32 export_count = 0;
+    u32 export_offset = 0;
+    u32 import_count = 0;
+    u32 import_offset = 0;
+    /// Where the list of compressed chunks starts in the header, 0 when there is none.
+    u32 chunk_list_offset = 0;
+    /// The compressed chunks, in file order. Empty when the package is stored unpacked.
+    struct Chunk {
+        u32 unpacked_offset;
+        u32 unpacked_size;
+        u32 packed_offset;
+        u32 packed_size;
+    };
+    std::vector<Chunk> chunks;
+};
+
+/// An object another package defines, which this one uses.
+struct ObjectImport {
+    s32 class_name = 0;  ///< Name index
+    s32 outer = 0;       ///< Object index: negative for imports, positive for exports
+    s32 object_name = 0; ///< Name index
+};
+
+/// An object this package defines, with where its data is.
+struct ObjectExport {
+    s32 class_index = 0; ///< Object index of the class; 0 for classes themselves
+    s32 outer = 0;
+    s32 object_name = 0;
+    s32 object_number = 0; ///< Added to the name as "_N-1" when not 0
+    u32 serial_size = 0;
+    u32 serial_offset = 0;
+};
+
+/// The name, import and export tables of an Unreal Engine 3 package.
+struct Tables {
+    std::vector<std::string> names;
+    std::vector<ObjectImport> imports;
+    std::vector<ObjectExport> exports;
+    /// Why reading stopped early, with the bytes it stopped at. Empty when all was read.
+    std::string error;
+
+    [[nodiscard]] std::string Name(s32 index) const;
+    /// The name of an object index: an import for negative ones, an export for positive ones.
+    [[nodiscard]] std::string ObjectName(s32 object_index) const;
+    [[nodiscard]] std::string ClassName(const ObjectExport& object) const;
+};
+
+/// Reads the header at the start of a package file as stored. Finds the list of compressed
+/// chunks by checking that each one points at a compressed part, so fields a game added to the
+/// header are skipped. Returns nothing for data that is not an Unreal Engine 3 package.
+[[nodiscard]] std::optional<Summary> ReadSummary(std::span<const u8> file);
+
+/// Unpacks a whole package into its uncompressed layout, where the offsets of the header and
+/// tables apply: the header as stored, then each chunk at its unpacked offset. Blocks that do
+/// not unpack stay zero and are counted in `failed_blocks`. Returns false when nothing unpacked.
+bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u8>& image,
+                 size_t& failed_blocks);
+
+/// Maps an offset in the data Unpack hands out (the chunks one after another) to the offset in
+/// the uncompressed layout. Returns nothing past the last chunk.
+[[nodiscard]] std::optional<u64> ImageOffset(const Summary& summary, u64 unpacked_offset);
+
+/// Reads the name, import and export tables from `data`, which holds the uncompressed layout
+/// starting at `data_offset`.
+[[nodiscard]] Tables ReadTables(std::span<const u8> data, u64 data_offset, const Summary& summary);
 
 } // namespace Preforged::Unreal

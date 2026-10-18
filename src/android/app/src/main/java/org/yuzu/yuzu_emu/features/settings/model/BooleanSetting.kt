@@ -100,6 +100,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_UNPACK_UNREAL_PACKAGES("preforged_unpack_unreal_packages"),
     PREFORGED_UNPACK_OODLE("preforged_unpack_oodle"),
     PREFORGED_ZSTD_DICTIONARIES("preforged_zstd_dictionaries"),
+    PREFORGED_LOG_UNREAL_LINKS("preforged_log_unreal_links"),
     USE_VULKAN_DRIVER_PIPELINE_CACHE("use_vulkan_driver_pipeline_cache"),
     EXTENDED_LOGGING("extended_logging"),
     DONT_SHOW_DRIVER_SHADER_WARNING("dont_show_driver_shader_warning"),

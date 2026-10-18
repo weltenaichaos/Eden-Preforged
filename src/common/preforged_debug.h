@@ -25,6 +25,8 @@ struct DebugOptions {
     bool unpack_oodle = true;
     /// Finds the zstd dictionaries in the game files and unpacks the files packed with them.
     bool zstd_dictionaries = true;
+    /// Logs how an Unreal game's packages refer to their shader code, during the search.
+    bool log_unreal_links = true;
     /// Compiles the shader pairs found in the game files while the game loads.
     bool precompile_game_shaders = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.

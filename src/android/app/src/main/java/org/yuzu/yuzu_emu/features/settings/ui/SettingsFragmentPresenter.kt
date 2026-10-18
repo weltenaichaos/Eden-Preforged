@@ -1525,6 +1525,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_UNPACK_UNREAL_PACKAGES.key)
                 add(BooleanSetting.PREFORGED_UNPACK_OODLE.key)
                 add(BooleanSetting.PREFORGED_ZSTD_DICTIONARIES.key)
+                add(BooleanSetting.PREFORGED_LOG_UNREAL_LINKS.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
                 add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
                 add(BooleanSetting.PREFORGED_INPUT_TYPES_PER_SHADER.key)

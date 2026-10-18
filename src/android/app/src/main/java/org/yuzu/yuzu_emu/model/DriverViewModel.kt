@@ -24,6 +24,7 @@ import org.yuzu.yuzu_emu.utils.GpuDriverHelper
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.utils.GpuDriverMetadata
 import org.yuzu.yuzu_emu.utils.DirectoryInitialization
+import org.yuzu.yuzu_emu.utils.Log
 import org.yuzu.yuzu_emu.utils.NativeConfig
 import java.io.File
 
@@ -120,6 +121,12 @@ class DriverViewModel : ViewModel() {
 
         if (!skipShaderWipe && newDriverPath != previousDriverPath) {
             activeGame?.let {
+                // Say so in the log: without it, the next start's empty cache looks like a bug.
+                Log.info(
+                    "[DriverViewModel] GPU driver for ${it.title} changed from " +
+                        "'${previousDriverPath.ifEmpty { "system" }}' to " +
+                        "'${newDriverPath.ifEmpty { "system" }}', deleting its shader cache"
+                )
                 wipeGameShaders(it)
 
                 if (!BooleanSetting.DONT_SHOW_DRIVER_SHADER_WARNING.getBoolean(needsGlobal = true)) {

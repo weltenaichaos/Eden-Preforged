@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <optional>
+#include <string_view>
 
 #include <fmt/format.h>
 #include <zlib.h>
@@ -533,6 +534,337 @@ bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& 
         ++stats.compressed_packages;
     }
     return found;
+}
+
+namespace {
+
+constexpr u32 MIN_UE3_VERSION = 491;
+constexpr u32 MAX_UE3_VERSION = 900;
+constexpr u32 MAX_CHUNKS = 100000;
+constexpr u32 MAX_TABLE_ENTRIES = 4000000;
+constexpr s32 MAX_NAME_LENGTH = 1024;
+
+/// Reads little-endian values from a span, failing past its end.
+class Reader {
+public:
+    Reader(std::span<const u8> data_, size_t pos_) : data{data_}, pos{pos_} {}
+
+    bool U32(u32& value) {
+        if (pos > data.size() || data.size() - pos < 4) {
+            return false;
+        }
+        value = Load32(data.data() + pos, false);
+        pos += 4;
+        return true;
+    }
+
+    bool S32(s32& value) {
+        u32 raw;
+        if (!U32(raw)) {
+            return false;
+        }
+        value = static_cast<s32>(raw);
+        return true;
+    }
+
+    bool Skip(size_t bytes) {
+        if (pos > data.size() || data.size() - pos < bytes) {
+            return false;
+        }
+        pos += bytes;
+        return true;
+    }
+
+    /// Reads a length-prefixed string: positive lengths count bytes, negative ones UTF-16
+    /// units, both with the closing zero. Characters past ASCII become '?'.
+    bool String(std::string& out) {
+        s32 length;
+        if (!S32(length) || length > MAX_NAME_LENGTH || length < -MAX_NAME_LENGTH) {
+            return false;
+        }
+        out.clear();
+        if (length >= 0) {
+            if (!Fits(static_cast<size_t>(length))) {
+                return false;
+            }
+            for (s32 i = 0; i + 1 < length; ++i) {
+                out += static_cast<char>(data[pos + i]);
+            }
+            pos += static_cast<size_t>(length);
+            return true;
+        }
+        const size_t units = static_cast<size_t>(-length);
+        if (!Fits(units * 2)) {
+            return false;
+        }
+        for (size_t i = 0; i + 1 < units; ++i) {
+            const u16 unit = static_cast<u16>(data[pos + i * 2] | (data[pos + i * 2 + 1] << 8));
+            out += unit < 0x80 ? static_cast<char>(unit) : '?';
+        }
+        pos += units * 2;
+        return true;
+    }
+
+    size_t Pos() const {
+        return pos;
+    }
+
+private:
+    bool Fits(size_t bytes) const {
+        return pos <= data.size() && data.size() - pos >= bytes;
+    }
+
+    std::span<const u8> data;
+    size_t pos;
+};
+
+/// Checks for a list of compressed chunks at `pos`: a count, then per chunk its unpacked
+/// offset and size and its packed offset and size. Each chunk must point at a compressed part
+/// that unpacks to its size, and the unpacked ranges must follow one another.
+std::optional<std::vector<Summary::Chunk>> ChunkListAt(std::span<const u8> file, size_t pos) {
+    Reader reader{file, pos};
+    u32 count;
+    if (!reader.U32(count) || count == 0 || count > MAX_CHUNKS) {
+        return std::nullopt;
+    }
+    std::vector<Summary::Chunk> chunks(count);
+    for (Summary::Chunk& chunk : chunks) {
+        if (!reader.U32(chunk.unpacked_offset) || !reader.U32(chunk.unpacked_size) ||
+            !reader.U32(chunk.packed_offset) || !reader.U32(chunk.packed_size)) {
+            return std::nullopt;
+        }
+    }
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const Summary::Chunk& chunk = chunks[i];
+        if (u64{chunk.packed_offset} + chunk.packed_size > file.size() ||
+            (i > 0 && chunk.unpacked_offset !=
+                          chunks[i - 1].unpacked_offset + chunks[i - 1].unpacked_size)) {
+            return std::nullopt;
+        }
+        const std::optional<Part> part = ReadPart(file, chunk.packed_offset);
+        if (!part || part->unpacked != chunk.unpacked_size) {
+            return std::nullopt;
+        }
+    }
+    return chunks;
+}
+
+} // Anonymous namespace
+
+std::string Tables::Name(s32 index) const {
+    if (index >= 0 && static_cast<size_t>(index) < names.size()) {
+        return names[static_cast<size_t>(index)];
+    }
+    return fmt::format("#{}", index);
+}
+
+std::string Tables::ObjectName(s32 object_index) const {
+    if (object_index < 0 && static_cast<size_t>(-static_cast<s64>(object_index)) <= imports.size()) {
+        return Name(imports[static_cast<size_t>(-static_cast<s64>(object_index) - 1)].object_name);
+    }
+    if (object_index > 0 && static_cast<size_t>(object_index) <= exports.size()) {
+        const ObjectExport& object = exports[static_cast<size_t>(object_index - 1)];
+        return object.object_number > 0
+                   ? fmt::format("{}_{}", Name(object.object_name), object.object_number - 1)
+                   : Name(object.object_name);
+    }
+    return object_index == 0 ? "None" : fmt::format("object {}", object_index);
+}
+
+std::string Tables::ClassName(const ObjectExport& object) const {
+    return object.class_index == 0 ? "Class" : ObjectName(object.class_index);
+}
+
+std::optional<Summary> ReadSummary(std::span<const u8> file) {
+    if (file.size() < 64 || Load32(file.data(), false) != PACKAGE_TAG) {
+        return std::nullopt;
+    }
+    Summary summary;
+    Reader reader{file, 4};
+    u32 version_word;
+    std::string folder;
+    u32 flags;
+    if (!reader.U32(version_word)) {
+        return std::nullopt;
+    }
+    summary.version = version_word & 0xFFFF;
+    summary.licensee = version_word >> 16;
+    if (summary.version < MIN_UE3_VERSION || summary.version > MAX_UE3_VERSION) {
+        return std::nullopt;
+    }
+    if (!reader.U32(summary.header_size) || !reader.String(folder) || !reader.U32(flags) ||
+        !reader.U32(summary.name_count) || !reader.U32(summary.name_offset) ||
+        !reader.U32(summary.export_count) || !reader.U32(summary.export_offset) ||
+        !reader.U32(summary.import_count) || !reader.U32(summary.import_offset)) {
+        return std::nullopt;
+    }
+    if (summary.name_count > MAX_TABLE_ENTRIES || summary.export_count > MAX_TABLE_ENTRIES ||
+        summary.import_count > MAX_TABLE_ENTRIES) {
+        return std::nullopt;
+    }
+    // Depends offset; import and export guids (version 623); thumbnail table (584); guid.
+    u32 generations = 0;
+    const bool skipped = reader.Skip(4) && (summary.version < 623 || reader.Skip(12)) &&
+                         (summary.version < 584 || reader.Skip(4)) && reader.Skip(16) &&
+                         reader.U32(generations) && generations <= 4096 &&
+                         reader.Skip(size_t{generations} * 12) &&
+                         // Engine version, cooked content version, compression flags.
+                         reader.Skip(12);
+    if (!skipped) {
+        return std::nullopt;
+    }
+    const size_t expected = reader.Pos();
+    // Games add fields to the header, so look a little before and after where the list
+    // should be.
+    for (size_t delta = 0; delta <= 256; ++delta) {
+        for (const size_t pos : {expected + delta, expected - std::min(expected, delta)}) {
+            if (auto chunks = ChunkListAt(file, pos)) {
+                summary.chunk_list_offset = static_cast<u32>(pos);
+                summary.chunks = std::move(*chunks);
+                return summary;
+            }
+        }
+    }
+    u32 count = 0;
+    if (Reader{file, expected}.U32(count) && count == 0) {
+        return summary; // Stored unpacked
+    }
+    return std::nullopt;
+}
+
+bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u8>& image,
+                 size_t& failed_blocks) {
+    failed_blocks = 0;
+    if (summary.chunks.empty()) {
+        image.assign(file.begin(), file.end());
+        return true;
+    }
+    const Summary::Chunk& last = summary.chunks.back();
+    const size_t first_offset = summary.chunks.front().unpacked_offset;
+    image.assign(size_t{last.unpacked_offset} + last.unpacked_size + Ooz::OUTPUT_SLACK, 0);
+    std::memcpy(image.data(), file.data(), std::min(first_offset, file.size()));
+    Method last_method = Method::Unknown;
+    bool any = false;
+    for (const Summary::Chunk& chunk : summary.chunks) {
+        const std::optional<Part> part = ReadPart(file, chunk.packed_offset);
+        if (!part) {
+            continue;
+        }
+        size_t block_pos = part->data_begin;
+        size_t out_pos = chunk.unpacked_offset;
+        for (const Block& block : part->blocks) {
+            const std::span<const u8> in = file.subspan(block_pos, block.packed);
+            const std::span<u8> out{image.data() + out_pos, block.unpacked};
+            const Method method = DecompressBlock(in, out, last_method, true);
+            if (method == Method::OodleFailed || method == Method::Unknown) {
+                std::memset(out.data(), 0, out.size());
+                ++failed_blocks;
+            } else {
+                any = true;
+            }
+            block_pos += block.packed;
+            out_pos += block.unpacked;
+        }
+    }
+    image.resize(size_t{last.unpacked_offset} + last.unpacked_size);
+    return any;
+}
+
+std::optional<u64> ImageOffset(const Summary& summary, u64 unpacked_offset) {
+    if (summary.chunks.empty()) {
+        return unpacked_offset;
+    }
+    // Unpack hands out the chunks one after another, and their unpacked ranges follow one
+    // another too, so the data is the image from the first chunk on.
+    const Summary::Chunk& last = summary.chunks.back();
+    const u64 image_offset = summary.chunks.front().unpacked_offset + unpacked_offset;
+    if (image_offset >= u64{last.unpacked_offset} + last.unpacked_size) {
+        return std::nullopt;
+    }
+    return image_offset;
+}
+
+Tables ReadTables(std::span<const u8> data, u64 data_offset, const Summary& summary) {
+    Tables tables;
+    const auto start = [&](u32 offset) -> std::optional<size_t> {
+        if (offset < data_offset || offset - data_offset > data.size()) {
+            return std::nullopt;
+        }
+        return static_cast<size_t>(offset - data_offset);
+    };
+    const auto fail = [&](std::string_view what, size_t index, size_t pos) {
+        tables.error = fmt::format("{} {} at 0x{:x}: {}", what, index, pos + data_offset,
+                                   Hex(data.subspan(std::min(pos, data.size())), 64));
+        return tables;
+    };
+    const auto names_pos = start(summary.name_offset);
+    if (!names_pos) {
+        return fail("names start outside the data, name", 0, 0);
+    }
+    Reader reader{data, *names_pos};
+    tables.names.reserve(summary.name_count);
+    for (u32 i = 0; i < summary.name_count; ++i) {
+        const size_t pos = reader.Pos();
+        std::string name;
+        if (!reader.String(name) || !reader.Skip(8)) {
+            return fail("name", i, pos);
+        }
+        tables.names.push_back(std::move(name));
+    }
+    const auto valid_name = [&](s32 index) {
+        return index >= 0 && static_cast<size_t>(index) < tables.names.size();
+    };
+    const auto valid_object = [&](s32 index) {
+        return index >= -static_cast<s64>(summary.import_count) &&
+               index <= static_cast<s64>(summary.export_count);
+    };
+    const auto imports_pos = start(summary.import_offset);
+    if (!imports_pos) {
+        return fail("imports start outside the data, import", 0, 0);
+    }
+    reader = Reader{data, *imports_pos};
+    tables.imports.reserve(summary.import_count);
+    for (u32 i = 0; i < summary.import_count; ++i) {
+        const size_t pos = reader.Pos();
+        ObjectImport object;
+        s32 class_package;
+        s32 number;
+        if (!reader.S32(class_package) || !reader.Skip(4) || !reader.S32(object.class_name) ||
+            !reader.Skip(4) || !reader.S32(object.outer) || !reader.S32(object.object_name) ||
+            !reader.S32(number) || !valid_name(class_package) || !valid_name(object.class_name) ||
+            !valid_name(object.object_name) || !valid_object(object.outer)) {
+            return fail("import", i, pos);
+        }
+        tables.imports.push_back(object);
+    }
+    const auto exports_pos = start(summary.export_offset);
+    if (!exports_pos) {
+        return fail("exports start outside the data, export", 0, 0);
+    }
+    reader = Reader{data, *exports_pos};
+    tables.exports.reserve(summary.export_count);
+    for (u32 i = 0; i < summary.export_count; ++i) {
+        const size_t pos = reader.Pos();
+        ObjectExport object;
+        s32 super_index;
+        s32 archetype;
+        u32 net_objects = 0;
+        // Class, super, outer, name, archetype, flags (64 bits), serial size and offset, export
+        // flags, net object counts per generation, package guid, package flags.
+        if (!reader.S32(object.class_index) || !reader.S32(super_index) ||
+            !reader.S32(object.outer) || !reader.S32(object.object_name) ||
+            !reader.S32(object.object_number) || !reader.S32(archetype) || !reader.Skip(8) ||
+            !reader.U32(object.serial_size) || !reader.U32(object.serial_offset) ||
+            !reader.Skip(4) || !reader.U32(net_objects) || net_objects > 1024 ||
+            !reader.Skip(size_t{net_objects} * 4 + 16 + 4) || !valid_object(object.class_index) ||
+            !valid_object(super_index) || !valid_object(object.outer) ||
+            !valid_object(archetype) || !valid_name(object.object_name) ||
+            (object.serial_size > 0 && object.serial_offset < summary.name_offset)) {
+            return fail("export", i, pos);
+        }
+        tables.exports.push_back(object);
+    }
+    return tables;
 }
 
 } // namespace Preforged::Unreal

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -37,6 +38,7 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "jni/shader_file_scan.h"
+#include "jni/unreal_links.h"
 #include "jni/unreal_package.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/program.h"
@@ -75,6 +77,8 @@ constexpr size_t MAX_EXTRACTED_BYTES = 256ULL << 20;
 constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
 constexpr u64 SELF_BRANCH_B = 0xE2400FFFFF07000FULL;
 constexpr u64 EXIT_VALUE = 0xE30000000007000FULL;
+/// Added to the name of an Unreal package for what it unpacked to.
+constexpr const char* UNPACKED_SUFFIX = " (unpacked)";
 
 enum class MatchKind : u8 { None, Needle, CodeOnly, Exact };
 
@@ -387,6 +391,9 @@ public:
                      std::chrono::steady_clock::time_point deadline_)
         : shaders{std::move(shaders_)}, stop{stop_}, deadline{deadline_}, filter((size_t{1} << FILTER_BITS) / 64),
           results(shaders.size()) {
+        if (Common::Preforged::Options().log_unreal_links) {
+            links = std::make_unique<Preforged::Unreal::LinkSurvey>(CHUNK_OVERLAP);
+        }
         for (size_t index = 0; index < shaders.size(); ++index) {
             const auto& shader = shaders[index];
             const size_t start = NeedleOffset(shader) / sizeof(u64);
@@ -1195,6 +1202,52 @@ public:
         }
     }
 
+    // Reads the Unreal package that holds the most shader code once more, to log how its objects
+    // refer to the code. Runs between the two passes, so the second searches the other packages
+    // for what it learned.
+    void StudyUnrealLinks(const std::vector<Vulkan::GraphicsPipelineCacheKey>& keys) {
+        if (!links || links_studied) {
+            return;
+        }
+        std::string best;
+        size_t most = 0;
+        for (const auto& [name, file] : unreal_code_files) {
+            const auto it = file_ids.find(name + UNPACKED_SUFFIX);
+            if (it != file_ids.end() && headers[it->second].size() > most) {
+                most = headers[it->second].size();
+                best = name;
+            }
+        }
+        if (best.empty()) {
+            return;
+        }
+        links_studied = true;
+        const auto start = std::chrono::steady_clock::now();
+        std::vector<Preforged::Unreal::LinkSurvey::CodeHeader> code;
+        for (const auto& [offset, header] : headers[file_ids.at(best + UNPACKED_SUFFIX)]) {
+            code.push_back({offset, header.hash});
+        }
+        std::vector<std::pair<u64, u64>> played;
+        for (const auto& key : keys) {
+            if (key.unique_hashes[1] != 0 && key.unique_hashes[5] != 0) {
+                played.emplace_back(key.unique_hashes[1], key.unique_hashes[5]);
+            }
+        }
+        const std::vector<u8> data = unreal_code_files.at(best)->ReadAllBytes();
+        links->StudyCodePackage(best + UNPACKED_SUFFIX, data, code, played,
+                                [this] { return Stopped(); });
+        LOG_INFO(Frontend, "[ShaderScan] Unreal links: read {} in {} ms", best,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count());
+    }
+
+    void ReportUnrealLinks() const {
+        if (links) {
+            links->Report();
+        }
+    }
+
     // Keeps the shader pairs from the game's program tables, for compiling them ahead of time.
     void SavePrograms(const std::filesystem::path& path) const {
         VideoCommon::PreforgedPrograms programs;
@@ -1294,6 +1347,13 @@ private:
             const std::vector<u8> data = file->ReadAllBytes();
             bytes_scanned += data.size();
             ScanBuffer(data, name, 0);
+            // Keeps Unreal packages that hold shader code, to read the one with the most again.
+            if (links) {
+                const auto it = file_ids.find(name + UNPACKED_SUFFIX);
+                if (it != file_ids.end() && !headers[it->second].empty()) {
+                    unreal_code_files.emplace(name, file);
+                }
+            }
         } else {
             std::vector<u8> chunk;
             for (size_t offset = 0; offset < size && !Stopped();
@@ -1324,16 +1384,25 @@ private:
         // unpack to, in pieces like large files.
         if (Common::Preforged::Options().unpack_unreal_packages &&
             Preforged::Unreal::IsPackage(data)) {
-            const std::string unpacked_name = name + " (unpacked)";
+            const std::string unpacked_name = name + UNPACKED_SUFFIX;
             const bool unpacked = Preforged::Unreal::Unpack(
                 data, CHUNK_SIZE, CHUNK_OVERLAP, unreal_stats,
                 [&](std::span<const u8> piece, u64 offset) {
+                    if (links) {
+                        if (offset == 0) {
+                            links->AddPackage(name, data, piece);
+                        }
+                        links->SearchPiece(unpacked_name, piece, offset);
+                    }
                     SearchShaders(piece, unpacked_name, offset);
                     return !Stopped();
                 },
                 Common::Preforged::Options().unpack_oodle);
             if (unpacked) {
                 return;
+            }
+            if (links && depth == 0) {
+                links->AddPackage(name, data, data);
             }
         }
         if (data.size() >= 0x14 && std::memcmp(data.data(), "SARC", 4) == 0 &&
@@ -1671,6 +1740,9 @@ private:
         /// Files too large to read whole, searched in pieces as they are, by their first 4 bytes.
         std::map<u32, std::pair<size_t, u64>> large_starts;
     } formats;
+    std::unique_ptr<Preforged::Unreal::LinkSurvey> links;
+    bool links_studied = false;
+    std::map<std::string, FileSys::VirtualFile> unreal_code_files;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
@@ -1783,12 +1855,17 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.FindZstdDictionaries(root);
     scanner.ScanDir(root, "", true);
     scanner.Report("shader-named files");
+    scanner.StudyUnrealLinks(graphics_keys);
     if (!scanner.Stopped()) {
         scanner.ScanDir(root, "", false);
         scanner.Report("all files");
     }
     scanner.ReportFormats();
+    // When the code is in a package the first pass didn't read, the other packages were
+    // searched before it was known.
+    scanner.StudyUnrealLinks(graphics_keys);
     scanner.ReportUnreal();
+    scanner.ReportUnrealLinks();
     scanner.ReportExtraction();
     scanner.ReportPairing(graphics_keys);
     scanner.ReportGuessAccuracy();

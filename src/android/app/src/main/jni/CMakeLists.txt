@@ -22,6 +22,8 @@ add_library(yuzu-android SHARED
     crash_report.h
     shader_file_scan.cpp
     shader_file_scan.h
+    unreal_links.cpp
+    unreal_links.h
     unreal_package.cpp
     unreal_package.h
     ooz/kraken.cpp
