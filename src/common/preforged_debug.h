@@ -61,6 +61,40 @@ void LogMappingSummary(size_t top);
 void NoteGpuAllocation(std::uint32_t memory_type, std::uint64_t size);
 void NoteGpuFree(std::uint32_t memory_type, std::uint64_t size);
 
+/// Vulkan objects the emulator creates, counted so the memory log shows which ones pile up.
+/// Drivers give some of them GPU memory of their own (command buffers, query pools, descriptor
+/// pools, events), which the GPU allocation counts above don't see.
+enum class VulkanObject : std::uint8_t {
+    CommandPool,
+    CommandBuffer,
+    DescriptorPool,
+    DescriptorSet,
+    QueryPool,
+    Event,
+    Fence,
+    Semaphore,
+    DeviceMemory,
+    Buffer,
+    BufferView,
+    Image,
+    ImageView,
+    Framebuffer,
+    RenderPass,
+    Sampler,
+    Pipeline,
+    ShaderModule,
+    Count,
+};
+
+/// Adds `change` to the number of live objects of `type`.
+void NoteVulkanObjects(VulkanObject type, std::int64_t change);
+
+/// Counts a queue submit. `ahead` is how many earlier submits the GPU still had to finish.
+void NoteQueueSubmit(std::uint64_t ahead);
+
+/// Notes how many command chunks wait for the thread that records and submits them.
+void NoteWorkQueue(std::uint64_t waiting);
+
 /// Logs resident, virtual and malloc memory and the GPU allocations, tagged with `when`, and the
 /// number of mappings when `count_mappings` is set. Past 20,000 mappings it also logs which
 /// names hold them, again after each 5,000 more.

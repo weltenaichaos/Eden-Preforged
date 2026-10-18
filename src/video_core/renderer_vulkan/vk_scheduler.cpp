@@ -13,6 +13,7 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/preforged_debug.h"
 #include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -89,6 +90,7 @@ void Scheduler::DispatchWork() {
         {
             std::scoped_lock ql{queue_mutex};
             work_queue.push(std::move(chunk));
+            Common::Preforged::NoteWorkQueue(work_queue.size());
         }
         event_cv.notify_all();
         AcquireNewChunk();
@@ -366,6 +368,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
+            Common::Preforged::NoteQueueSubmit(signal_value - master_semaphore->KnownGpuTick());
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {

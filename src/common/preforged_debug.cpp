@@ -121,6 +121,62 @@ std::string DescribeGpuMemory() {
                        counts.freed.load(std::memory_order_relaxed));
 }
 
+constexpr std::size_t VulkanObjectTypes = static_cast<std::size_t>(VulkanObject::Count);
+
+constexpr std::array<const char*, VulkanObjectTypes> VulkanObjectNames{
+    "command pools",   "command buffers made", "descriptor pools", "descriptor sets made",
+    "query pools",     "events",               "fences",           "semaphores",
+    "direct memory allocations",               "buffers",          "buffer views",
+    "images",          "image views",          "framebuffers",     "render passes",
+    "samplers",        "pipelines",            "shader modules",
+};
+
+struct VulkanObjectCounts {
+    std::array<std::atomic<std::int64_t>, VulkanObjectTypes> live{};
+    std::atomic<std::uint64_t> submits{0};
+    std::atomic<std::uint64_t> most_ahead{0};
+    std::atomic<std::uint64_t> most_waiting{0};
+};
+
+void StoreMax(std::atomic<std::uint64_t>& most, std::uint64_t value) {
+    std::uint64_t current = most.load(std::memory_order_relaxed);
+    while (value > current &&
+           !most.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+    }
+}
+
+VulkanObjectCounts& VulkanObjects() {
+    static VulkanObjectCounts counts;
+    return counts;
+}
+
+/// Lists the live Vulkan objects by type with the change since the last call, then the queue
+/// submits since the last call and how far the GPU fell behind them.
+std::string DescribeVulkanObjects() {
+    VulkanObjectCounts& counts = VulkanObjects();
+    static std::array<std::int64_t, VulkanObjectTypes> last{};
+    static std::uint64_t last_submits = 0;
+    std::string text;
+    for (std::size_t type = 0; type < VulkanObjectTypes; ++type) {
+        const std::int64_t live = counts.live[type].load(std::memory_order_relaxed);
+        const std::int64_t change = live - last[type];
+        last[type] = live;
+        if (live == 0 && change == 0) {
+            continue;
+        }
+        text += fmt::format("{}{} {} ({}{})", text.empty() ? "" : ", ", VulkanObjectNames[type],
+                            live, change >= 0 ? "+" : "", change);
+    }
+    const std::uint64_t submits = counts.submits.load(std::memory_order_relaxed);
+    const std::uint64_t ahead = counts.most_ahead.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t waiting = counts.most_waiting.exchange(0, std::memory_order_relaxed);
+    text += fmt::format("; {} queue submits (+{}), the GPU was up to {} submits behind, up to {} "
+                        "command chunks waited to be submitted",
+                        submits, submits - last_submits, ahead, waiting);
+    last_submits = submits;
+    return text;
+}
+
 #ifdef __linux__
 /// Counts the lines of /proc/self/maps. Reads in small pieces, since the kernel holds the
 /// mapping lock while it writes each piece, which holds up threads that map memory.
@@ -157,6 +213,23 @@ void NoteGpuFree(std::uint32_t memory_type, std::uint64_t size) {
     counts.freed.fetch_add(1, std::memory_order_relaxed);
 }
 
+void NoteVulkanObjects(VulkanObject type, std::int64_t change) {
+    const auto index = static_cast<std::size_t>(type);
+    if (index < VulkanObjectTypes) {
+        VulkanObjects().live[index].fetch_add(change, std::memory_order_relaxed);
+    }
+}
+
+void NoteQueueSubmit(std::uint64_t ahead) {
+    VulkanObjectCounts& counts = VulkanObjects();
+    counts.submits.fetch_add(1, std::memory_order_relaxed);
+    StoreMax(counts.most_ahead, ahead);
+}
+
+void NoteWorkQueue(std::uint64_t waiting) {
+    StoreMax(VulkanObjects().most_waiting, waiting);
+}
+
 void LogMemoryUse(const char* when, bool count_mappings) {
 #ifdef __linux__
     long pages_total = 0;
@@ -186,6 +259,7 @@ void LogMemoryUse(const char* when, bool count_mappings) {
              static_cast<size_t>(heap.uordblks) >> 20, mappings,
              static_cast<size_t>(heap.hblkhd) >> 20, static_cast<size_t>(heap.fordblks) >> 20);
     LOG_INFO(Common, "[Preforged] GPU memory {}: {}", when, DescribeGpuMemory());
+    LOG_INFO(Common, "[Preforged] Vulkan objects {}: {}", when, DescribeVulkanObjects());
     if (count_mappings && count >= next_summary) {
         next_summary = count + 5000;
         LogMappingSummary(8);
