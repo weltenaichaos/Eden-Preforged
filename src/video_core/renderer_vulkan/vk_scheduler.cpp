@@ -13,6 +13,7 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -70,6 +71,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
 }
 
 void Scheduler::WaitWorker() {
+    const Common::Preforged::FrameStats::Timer timer{Common::Preforged::FrameStats::Item::WorkerWait};
     DispatchWork();
 
     // Ensure the queue is drained.

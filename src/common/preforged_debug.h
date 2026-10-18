@@ -28,7 +28,8 @@ struct DebugOptions {
     bool store_any_state = false;
     /// Logs memory use every 30 seconds in game.
     bool log_memory = true;
-    /// Logs every frame that took more than twice as long as the frame before it.
+    /// Logs every frame that took more than twice as long as the frame before it, with what ran
+    /// during it (see FrameStats).
     bool log_slow_frames = true;
     /// Logs which allocation sizes fill the malloc heap and which mappings the app holds, each
     /// time the heap grows past another 2 GiB. Walking the heap holds up the emulator a moment.

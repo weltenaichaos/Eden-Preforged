@@ -99,6 +99,8 @@ add_library(
     scratch_buffer.h
     preforged_debug.cpp
     preforged_debug.h
+    preforged_frame_stats.cpp
+    preforged_frame_stats.h
     preforged_heap_profile.cpp
     preforged_heap_profile.h
     settings.cpp

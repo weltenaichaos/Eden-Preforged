@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "common/preforged_debug.h"
+#include "common/preforged_frame_stats.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
@@ -314,13 +315,18 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
                 in_game = worker_thread != nullptr &&
-                          Common::Preforged::Options().log_shader_compiles] {
+                          Common::Preforged::Options().log_shader_compiles,
+                count_compile = worker_thread != nullptr] {
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
         try {
             const auto driver_start{std::chrono::steady_clock::now()};
             MakePipeline(render_pass);
             build_cache.reset();
+            if (count_compile) {
+                Common::Preforged::FrameStats::Add(Common::Preforged::FrameStats::Item::ShaderDriver,
+                                                   std::chrono::steady_clock::now() - driver_start);
+            }
             if (in_game) {
                 // Shader timing test: the driver's own compile of the finished pipeline
                 const std::chrono::duration<double, std::milli> driver_time{
@@ -614,6 +620,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            const Common::Preforged::FrameStats::Timer timer{
+                Common::Preforged::FrameStats::Item::PipelineWait};
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
         });

@@ -23,6 +23,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
+#include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 
 namespace Vulkan {
@@ -79,7 +80,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics] {
+    auto func{[this, shader_notify, pipeline_statistics, count_compile = thread_worker != nullptr] {
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -111,6 +112,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineIndex = 0,
         };
         try {
+            const Common::Preforged::FrameStats::Timer timer{
+                count_compile ? Common::Preforged::FrameStats::Item::ShaderDriver
+                              : Common::Preforged::FrameStats::Item::Count};
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
@@ -261,6 +265,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            const Common::Preforged::FrameStats::Timer timer{
+                Common::Preforged::FrameStats::Item::PipelineWait};
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
         });

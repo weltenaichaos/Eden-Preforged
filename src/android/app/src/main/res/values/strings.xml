@@ -681,7 +681,7 @@
     <string name="preforged_log_memory">Log memory use</string>
     <string name="preforged_log_memory_description">Logs memory use every 30 seconds in game.</string>
     <string name="preforged_log_slow_frames">Log slow frames</string>
-    <string name="preforged_log_slow_frames_description">Logs every frame that took over 50 ms and more than twice as long as the frame before it, so stutters show up in the log with their time.</string>
+    <string name="preforged_log_slow_frames_description">Logs every frame that took over 50 ms and more than twice as long as the frame before it, so stutters show up in the log with their time and what ran during them, such as CPU code and shader compiles, texture work and waits for the GPU. Takes effect when a game starts.</string>
     <string name="preforged_log_allocation_sizes">Log what fills memory</string>
     <string name="preforged_log_allocation_sizes_description">Each time the app\'s memory grows past another 2 GB, logs which allocation sizes hold the most of it. The game pauses for a moment while it is counted.</string>
     <string name="preforged_track_allocations">Track what holds memory</string>

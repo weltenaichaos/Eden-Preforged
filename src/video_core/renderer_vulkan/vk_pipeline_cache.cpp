@@ -34,6 +34,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/preforged_shaders.h"
 #include "common/preforged_debug.h"
+#include "common/preforged_frame_stats.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -1170,7 +1171,6 @@ void PipelineCache::PrecompilePreforgedPairs(
         }
     }};
     {
-        static constexpr std::array<const char*, 4> names{"off", "float", "int", "uint"};
         std::vector<std::string> parts;
         for (size_t index = 0; index < votes.size(); ++index) {
             const auto& counts{votes[index]};
@@ -1538,6 +1538,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     if (!build_cache) {
         build_cache = LoadPreforgedStoreEntry(key, preforged_code, store_match);
     }
+    if (build_in_parallel) {
+        Common::Preforged::FrameStats::Add(Common::Preforged::FrameStats::Item::ShaderTranslate,
+                                           std::chrono::steady_clock::now() - translate_start);
+    }
     if (build_in_parallel && Common::Preforged::Options().log_shader_compiles) {
         // Shader timing test: guest shader translation to SPIR-V, done on the GPU thread in game
         const std::chrono::duration<double, std::milli> translate_time{
@@ -1613,6 +1617,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
 std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+    const Common::Preforged::FrameStats::Timer timer{
+        Common::Preforged::FrameStats::Item::ShaderTranslate};
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
