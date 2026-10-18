@@ -488,7 +488,7 @@ void EmulationSession::RunEmulation() {
 // out of either ends the app without a message.
 void EmulationSession::LogMemoryUse() {
     const auto start = std::chrono::steady_clock::now();
-    Common::Preforged::LogMemoryUse("in game", false);
+    Common::Preforged::LogMemoryUse("in game", true);
     LOG_INFO(Frontend, "[Preforged] memory log took {:.1f} ms",
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                  .count());

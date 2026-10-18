@@ -3,12 +3,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #ifdef __linux__
+#include <fcntl.h>
 #include <malloc.h>
 #include <unistd.h>
 #endif
@@ -80,6 +82,80 @@ void LoadOptions() {
     }
 }
 
+namespace {
+
+constexpr std::size_t MaxMemoryTypes = 32;
+
+struct GpuMemoryCounts {
+    std::array<std::atomic<std::uint64_t>, MaxMemoryTypes> live_count{};
+    std::array<std::atomic<std::uint64_t>, MaxMemoryTypes> live_bytes{};
+    std::atomic<std::uint64_t> made{0};
+    std::atomic<std::uint64_t> freed{0};
+};
+
+GpuMemoryCounts& GpuMemory() {
+    static GpuMemoryCounts counts;
+    return counts;
+}
+
+std::string DescribeGpuMemory() {
+    const GpuMemoryCounts& counts = GpuMemory();
+    std::uint64_t count = 0;
+    std::uint64_t bytes = 0;
+    std::string types;
+    for (std::size_t type = 0; type < MaxMemoryTypes; ++type) {
+        const std::uint64_t type_count = counts.live_count[type].load(std::memory_order_relaxed);
+        if (type_count == 0) {
+            continue;
+        }
+        const std::uint64_t type_bytes = counts.live_bytes[type].load(std::memory_order_relaxed);
+        count += type_count;
+        bytes += type_bytes;
+        types += fmt::format("{}type {} {}x {} MiB", types.empty() ? "" : ", ", type, type_count,
+                             type_bytes >> 20);
+    }
+    return fmt::format("{} allocations, {} MiB ({}); {} made and {} freed since the app started",
+                       count, bytes >> 20, types.empty() ? "none" : types,
+                       counts.made.load(std::memory_order_relaxed),
+                       counts.freed.load(std::memory_order_relaxed));
+}
+
+#ifdef __linux__
+/// Counts the lines of /proc/self/maps. Reads in small pieces, since the kernel holds the
+/// mapping lock while it writes each piece, which holds up threads that map memory.
+std::size_t CountMappings() {
+    const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    std::size_t count = 0;
+    char buffer[16384];
+    for (ssize_t size; (size = read(fd, buffer, sizeof(buffer))) > 0;) {
+        count += static_cast<std::size_t>(std::count(buffer, buffer + size, '\n'));
+    }
+    close(fd);
+    return count;
+}
+#endif
+
+} // Anonymous namespace
+
+void NoteGpuAllocation(std::uint32_t memory_type, std::uint64_t size) {
+    GpuMemoryCounts& counts = GpuMemory();
+    const std::size_t type = std::min<std::size_t>(memory_type, MaxMemoryTypes - 1);
+    counts.live_count[type].fetch_add(1, std::memory_order_relaxed);
+    counts.live_bytes[type].fetch_add(size, std::memory_order_relaxed);
+    counts.made.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteGpuFree(std::uint32_t memory_type, std::uint64_t size) {
+    GpuMemoryCounts& counts = GpuMemory();
+    const std::size_t type = std::min<std::size_t>(memory_type, MaxMemoryTypes - 1);
+    counts.live_count[type].fetch_sub(1, std::memory_order_relaxed);
+    counts.live_bytes[type].fetch_sub(size, std::memory_order_relaxed);
+    counts.freed.fetch_add(1, std::memory_order_relaxed);
+}
+
 void LogMemoryUse(const char* when, bool count_mappings) {
 #ifdef __linux__
     long pages_total = 0;
@@ -90,18 +166,15 @@ void LogMemoryUse(const char* when, bool count_mappings) {
         }
         std::fclose(statm);
     }
-    // Counting mappings reads the whole mapping list, which holds up threads that change memory
-    // mappings for up to a few hundred milliseconds, so it is left out during play.
     std::string mappings{"not counted"};
+    static std::size_t last_count = 0;
+    static std::size_t next_summary = 20000;
+    std::size_t count = 0;
     if (count_mappings) {
-        size_t count = 0;
-        if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
-            for (int c; (c = std::fgetc(maps)) != EOF;) {
-                count += c == '\n' ? 1 : 0;
-            }
-            std::fclose(maps);
-        }
-        mappings = std::to_string(count);
+        count = CountMappings();
+        mappings = count >= last_count ? fmt::format("{} (+{})", count, count - last_count)
+                                       : fmt::format("{} (-{})", count, last_count - count);
+        last_count = count;
     }
     const struct mallinfo heap = mallinfo();
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -111,6 +184,11 @@ void LogMemoryUse(const char* when, bool count_mappings) {
              when, pages_resident * page_size >> 20, pages_total * page_size >> 20,
              static_cast<size_t>(heap.uordblks) >> 20, mappings,
              static_cast<size_t>(heap.hblkhd) >> 20, static_cast<size_t>(heap.fordblks) >> 20);
+    LOG_INFO(Common, "[Preforged] GPU memory {}: {}", when, DescribeGpuMemory());
+    if (count_mappings && count >= next_summary) {
+        next_summary = count + 5000;
+        LogMappingSummary(8);
+    }
     HeapProfile::Log(when, 6);
 
     // Each time the heap grows past another 2 GiB, log what fills it.

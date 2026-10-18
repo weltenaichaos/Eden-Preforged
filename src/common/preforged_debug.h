@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace Common::Preforged {
 
@@ -51,8 +52,15 @@ void LoadOptions();
 /// Android ends the app once it has about 65,000. Shows the top `top` names.
 void LogMappingSummary(size_t top);
 
-/// Logs resident, virtual and malloc memory, tagged with `when`, and the number of mappings
-/// when `count_mappings` is set, which briefly holds up other threads.
+/// Counts the GPU memory allocations (VkDeviceMemory) the memory allocator makes and frees, so
+/// the memory log shows how many the emulator holds. Some drivers map each one on its own, and
+/// Android ends the app once it holds about 65,000 mappings.
+void NoteGpuAllocation(std::uint32_t memory_type, std::uint64_t size);
+void NoteGpuFree(std::uint32_t memory_type, std::uint64_t size);
+
+/// Logs resident, virtual and malloc memory and the GPU allocations, tagged with `when`, and the
+/// number of mappings when `count_mappings` is set. Past 20,000 mappings it also logs which
+/// names hold them, again after each 5,000 more.
 void LogMemoryUse(const char* when, bool count_mappings = true);
 
 /// Logs the allocation sizes that hold the most malloc memory, tagged with `when`. Walks the

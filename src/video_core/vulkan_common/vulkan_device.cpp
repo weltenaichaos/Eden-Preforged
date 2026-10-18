@@ -22,6 +22,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/preforged_debug.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -39,6 +40,24 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+
+void VKAPI_PTR OnGpuAllocate(VmaAllocator, uint32_t memory_type, VkDeviceMemory, VkDeviceSize size,
+                             void*) {
+    Common::Preforged::NoteGpuAllocation(memory_type, size);
+}
+
+void VKAPI_PTR OnGpuFree(VmaAllocator, uint32_t memory_type, VkDeviceMemory, VkDeviceSize size,
+                         void*) {
+    Common::Preforged::NoteGpuFree(memory_type, size);
+}
+
+// Counts the memory allocator's GPU allocations for the memory log.
+const VmaDeviceMemoryCallbacks GPU_MEMORY_CALLBACKS{
+    .pfnAllocate = OnGpuAllocate,
+    .pfnFree = OnGpuFree,
+    .pUserData = nullptr,
+};
+
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -756,7 +775,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                                            ? (64u * 1024u * 1024u)
                                            : (256u * 1024u * 1024u),
             .pAllocationCallbacks = vk::HostAllocator(),
-            .pDeviceMemoryCallbacks = nullptr,
+            .pDeviceMemoryCallbacks = &GPU_MEMORY_CALLBACKS,
             .pHeapSizeLimit = nullptr,
             .pVulkanFunctions = &functions,
             .instance = instance,
@@ -765,6 +784,22 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     };
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
+    {
+        // Names the memory types the GPU memory log counts by.
+        const auto memory = physical.GetMemoryProperties().memoryProperties;
+        std::string types;
+        for (u32 type = 0; type < memory.memoryTypeCount; ++type) {
+            const auto flags = memory.memoryTypes[type].propertyFlags;
+            types += fmt::format(
+                "{}{}:{}{}{}{}", type == 0 ? "" : ", ", type,
+                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " device" : "",
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " visible" : "",
+                (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? " coherent" : "",
+                (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " cached" : "");
+        }
+        LOG_INFO(Render_Vulkan, "[Preforged] GPU memory types: {}; allocator block size {} MiB",
+                 types, allocator_info.preferredLargeHeapBlockSize >> 20);
+    }
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
