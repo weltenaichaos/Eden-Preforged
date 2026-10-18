@@ -352,7 +352,14 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
 
     // Complete initialization.
     m_system.GPU().Start();
-    m_system.GetCpuManager().OnGpuReady();
+    // The CPU cores start running the game at OnGpuReady. Called after loading by default, as on
+    // desktop: otherwise the game boots while the shader file scan reads its files, and the
+    // decryption layer under them can't be read from two threads at once.
+    m_cores_wait_for_loading = Common::Preforged::Options().start_after_loading;
+    m_loaded_time = std::chrono::steady_clock::now();
+    if (!m_cores_wait_for_loading) {
+        m_system.GetCpuManager().OnGpuReady();
+    }
     m_system.RegisterExitCallback([&] { HaltEmulation(); });
 
     m_system.RegisterApplicationChangedCallback(
@@ -428,7 +435,8 @@ void EmulationSession::RunEmulation() {
     // load. Each CPU core waits for it before it runs.
     Core::Preforged::CpuCode::Start(m_system);
 
-    // Runs before the game starts: the game's file layers are not safe to read from two threads.
+    // Runs before the game starts (see InitializeEmulation): the game's file layers are not safe
+    // to read from two threads.
     // Runs before the disk cache loads, which compiles the shader pairs the scan finds.
     LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
     RunShaderFileScan(m_system, m_system.GetApplicationProcessProgramID(), std::stop_token{},
@@ -450,6 +458,15 @@ void EmulationSession::RunEmulation() {
     });
     LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
 
+    if (m_cores_wait_for_loading) {
+        m_cores_wait_for_loading = false;
+        LOG_INFO(Frontend, "[Preforged] the game starts after loading, which took {:.1f} s",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - m_loaded_time)
+                     .count());
+        m_system.GetCpuManager().OnGpuReady();
+    } else {
+        LOG_INFO(Frontend, "[Preforged] the game started while loading");
+    }
     void(m_system.Run());
 
     if (m_system.DebuggerEnabled()) {

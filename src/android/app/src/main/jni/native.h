@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <optional>
 
 #include <android/native_window_jni.h>
@@ -89,6 +90,9 @@ private:
     std::unique_ptr<FileSys::ManualContentProvider> m_manual_provider;
     int m_applet_id{1};
     std::optional<u64> m_pending_shader_cache_title;
+    // The CPU cores wait for loading to finish before they run the game (see InitializeEmulation).
+    bool m_cores_wait_for_loading{false};
+    std::chrono::steady_clock::time_point m_loaded_time{};
 
     // GPU driver parameters
     std::shared_ptr<Common::DynamicLibrary> m_vulkan_library;

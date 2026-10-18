@@ -38,6 +38,9 @@ struct DebugOptions {
     /// Records the CPU code the game compiles to a list, and compiles that list while the game
     /// loads the next time (Core::Preforged::CpuCode).
     bool precompile_cpu_code = true;
+    /// Starts running the game only after the shader file scan, the shader cache and the CPU
+    /// code have loaded, instead of while they load.
+    bool start_after_loading = true;
     /// Records a sample of the heap allocations with the code that made them, and logs which
     /// code holds the most memory with every memory log. Costs a little speed.
     bool track_allocations = true;
