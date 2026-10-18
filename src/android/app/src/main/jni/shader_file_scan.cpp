@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -67,6 +68,10 @@ constexpr u64 MAX_DICTIONARY_SEARCH_BYTES = 256ULL << 20;
 constexpr size_t MAX_WHOLE_PACKAGE = 384ULL << 20;
 constexpr u32 FILTER_BITS = 22;
 constexpr auto TIME_LIMIT = std::chrono::minutes{4};
+// Raised whenever the search learns to read more of the game files, so a game an older version
+// searched is searched once more. 10: Oodle blocks in Unreal packages. 11: zstd files packed
+// with a dictionary, the Unreal shader link log.
+constexpr u32 SEARCH_VERSION = 11;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
@@ -751,13 +756,30 @@ public:
                  TopStarts(formats.large_starts, 8));
     }
 
-    // Says in one line how much of what the game drew the search found, and where to look when
-    // it found little.
-    void ReportResult() const {
+    /// How many of the shaders the game drew the search found.
+    size_t FoundCount() const {
         size_t found = 0;
         for (const auto& result : results) {
             found += result.kind == MatchKind::Exact || result.kind == MatchKind::CodeOnly ? 1 : 0;
         }
+        return found;
+    }
+
+    /// One line on what the search found, kept in the done marker for later starts.
+    /// `cut_short` says whether the search stopped before it read all files.
+    std::string ResultSummary(bool cut_short) const {
+        return fmt::format("found {} of the {} shaders the game had drawn, took {} shaders from "
+                           "the files{}",
+                           FoundCount(), shaders.size(), extracted.size(),
+                           !cut_short              ? ""
+                           : stop.stop_requested() ? ", stopped early because the game was closed"
+                                                   : ", stopped early at the time limit");
+    }
+
+    // Says in one line how much of what the game drew the search found, and where to look when
+    // it found little.
+    void ReportResult() const {
+        const size_t found = FoundCount();
         const size_t percent = shaders.empty() ? 0 : found * 100 / shaders.size();
         LOG_INFO(Frontend,
                  "[ShaderScan] result: {} of the {} shaders the game drew found in its files "
@@ -1770,6 +1792,68 @@ void ListGameFiles(const FileSys::VirtualDir& dir, const std::string& path, std:
     }
 }
 
+/// What the last search of a game left in its shader folder.
+struct SearchMarker {
+    std::string files_id; ///< Id of the game file list it searched
+    u32 version = 0;      ///< SEARCH_VERSION of the search
+    std::string result;   ///< What it found, from ResultSummary
+};
+
+constexpr std::string_view MARKER_NAME = "shader_scan_done";
+/// Before version 11 the marker held only the id of the game file list.
+constexpr std::string_view OLD_MARKER_NAME = "shader_scan_done_v10";
+
+std::optional<SearchMarker> ReadSearchMarker(const std::filesystem::path& shader_dir) {
+    std::error_code error;
+    const auto path = shader_dir / MARKER_NAME;
+    if (std::filesystem::exists(path, error)) {
+        SearchMarker marker;
+        const std::string text =
+            Common::FS::ReadStringFromFile(path, Common::FS::FileType::TextFile);
+        size_t start = 0;
+        while (start < text.size()) {
+            size_t end = text.find('\n', start);
+            if (end == std::string::npos) {
+                end = text.size();
+            }
+            const std::string_view line{text.data() + start, end - start};
+            start = end + 1;
+            const size_t space = line.find(' ');
+            if (space == std::string_view::npos) {
+                continue;
+            }
+            const std::string_view key = line.substr(0, space);
+            const std::string_view value = line.substr(space + 1);
+            if (key == "files") {
+                marker.files_id = value;
+            } else if (key == "version") {
+                std::from_chars(value.data(), value.data() + value.size(), marker.version);
+            } else if (key == "result") {
+                marker.result = value;
+            }
+        }
+        return marker;
+    }
+    const auto old_path = shader_dir / OLD_MARKER_NAME;
+    if (std::filesystem::exists(old_path, error)) {
+        return SearchMarker{
+            .files_id = Common::FS::ReadStringFromFile(old_path, Common::FS::FileType::TextFile),
+            .version = 10,
+            .result = "not kept by that version",
+        };
+    }
+    return std::nullopt;
+}
+
+void WriteSearchMarker(const std::filesystem::path& shader_dir, const SearchMarker& marker) {
+    void(Common::FS::WriteStringToFile(
+        shader_dir / MARKER_NAME, Common::FS::FileType::TextFile,
+        fmt::format("files {}\nversion {}\nresult {}\n", marker.files_id, marker.version,
+                    marker.result)));
+    std::error_code error;
+    std::filesystem::remove(shader_dir / OLD_MARKER_NAME, error);
+}
+
 } // namespace
 
 void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token stop,
@@ -1777,9 +1861,9 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    // v10: runs once more, since it now unpacks Oodle blocks too. The marker holds an id of the
-    // game files the search read, so it runs again when an update or a mod changes them.
-    const auto done_marker = shader_dir / "shader_scan_done_v10";
+    // The marker holds an id of the game files the search read and the search's version, so it
+    // runs again when an update or a mod changes the files or when the search improves.
+    const auto done_marker = shader_dir / MARKER_NAME;
     std::error_code error;
     const auto& options = Common::Preforged::Options();
     if (!options.scan_game_files) {
@@ -1805,19 +1889,30 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - start_time)
                  .count());
-    if (std::filesystem::exists(done_marker, error) && !options.rescan_game_files) {
-        const std::string searched_id =
-            Common::FS::ReadStringFromFile(done_marker, Common::FS::FileType::TextFile);
-        if (searched_id == files_id) {
+    if (const auto last = ReadSearchMarker(shader_dir)) {
+        if (options.rescan_game_files) {
             LOG_INFO(Frontend,
-                     "[ShaderScan] already ran for these game files, delete {} to run it again",
-                     Common::FS::PathToUTF8String(done_marker));
+                     "[ShaderScan] 'Search game files on every start' is on, so it runs again "
+                     "(last search, version {}: {})",
+                     last->version, last->result);
+        } else if (last->files_id != files_id) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] the game files changed since the last search (id {}), for "
+                     "example by an update or a mod, so it runs again",
+                     last->files_id.empty() ? std::string{"none"} : last->files_id);
+        } else if (last->version < SEARCH_VERSION) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] the search improved since it last ran for this game (version "
+                     "{} then, {} now), so it runs once more; last result: {}",
+                     last->version, SEARCH_VERSION, last->result);
+        } else {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] already ran for these game files with this search version "
+                     "({}); last result: {}. Turn on 'Search game files on every start' or "
+                     "delete {} to run it again",
+                     last->version, last->result, Common::FS::PathToUTF8String(done_marker));
             return;
         }
-        LOG_INFO(Frontend,
-                 "[ShaderScan] the game files changed since the last search (id {}), for "
-                 "example by an update or a mod, so it runs again",
-                 searched_id.empty() ? std::string{"none"} : searched_id);
     }
 
     // Read from a copy, because a damaged cache file is deleted while it is read.
@@ -1847,7 +1942,12 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     LOG_INFO(Frontend, "[ShaderScan] searching game files for {} cached shaders", shaders.size());
 
     // Mark the scan as done up front, so a crash during it never blocks the game twice.
-    void(Common::FS::WriteStringToFile(done_marker, Common::FS::FileType::TextFile, files_id));
+    SearchMarker marker{
+        .files_id = files_id,
+        .version = SEARCH_VERSION,
+        .result = "did not finish, Eden was closed or crashed during the search",
+    };
+    WriteSearchMarker(shader_dir, marker);
 
     Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
     scanner.SetProgress(&progress, std::max<size_t>(Scanner::CountFiles(root, "") + 1, 2));
@@ -1860,6 +1960,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         scanner.ScanDir(root, "", false);
         scanner.Report("all files");
     }
+    const bool cut_short = scanner.Stopped();
     scanner.ReportFormats();
     // When the code is in a package the first pass didn't read, the other packages were
     // searched before it was known.
@@ -1885,6 +1986,8 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     }
     scanner.SavePrograms(shader_dir / "preforged_programs.bin");
     scanner.ReportResult();
+    marker.result = scanner.ResultSummary(cut_short);
+    WriteSearchMarker(shader_dir, marker);
     if (progress) {
         progress(1, 1);
     }
