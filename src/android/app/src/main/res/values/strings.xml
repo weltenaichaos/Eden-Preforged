@@ -688,6 +688,8 @@
     <string name="preforged_track_allocations_description">Follows a sample of the app\'s memory allocations and logs which code holds the most memory with every memory log. Costs a little speed. Takes effect when a game starts.</string>
     <string name="preforged_track_driver_memory">Track the GPU driver\'s memory</string>
     <string name="preforged_track_driver_memory_description">Hands the GPU driver\'s own memory requests to the tracker above, so the log also shows what the driver holds. Takes effect after restarting the app.</string>
+    <string name="preforged_precompile_cpu_code">Compile CPU code from earlier sessions</string>
+    <string name="preforged_precompile_cpu_code_description">Saves a list of the CPU code the game compiles while you play, and compiles that code while the game loads the next time, so it doesn\'t stutter compiling it again. The first session with this on records the list. Only for games that can\'t run natively. Takes effect when a game starts.</string>
     <string name="preforged_driver_pipeline_cache">Use the driver pipeline cache</string>
     <string name="preforged_driver_pipeline_cache_description">Loads the GPU driver\'s saved pipelines at game start. Off leaves the saved file alone but loads nothing from it, so every pipeline is built by the driver again.</string>
     <string name="flush_by_line">Flush debug logs by line</string>
@@ -1282,6 +1284,7 @@
     <string name="building_shaders">Building shaders</string>
     <string name="scanning_game_files">Searching game files for shaders (first start only)</string>
     <string name="precompiling_game_shaders">Compiling shaders from game files (first start only)</string>
+    <string name="precompiling_cpu_code">Compiling CPU code from earlier sessions</string>
 
     <!-- App options -->
     <string name="change_app_theme">Change app theme</string>

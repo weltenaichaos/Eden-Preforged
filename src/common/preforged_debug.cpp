@@ -54,6 +54,7 @@ void LoadOptions() {
     options.log_slow_frames = Settings::values.preforged_log_slow_frames.GetValue();
     options.log_allocation_sizes = Settings::values.preforged_log_allocation_sizes.GetValue();
     options.track_allocations = Settings::values.preforged_track_allocations.GetValue();
+    options.precompile_cpu_code = Settings::values.preforged_precompile_cpu_code.GetValue();
     FrameStats::SetEnabled(options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
@@ -67,10 +68,11 @@ void LoadOptions() {
              options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] driver pipeline cache {}, log allocation sizes {}, track allocations {}, "
-             "track driver memory {}",
+             "track driver memory {}, pre-compile CPU code {}",
              Settings::values.use_vulkan_driver_pipeline_cache.GetValue(),
              options.log_allocation_sizes, options.track_allocations,
-             Settings::values.preforged_track_driver_memory.GetValue());
+             Settings::values.preforged_track_driver_memory.GetValue(),
+             options.precompile_cpu_code);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {

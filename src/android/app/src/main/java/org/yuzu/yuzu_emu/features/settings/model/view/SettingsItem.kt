@@ -346,6 +346,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_PRECOMPILE_CPU_CODE,
+                    titleId = R.string.preforged_precompile_cpu_code,
+                    descriptionId = R.string.preforged_precompile_cpu_code_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description

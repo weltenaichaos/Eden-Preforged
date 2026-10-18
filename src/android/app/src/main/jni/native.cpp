@@ -53,6 +53,7 @@ extern "C" {
 #include "common/string_util.h"
 #include "common/thread.h"
 #include "frontend_common/play_time_manager.h"
+#include "core/arm/dynarmic/preforged_cpu_code.h"
 #include "core/constants.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
@@ -386,6 +387,7 @@ void EmulationSession::ShutdownEmulation() {
 
     // Shutdown the main emulated process
     if (m_load_result == Core::SystemResultStatus::Success) {
+        Core::Preforged::CpuCode::Stop();
         m_system.DetachDebugger();
         m_system.ShutdownMainProcess();
         m_load_result = Core::SystemResultStatus::ErrorNotInitialized;
@@ -422,6 +424,10 @@ void EmulationSession::RunEmulation() {
         m_is_running = true;
     }
 
+    // Compiles the CPU code earlier sessions recorded, on threads of its own while the shaders
+    // load. Each CPU core waits for it before it runs.
+    Core::Preforged::CpuCode::Start(m_system);
+
     // Runs before the game starts: the game's file layers are not safe to read from two threads.
     // Runs before the disk cache loads, which compiles the shader pairs the scan finds.
     LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
@@ -430,18 +436,19 @@ void EmulationSession::RunEmulation() {
                           LoadDiskCacheProgress(VideoCore::LoadCallbackStage::ScanGameFiles,
                                                 static_cast<int>(done), static_cast<int>(total));
                       });
-    // The loading screen stays up while the disk cache loads right after.
-    if (!Settings::values.use_disk_shader_cache.GetValue()) {
-        LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
-    }
+    // The loading screen stays up while the disk cache and the CPU code load right after.
 
     // Load the disk shader cache.
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
         m_system.Renderer().ReadRasterizer()->LoadDiskResources(
             m_system.GetApplicationProcessProgramID(), std::stop_token{}, LoadDiskCacheProgress);
-        LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
     }
+    Core::Preforged::CpuCode::Wait([](std::size_t done, std::size_t total) {
+        LoadDiskCacheProgress(VideoCore::LoadCallbackStage::PrecompileCpuCode,
+                              static_cast<int>(done), static_cast<int>(total));
+    });
+    LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
 
     void(m_system.Run());
 

@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <memory>
+#include <span>
 #include "common/container/unordered_map.h"
 
 #include <dynarmic/interface/A64/a64.h>
@@ -51,6 +52,7 @@ public:
     bool MemoryWriteExclusive64(u64 vaddr, std::uint64_t value, std::uint64_t expected) override;
     bool MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vector value, Dynarmic::A64::Vector expected) override;
     void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) override;
+    void BlockCompiled(u64 location) override;
     void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override;
     void CallSVC(u32 svc) override;
     void AddTicks(u64 ticks) override;
@@ -96,6 +98,13 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
 
+    /// Claims the JIT for compiling ahead from another thread (Preforged::CpuCode). Fails once
+    /// the core has run. Until EndCompileAhead, the core waits before it runs.
+    bool BeginCompileAhead();
+    Dynarmic::A64::Jit::CompileAheadResult CompileAhead(std::span<const u64> locations,
+                                                       std::size_t keep_free);
+    void EndCompileAhead();
+
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
     void RewindBreakpointInstruction() override;
@@ -112,6 +121,11 @@ private:
     std::size_t m_core_index{};
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
+
+    // Compiling ahead: 0 before the core first runs, 1 while compiling ahead, 2 once it ran.
+    void WaitForCompileAhead();
+    std::atomic<u8> m_compile_state{0};
+    std::atomic<u32> m_cache_clears{};
 
     // SVC callback
     u32 m_svc{};
