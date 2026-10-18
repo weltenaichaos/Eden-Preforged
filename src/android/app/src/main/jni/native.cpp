@@ -192,6 +192,15 @@ void EmulationSession::InitializeGpuDriver(const std::string& hook_lib_dir,
         handle = adrenotools_open_libvulkan(
             RTLD_NOW, featureFlags | ADRENOTOOLS_DRIVER_CUSTOM, nullptr, hook_lib_dir.c_str(),
             custom_driver_dir.c_str(), custom_driver_name.c_str(), file_redirect_dir_, nullptr);
+        // Without this line a driver that fails to load looks like the system driver was chosen.
+        const char* const reason = handle ? nullptr : dlerror();
+        LOG_INFO(Frontend, "[Preforged] GPU driver: custom driver {} in {}: {}{}",
+                 custom_driver_name, custom_driver_dir,
+                 handle ? "loaded" : "failed to load, using the system driver",
+                 reason ? fmt::format(" ({})", reason) : std::string{});
+    } else {
+        LOG_INFO(Frontend, "[Preforged] GPU driver: no custom driver installed, using the "
+                           "system driver");
     }
 
     // Try to load the system driver.

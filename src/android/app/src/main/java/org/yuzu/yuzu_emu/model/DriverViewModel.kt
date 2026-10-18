@@ -228,7 +228,27 @@ class DriverViewModel : ViewModel() {
 
         val selectedDriverFile = File(StringSetting.DRIVER_PATH.getString())
         val selectedDriverMetadata = GpuDriverHelper.customDriverSettingData
-        if (GpuDriverHelper.installedCustomDriverData == selectedDriverMetadata) {
+        val installedDriverMetadata = GpuDriverHelper.installedCustomDriverData
+        // Says which driver the game gets and why, since a missing driver file silently falls
+        // back to the system driver.
+        val selectedPath = selectedDriverFile.path
+        val setting = if (selectedPath.isEmpty()) {
+            "system driver"
+        } else {
+            val found = if (selectedDriverFile.exists()) "found" else "missing"
+            "'$selectedPath' (file $found, name '${selectedDriverMetadata.name}')"
+        }
+        val decision = when {
+            installedDriverMetadata == selectedDriverMetadata -> "keeping it"
+            selectedDriverMetadata.name == null -> "using the system driver"
+            selectedDriverFile.exists() -> "installing the chosen driver"
+            else -> "the chosen driver file is gone, using the system driver"
+        }
+        Log.info(
+            "[DriverViewModel] GPU driver for this game: setting $setting, installed now " +
+                "'${installedDriverMetadata.name}'; $decision"
+        )
+        if (installedDriverMetadata == selectedDriverMetadata) {
             setDriverReady()
             return
         }

@@ -64,13 +64,17 @@ constexpr size_t MAX_DECOMPRESSED = 256ULL << 20;
 /// and up to this much in all.
 constexpr size_t MAX_DICTIONARY_ARCHIVE = 16ULL << 20;
 constexpr u64 MAX_DICTIONARY_SEARCH_BYTES = 256ULL << 20;
+/// How long the walk over all files may look for dictionaries when none is in a file named like
+/// one. Tears of the Kingdom's 304,207 files took 187 s, most of the search's time.
+constexpr auto DICTIONARY_SEARCH_TIME = std::chrono::seconds{45};
 /// Unreal packages up to this size are read whole, so their compressed parts can be unpacked.
 constexpr size_t MAX_WHOLE_PACKAGE = 384ULL << 20;
 constexpr u32 FILTER_BITS = 22;
 constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // Raised whenever the search learns to read more of the game files, so a game an older version
 // searched is searched once more. 10: Oodle blocks in Unreal packages. 11: zstd files packed
-// with a dictionary, the Unreal shader link log.
+// with a dictionary (dictionaries looked for in files named like them first), the Unreal shader
+// link log.
 constexpr u32 SEARCH_VERSION = 11;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
@@ -546,59 +550,125 @@ public:
 
     // Finds the zstd dictionaries in the game files before the search, so the files packed with
     // them can be unpacked wherever they come. A dictionary is a file of its own, or a file in an
-    // archive packed with zstd without one.
+    // archive packed with zstd without one. Files named like dictionaries are read first; only
+    // when none holds one are all files walked, for a limited time.
     void FindZstdDictionaries(const FileSys::VirtualDir& root) {
         if (!Common::Preforged::Options().zstd_dictionaries) {
             return;
         }
-        const auto start = std::chrono::steady_clock::now();
+        using Clock = std::chrono::steady_clock;
+        const auto start = Clock::now();
+        const auto ms = [](Clock::duration time) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(time).count();
+        };
+        const auto for_each_file =
+            [&](const std::function<bool(const FileSys::VirtualFile&, const std::string&)>& visit) {
+                std::function<bool(const FileSys::VirtualDir&, const std::string&)> walk =
+                    [&](const FileSys::VirtualDir& dir, const std::string& path) {
+                        if (!dir || Stopped()) {
+                            return false;
+                        }
+                        for (const auto& file : dir->GetFiles()) {
+                            if (!visit(file, path + "/" + file->GetName())) {
+                                return false;
+                            }
+                        }
+                        for (const auto& subdir : dir->GetSubdirectories()) {
+                            if (!walk(subdir, path + "/" + subdir->GetName())) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+                walk(root, "");
+            };
+        const auto found_list = [&] {
+            std::string found;
+            for (const auto& [id, bytes] : zstd_dictionaries.Sizes()) {
+                found +=
+                    fmt::format("{}{:08x} ({} KiB)", found.empty() ? "" : ", ", id, bytes >> 10);
+            }
+            return found.empty() ? std::string{"none"} : found;
+        };
+
+        // Files named like a dictionary ("dic" anywhere in the name, as in .zsdic or ZsDic).
+        size_t by_name = 0;
+        u64 by_name_read = 0;
+        std::string by_name_examples;
+        for_each_file([&](const FileSys::VirtualFile& file, const std::string& name) {
+            const size_t size = file->GetSize();
+            if (size >= 8 && size <= MAX_DICTIONARY_ARCHIVE &&
+                by_name_read + size <= MAX_DICTIONARY_SEARCH_BYTES &&
+                Lower(file->GetName()).find("dic") != std::string::npos) {
+                ++by_name;
+                by_name_read += size;
+                if (by_name <= 4) {
+                    by_name_examples += fmt::format(
+                        "{}{} ({} KiB)", by_name_examples.empty() ? "" : ", ", name, size >> 10);
+                }
+                FindDictionariesIn(file->ReadAllBytes(), name, 0);
+            }
+            return true;
+        });
+        const auto by_name_time = Clock::now() - start;
+        if (!zstd_dictionaries.Sizes().empty()) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] zstd dictionaries: {} found: {}, in {} files named like "
+                     "dictionaries ({}) read in {} ms",
+                     zstd_dictionaries.Sizes().size(), found_list(), by_name, by_name_examples,
+                     ms(by_name_time));
+            return;
+        }
+
+        // None found by name: look at the start of every file for dictionaries and for the ids
+        // of the dictionaries zstd frames name, then unpack the small zstd files that name none,
+        // smallest first, until every named dictionary is found.
+        const auto walk_deadline = Clock::now() + DICTIONARY_SEARCH_TIME;
         std::map<u32, size_t> named;
         std::vector<std::tuple<size_t, std::string, FileSys::VirtualFile>> containers;
         size_t looked_at = 0;
-        const std::function<void(const FileSys::VirtualDir&, const std::string&)> walk =
-            [&](const FileSys::VirtualDir& dir, const std::string& path) {
-                if (!dir || Stopped()) {
-                    return;
+        bool walk_done = true;
+        for_each_file([&](const FileSys::VirtualFile& file, const std::string& name) {
+            if (Clock::now() > walk_deadline) {
+                walk_done = false;
+                return false;
+            }
+            const size_t size = file->GetSize();
+            if (size < 8 || size > MAX_WHOLE_FILE) {
+                return true;
+            }
+            ++looked_at;
+            // The longest zstd frame header.
+            const std::vector<u8> head = file->ReadBytes(std::min<size_t>(size, 18), 0);
+            if (Common::Compression::IsZstdDictionary(head)) {
+                AddDictionary(file->ReadAllBytes(), name);
+            } else if (IsZstd(head)) {
+                const u32 id = Common::Compression::ZstdFrameDictionaryId(head);
+                if (id != 0) {
+                    ++named[id];
+                } else if (size <= MAX_DICTIONARY_ARCHIVE) {
+                    containers.emplace_back(size, name, file);
                 }
-                for (const auto& file : dir->GetFiles()) {
-                    const size_t size = file->GetSize();
-                    if (size < 8 || size > MAX_WHOLE_FILE) {
-                        continue;
-                    }
-                    ++looked_at;
-                    // The longest zstd frame header.
-                    const std::vector<u8> head = file->ReadBytes(std::min<size_t>(size, 18), 0);
-                    const std::string name = path + "/" + file->GetName();
-                    if (Common::Compression::IsZstdDictionary(head)) {
-                        AddDictionary(file->ReadAllBytes(), name);
-                    } else if (IsZstd(head)) {
-                        const u32 id = Common::Compression::ZstdFrameDictionaryId(head);
-                        if (id != 0) {
-                            ++named[id];
-                        } else if (size <= MAX_DICTIONARY_ARCHIVE) {
-                            containers.emplace_back(size, name, file);
-                        }
-                    }
-                }
-                for (const auto& subdir : dir->GetSubdirectories()) {
-                    walk(subdir, path + "/" + subdir->GetName());
-                }
-            };
-        walk(root, "");
+            }
+            return true;
+        });
+        const auto walk_time = Clock::now() - start - by_name_time;
         const auto all_found = [&] {
-            return std::ranges::all_of(named, [&](const auto& entry) {
-                return zstd_dictionaries.Has(entry.first);
-            });
+            return std::ranges::all_of(
+                named, [&](const auto& entry) { return zstd_dictionaries.Has(entry.first); });
         };
-        // Unpack the small zstd files that name no dictionary, smallest first, until every
-        // dictionary the other files name is found.
         std::sort(containers.begin(), containers.end(),
                   [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
         size_t unpacked = 0;
         u64 read = 0;
+        bool unpack_done = true;
         for (const auto& [size, name, file] : containers) {
-            if (named.empty() || all_found() || read + size > MAX_DICTIONARY_SEARCH_BYTES ||
+            if (named.empty() || all_found()) {
+                break;
+            }
+            if (read + size > MAX_DICTIONARY_SEARCH_BYTES || Clock::now() > walk_deadline ||
                 Stopped()) {
+                unpack_done = false;
                 break;
             }
             read += size;
@@ -608,24 +678,22 @@ public:
             const std::vector<u8> out = zstd_dictionaries.Decompress(data, MAX_DECOMPRESSED, used);
             FindDictionariesIn(out, name, 0);
         }
-        std::string found;
-        for (const auto& [id, bytes] : zstd_dictionaries.Sizes()) {
-            found += fmt::format("{}{:08x} ({} KiB)", found.empty() ? "" : ", ", id, bytes >> 10);
-        }
         std::string wanted;
         for (const auto& [id, frames] : named) {
             wanted += fmt::format("{}{:08x} x{}{}", wanted.empty() ? "" : ", ", id, frames,
                                   zstd_dictionaries.Has(id) ? "" : " (not found)");
         }
         LOG_INFO(Frontend,
-                 "[ShaderScan] zstd dictionaries: {} found: {}; files name {}; looked at the "
-                 "start of {} files and unpacked {} small zstd files that name none ({} KiB) in "
-                 "{} ms",
-                 zstd_dictionaries.Sizes().size(), found.empty() ? "none" : found,
-                 wanted.empty() ? "none" : wanted, looked_at, unpacked, read >> 10,
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - start)
-                     .count());
+                 "[ShaderScan] zstd dictionaries: {} found: {}; {} files named like "
+                 "dictionaries ({}) read in {} ms; files name {}; looked at the start of {} "
+                 "files in {} ms{}; unpacked {} of {} small zstd files that name none ({} KiB) "
+                 "in {} ms{}",
+                 zstd_dictionaries.Sizes().size(), found_list(), by_name,
+                 by_name_examples.empty() ? std::string{"none"} : by_name_examples,
+                 ms(by_name_time), wanted.empty() ? std::string{"none"} : wanted, looked_at,
+                 ms(walk_time), walk_done ? "" : " (stopped at the time limit)", unpacked,
+                 containers.size(), read >> 10, ms(Clock::now() - start - by_name_time - walk_time),
+                 unpack_done ? "" : " (stopped at the time or size limit)");
     }
 
     void FindDictionariesIn(std::span<const u8> data, const std::string& name, int depth) {
@@ -1431,9 +1499,15 @@ private:
             ScanSarc(data, name, depth)) {
             return;
         }
-        if (Common::Preforged::Options().zstd_dictionaries &&
-            Common::Compression::IsZstdDictionary(data)) {
-            AddDictionary(data, name);
+        if (Common::Preforged::Options().zstd_dictionaries) {
+            if (Common::Compression::IsZstdDictionary(data)) {
+                AddDictionary(data, name);
+            }
+            // Packed bytes hold no shader code as it is, so searching them only costs time.
+            // Decompress counted the file as naming a missing dictionary.
+            if (IsZstd(data) && Common::Compression::ZstdFrameDictionaryId(data) != 0) {
+                return;
+            }
         }
         auto& stored = formats.stored_starts[Start32(data)];
         ++stored.first;
