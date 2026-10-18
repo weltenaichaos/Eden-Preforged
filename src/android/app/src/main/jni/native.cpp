@@ -100,6 +100,10 @@ extern "C" {
 #include "jni/shader_file_scan.h"
 #include "common/fs/fs_paths.h"
 #include "common/preforged_debug.h"
+#include "core/arm/debug.h"
+#include "core/hle/kernel/k_light_lock.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/frame_gen/lossless_dll.h"
 #include "video_core/renderer_base.h"
@@ -417,6 +421,8 @@ void EmulationSession::UnPauseEmulation() {
     std::scoped_lock lock(m_mutex);
     m_system.Run();
     m_is_paused = false;
+    // Time spent paused is not a freeze.
+    Common::Preforged::NoteFrame();
 }
 
 void EmulationSession::HaltEmulation() {
@@ -474,11 +480,16 @@ void EmulationSession::RunEmulation() {
     }
 
     auto last_memory_log = std::chrono::steady_clock::now();
+    Common::Preforged::ResetFrameClock();
+    m_freeze_reports = 0;
     while (true) {
         if (Common::Preforged::Options().log_memory &&
             std::chrono::steady_clock::now() - last_memory_log > std::chrono::seconds{30}) {
             last_memory_log = std::chrono::steady_clock::now();
             LogMemoryUse();
+        }
+        if (Common::Preforged::Options().log_slow_frames) {
+            CheckForFreeze();
         }
         std::optional<u64> reload_title;
         {
@@ -509,6 +520,64 @@ void EmulationSession::LogMemoryUse() {
     LOG_INFO(Frontend, "[Preforged] memory log took {:.1f} ms",
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                  .count());
+}
+
+// Logs what the game and the GPU wait on once the game has shown no frame for a few seconds,
+// then every 30 seconds while that lasts.
+void EmulationSession::CheckForFreeze() {
+    constexpr double FREEZE_SECONDS = 5.0;
+    constexpr double REPEAT_SECONDS = 30.0;
+    const double seconds = Common::Preforged::SecondsSinceFrame();
+    if (seconds < FREEZE_SECONDS || m_is_paused) {
+        m_freeze_reports = 0;
+        return;
+    }
+    if (seconds < FREEZE_SECONDS + REPEAT_SECONDS * m_freeze_reports) {
+        return;
+    }
+    ++m_freeze_reports;
+    LogFreeze(seconds);
+}
+
+void EmulationSession::LogFreeze(double seconds) {
+    LOG_INFO(Frontend, "[Preforged] no frame for {:.1f} s; GPU: {}", seconds,
+             Common::Preforged::DescribeGpuProgress());
+    Kernel::KProcess* const process = m_system.ApplicationProcess();
+    if (process == nullptr) {
+        return;
+    }
+    std::vector<std::string> lines;
+    {
+        Kernel::KScopedLightLock lock{process->GetListLock()};
+        for (const Kernel::KThread& thread : process->GetThreadList()) {
+            std::string line = fmt::format(
+                "thread {} {}: {}", thread.GetThreadId(),
+                Core::GetThreadName(&thread).value_or("(no name)"), Core::GetThreadState(&thread));
+            if (thread.GetState() == Kernel::ThreadState::Waiting) {
+                line += fmt::format(" for {}", Core::GetThreadWaitReason(&thread));
+            }
+            line += fmt::format(", priority {}, core {}", thread.GetPriority(),
+                                thread.GetActiveCore());
+            // Only a waiting thread's saved registers are current.
+            if (thread.GetState() == Kernel::ThreadState::Waiting) {
+                const auto backtrace = Core::GetBacktrace(&thread);
+                line += "; calls:";
+                for (size_t i = 0; i < backtrace.size() && i < 12; ++i) {
+                    const auto& entry = backtrace[i];
+                    line += fmt::format(" {}+{:x}", entry.module.empty() ? "?" : entry.module,
+                                        entry.offset);
+                    if (!entry.name.empty()) {
+                        line += fmt::format(" ({})", entry.name);
+                    }
+                }
+            }
+            lines.push_back(std::move(line));
+        }
+    }
+    LOG_INFO(Frontend, "[Preforged] {} game threads while no frame is shown:", lines.size());
+    for (const std::string& line : lines) {
+        LOG_INFO(Frontend, "[Preforged]   {}", line);
+    }
 }
 
 void EmulationSession::RequestDiskShaderCacheReload(u64 program_id) {

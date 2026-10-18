@@ -1526,6 +1526,8 @@ class SettingsFragmentPresenter(
                 add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_CPU_CODE.key)
                 add(BooleanSetting.PREFORGED_START_AFTER_LOADING.key)
+                add(BooleanSetting.PREFORGED_LIMIT_GPU_LAG.key)
+                add(BooleanSetting.PREFORGED_MERGE_GPU_WORK.key)
                 add(BooleanSetting.PREFORGED_LOG_SHADER_COMPILES.key)
                 add(BooleanSetting.PREFORGED_STORE_ANY_STATE.key)
                 add(BooleanSetting.PREFORGED_LOG_MEMORY.key)

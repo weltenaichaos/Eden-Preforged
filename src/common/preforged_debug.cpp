@@ -58,6 +58,8 @@ void LoadOptions() {
     options.track_allocations = Settings::values.preforged_track_allocations.GetValue();
     options.precompile_cpu_code = Settings::values.preforged_precompile_cpu_code.GetValue();
     options.start_after_loading = Settings::values.preforged_start_after_loading.GetValue();
+    options.limit_gpu_lag = Settings::values.preforged_limit_gpu_lag.GetValue();
+    options.merge_gpu_work = Settings::values.preforged_merge_gpu_work.GetValue();
     FrameStats::SetEnabled(options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
@@ -76,6 +78,10 @@ void LoadOptions() {
              options.log_allocation_sizes, options.track_allocations,
              Settings::values.preforged_track_driver_memory.GetValue(),
              options.precompile_cpu_code, options.start_after_loading);
+    LOG_INFO(Common,
+             "[Preforged] limit GPU lag {} (at most {} submits), merge GPU work {} (from {} "
+             "submits left)",
+             options.limit_gpu_lag, MaxGpuLag, options.merge_gpu_work, MergeGpuLag);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {
@@ -131,12 +137,39 @@ constexpr std::array<const char*, VulkanObjectTypes> VulkanObjectNames{
     "samplers",        "pipelines",            "shader modules",
 };
 
+constexpr std::size_t SubmitCauses = static_cast<std::size_t>(SubmitCause::Count);
+
+constexpr std::array<const char*, SubmitCauses> SubmitCauseNames{
+    "other", "fences", "command lists", "draw batches", "waits for the GPU", "frames",
+};
+
 struct VulkanObjectCounts {
     std::array<std::atomic<std::int64_t>, VulkanObjectTypes> live{};
     std::atomic<std::uint64_t> submits{0};
     std::atomic<std::uint64_t> most_ahead{0};
     std::atomic<std::uint64_t> most_waiting{0};
+    std::array<std::atomic<std::uint64_t>, SubmitCauses> by_cause{};
+    std::atomic<std::uint64_t> merged{0};
+    std::atomic<std::uint64_t> empty_skipped{0};
+    std::atomic<std::uint64_t> lag_waits{0};
+    std::atomic<std::uint64_t> lag_wait_nanoseconds{0};
+    std::atomic<std::uint64_t> longest_lag_wait{0};
+    /// Freeze report: the GPU thread's last submit and what it knew of the GPU's progress.
+    std::atomic<std::uint64_t> last_tick{0};
+    std::atomic<std::uint64_t> last_pending{0};
+    std::atomic<std::uint64_t> known_tick{0};
+    std::atomic<std::int64_t> last_submit_time{0};
+    std::atomic<std::int64_t> last_frame_time{0};
+    std::atomic<std::uint64_t> waiting_chunks{0};
 };
+
+thread_local SubmitCause current_cause = SubmitCause::Other;
+
+std::int64_t NowNanoseconds() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 void StoreMax(std::atomic<std::uint64_t>& most, std::uint64_t value) {
     std::uint64_t current = most.load(std::memory_order_relaxed);
@@ -174,6 +207,25 @@ std::string DescribeVulkanObjects() {
                         "command chunks waited to be submitted",
                         submits, submits - last_submits, ahead, waiting);
     last_submits = submits;
+
+    std::string causes;
+    for (std::size_t cause = 0; cause < SubmitCauses; ++cause) {
+        const std::uint64_t count = counts.by_cause[cause].exchange(0, std::memory_order_relaxed);
+        if (count != 0) {
+            causes += fmt::format("{}{} {}", causes.empty() ? "" : ", ", SubmitCauseNames[cause],
+                                  count);
+        }
+    }
+    const std::uint64_t lag_waits = counts.lag_waits.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t lag_ns = counts.lag_wait_nanoseconds.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t longest = counts.longest_lag_wait.exchange(0, std::memory_order_relaxed);
+    text += fmt::format("; submits since the last log by cause: {}; {} command lists and draw "
+                        "batches merged into later submits, {} empty submits left out; waited {} "
+                        "times for the GPU to catch up, {:.1f} ms in all (longest {:.1f} ms)",
+                        causes.empty() ? std::string{"none"} : causes,
+                        counts.merged.exchange(0, std::memory_order_relaxed),
+                        counts.empty_skipped.exchange(0, std::memory_order_relaxed), lag_waits,
+                        lag_ns / 1e6, longest / 1e6);
     return text;
 }
 
@@ -227,7 +279,74 @@ void NoteQueueSubmit(std::uint64_t ahead) {
 }
 
 void NoteWorkQueue(std::uint64_t waiting) {
-    StoreMax(VulkanObjects().most_waiting, waiting);
+    VulkanObjectCounts& counts = VulkanObjects();
+    StoreMax(counts.most_waiting, waiting);
+    counts.waiting_chunks.store(waiting, std::memory_order_relaxed);
+}
+
+SubmitCauseScope::SubmitCauseScope(SubmitCause cause) : previous{current_cause} {
+    current_cause = cause;
+}
+
+SubmitCauseScope::~SubmitCauseScope() {
+    current_cause = previous;
+}
+
+void NoteSubmit(std::uint64_t tick, std::uint64_t pending) {
+    VulkanObjectCounts& counts = VulkanObjects();
+    const auto cause = static_cast<std::size_t>(current_cause);
+    counts.by_cause[cause < SubmitCauses ? cause : 0].fetch_add(1, std::memory_order_relaxed);
+    counts.last_tick.store(tick, std::memory_order_relaxed);
+    counts.last_pending.store(pending, std::memory_order_relaxed);
+    counts.last_submit_time.store(NowNanoseconds(), std::memory_order_relaxed);
+}
+
+void NoteMergedWork() {
+    VulkanObjects().merged.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteEmptySubmitSkipped() {
+    VulkanObjects().empty_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteGpuLagWait(std::chrono::steady_clock::duration time) {
+    VulkanObjectCounts& counts = VulkanObjects();
+    const auto nanoseconds = static_cast<std::uint64_t>(std::max<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(time).count(), 0));
+    counts.lag_waits.fetch_add(1, std::memory_order_relaxed);
+    counts.lag_wait_nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+    StoreMax(counts.longest_lag_wait, nanoseconds);
+}
+
+void NoteGpuTick(std::uint64_t known_tick) {
+    VulkanObjects().known_tick.store(known_tick, std::memory_order_relaxed);
+}
+
+void NoteFrame() {
+    VulkanObjects().last_frame_time.store(NowNanoseconds(), std::memory_order_relaxed);
+}
+
+void ResetFrameClock() {
+    VulkanObjects().last_frame_time.store(NowNanoseconds(), std::memory_order_relaxed);
+}
+
+double SecondsSinceFrame() {
+    const std::int64_t last = VulkanObjects().last_frame_time.load(std::memory_order_relaxed);
+    return last == 0 ? -1.0 : (NowNanoseconds() - last) / 1e9;
+}
+
+std::string DescribeGpuProgress() {
+    const VulkanObjectCounts& counts = VulkanObjects();
+    const std::int64_t last_submit = counts.last_submit_time.load(std::memory_order_relaxed);
+    return fmt::format(
+        "last submit {:.1f} s ago (tick {}, {} earlier submits unfinished then), the GPU thread "
+        "last saw tick {} finished, {} command chunks wait for the command worker; running now: "
+        "{}",
+        last_submit == 0 ? -1.0 : (NowNanoseconds() - last_submit) / 1e9,
+        counts.last_tick.load(std::memory_order_relaxed),
+        counts.last_pending.load(std::memory_order_relaxed),
+        counts.known_tick.load(std::memory_order_relaxed),
+        counts.waiting_chunks.load(std::memory_order_relaxed), FrameStats::DescribeActive());
 }
 
 void LogMemoryUse(const char* when, bool count_mappings) {

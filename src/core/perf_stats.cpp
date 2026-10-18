@@ -81,6 +81,7 @@ void PerfStats::EndSystemFrame() {
     }
     accumulated_frametime += frame_time;
     system_frames += 1;
+    Common::Preforged::NoteFrame();
 
     const auto frame_length = frame_end - previous_frame_end;
     // What ran since the last frame, summed over threads, and in the frame before for comparison.

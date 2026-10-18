@@ -94,6 +94,8 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_TRACK_DRIVER_MEMORY("preforged_track_driver_memory"),
     PREFORGED_PRECOMPILE_CPU_CODE("preforged_precompile_cpu_code"),
     PREFORGED_START_AFTER_LOADING("preforged_start_after_loading"),
+    PREFORGED_LIMIT_GPU_LAG("preforged_limit_gpu_lag"),
+    PREFORGED_MERGE_GPU_WORK("preforged_merge_gpu_work"),
     USE_VULKAN_DRIVER_PIPELINE_CACHE("use_vulkan_driver_pipeline_cache"),
     EXTENDED_LOGGING("extended_logging"),
     DONT_SHOW_DRIVER_SHADER_WARNING("dont_show_driver_shader_warning"),

@@ -15,6 +15,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/preforged_debug.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -886,7 +887,24 @@ void RasterizerVulkan::FlushCommands() {
     if (draw_counter == 0) {
         return;
     }
+    if (Common::Preforged::Options().merge_gpu_work) {
+        // A fence that was just queued submitted everything already.
+        if (!scheduler.HasUnsubmittedWork()) {
+            draw_counter = 0;
+            Common::Preforged::NoteEmptySubmitSkipped();
+            return;
+        }
+        // While the GPU still works through earlier submits, this work would not start any
+        // sooner in a submit of its own, so it goes out with the next one. The draw counter
+        // stays set, so the next command list submits it once the GPU catches up.
+        if (scheduler.GpuIsBehind(Common::Preforged::MergeGpuLag)) {
+            scheduler.DispatchWork();
+            Common::Preforged::NoteMergedWork();
+            return;
+        }
+    }
     draw_counter = 0;
+    const Common::Preforged::SubmitCauseScope cause{Common::Preforged::SubmitCause::CommandList};
     scheduler.Flush();
 }
 
@@ -997,6 +1015,16 @@ void RasterizerVulkan::FlushWork() {
         scheduler.DispatchWork();
         return;
     }
+    if (Common::Preforged::Options().merge_gpu_work &&
+        scheduler.GpuIsBehind(Common::Preforged::MergeGpuLag)) {
+        // Checked again every few draws until the GPU catches up.
+        scheduler.DispatchWork();
+        if (draw_counter <= DRAWS_TO_DISPATCH + CHECK_MASK) {
+            Common::Preforged::NoteMergedWork();
+        }
+        return;
+    }
+    const Common::Preforged::SubmitCauseScope cause{Common::Preforged::SubmitCause::DrawBatch};
     scheduler.Flush();
     draw_counter = 0;
 }

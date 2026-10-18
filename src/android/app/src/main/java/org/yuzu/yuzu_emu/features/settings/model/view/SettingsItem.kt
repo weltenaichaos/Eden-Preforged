@@ -360,6 +360,20 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_LIMIT_GPU_LAG,
+                    titleId = R.string.preforged_limit_gpu_lag,
+                    descriptionId = R.string.preforged_limit_gpu_lag_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_MERGE_GPU_WORK,
+                    titleId = R.string.preforged_merge_gpu_work,
+                    descriptionId = R.string.preforged_merge_gpu_work_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description

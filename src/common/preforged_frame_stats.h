@@ -27,6 +27,7 @@ enum class Item : unsigned char {
     TextureCleanup,  ///< The texture cache's garbage collector
     FrameWait,       ///< The GPU thread waiting for a free frame to draw into
     Present,         ///< Acquiring and presenting swapchain images, on the present thread
+    SemaphoreAcquire, ///< The GPU thread waiting for a game semaphore to reach a value
     Count,
 };
 
@@ -56,6 +57,13 @@ void Add(Item item, std::chrono::steady_clock::duration time, uint64_t bytes = 0
 /// "CPU code compiled 120x 35.2 ms (longest 4.1 ms)".
 [[nodiscard]] std::string Describe(const Snapshot& snapshot);
 
+/// Marks an item as running on this thread, so DescribeActive can tell what a freeze waits on.
+void Begin(Item item);
+void End(Item item);
+
+/// Describes the items running right now and how long each has been running, oldest first.
+[[nodiscard]] std::string DescribeActive();
+
 /// Counts the time from construction to destruction as one event of `item`. Item::Count counts
 /// nothing.
 class Timer {
@@ -64,11 +72,13 @@ public:
         : item{item_}, bytes{bytes_}, running{item_ != Item::Count && Enabled()} {
         if (running) {
             start = std::chrono::steady_clock::now();
+            Begin(item);
         }
     }
 
     ~Timer() {
         if (running) {
+            End(item);
             Add(item, std::chrono::steady_clock::now() - start, bytes);
         }
     }

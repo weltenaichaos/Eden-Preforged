@@ -681,7 +681,7 @@
     <string name="preforged_log_memory">Log memory use</string>
     <string name="preforged_log_memory_description">Logs memory use every 30 seconds in game.</string>
     <string name="preforged_log_slow_frames">Log slow frames</string>
-    <string name="preforged_log_slow_frames_description">Logs every frame that took over 50 ms and more than twice as long as the frame before it, so stutters show up in the log with their time and what ran during them, such as CPU code and shader compiles, texture work and waits for the GPU. Takes effect when a game starts.</string>
+    <string name="preforged_log_slow_frames_description">Logs every frame that took over 50 ms and more than twice as long as the frame before it, so stutters show up in the log with their time and what ran during them, such as CPU code and shader compiles, texture work and waits for the GPU. When the game shows no frame for 5 seconds, it also logs what the game threads and the GPU wait on, and again every 30 seconds while that lasts. Takes effect when a game starts.</string>
     <string name="preforged_log_allocation_sizes">Log what fills memory</string>
     <string name="preforged_log_allocation_sizes_description">Each time the app\'s memory grows past another 2 GB, logs which allocation sizes hold the most of it. The game pauses for a moment while it is counted.</string>
     <string name="preforged_track_allocations">Track what holds memory</string>
@@ -692,6 +692,10 @@
     <string name="preforged_precompile_cpu_code_description">Saves a list of the CPU code the game compiles while you play, and compiles that code while the game loads the next time, so it doesn\'t stutter compiling it again. The first session with this on records the list. Only for games that can\'t run natively. Takes effect when a game starts.</string>
     <string name="preforged_start_after_loading">Start the game after loading</string>
     <string name="preforged_start_after_loading_description">Starts running the game only once the game file search, the shaders and the CPU code have loaded. Off starts it while they load, which can corrupt what the game reads from its files during the game file search. Takes effect when a game starts.</string>
+    <string name="preforged_limit_gpu_lag">Limit how far ahead of the GPU Eden runs</string>
+    <string name="preforged_limit_gpu_lag_description">Waits for the GPU once it has 32 batches of work left to finish. Every waiting batch holds command buffers and queries that the GPU driver keeps in memory, and Eden never frees them, so without the limit, scenes that send many small batches can fill the memory until the app closes. Takes effect when a game starts.</string>
+    <string name="preforged_merge_gpu_work">Merge GPU work while the GPU is behind</string>
+    <string name="preforged_merge_gpu_work_description">While the GPU still has 3 or more batches to finish, adds the work of each finished game command list to the next batch instead of sending it on its own. Sends fewer batches, which costs the driver less time. Takes effect when a game starts.</string>
     <string name="preforged_driver_pipeline_cache">Use the driver pipeline cache</string>
     <string name="preforged_driver_pipeline_cache_description">Loads the GPU driver\'s saved pipelines at game start. Off leaves the saved file alone but loads nothing from it, so every pipeline is built by the driver again.</string>
     <string name="flush_by_line">Flush debug logs by line</string>
