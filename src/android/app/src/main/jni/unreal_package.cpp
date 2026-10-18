@@ -733,27 +733,43 @@ std::optional<Summary> ReadSummary(std::span<const u8> file) {
 }
 
 bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u8>& image,
-                 size_t& failed_blocks) {
+                 size_t& failed_blocks, std::vector<ImageSpan>& spans) {
     failed_blocks = 0;
+    spans.clear();
     if (summary.chunks.empty()) {
         image.assign(file.begin(), file.end());
+        spans.push_back({0, 0, file.size()});
         return true;
     }
     const Summary::Chunk& last = summary.chunks.back();
     const size_t first_offset = summary.chunks.front().unpacked_offset;
     image.assign(size_t{last.unpacked_offset} + last.unpacked_size + Ooz::OUTPUT_SLACK, 0);
     std::memcpy(image.data(), file.data(), std::min(first_offset, file.size()));
+    // In file order, the order Unpack finds the parts in.
+    std::vector<const Summary::Chunk*> order;
+    for (const Summary::Chunk& chunk : summary.chunks) {
+        order.push_back(&chunk);
+    }
+    std::stable_sort(order.begin(), order.end(), [](const auto* a, const auto* b) {
+        return a->packed_offset < b->packed_offset;
+    });
     Method last_method = Method::Unknown;
     bool any = false;
-    for (const Summary::Chunk& chunk : summary.chunks) {
-        const std::optional<Part> part = ReadPart(file, chunk.packed_offset);
+    u64 unpacked_pos = 0;
+    for (const Summary::Chunk* const chunk : order) {
+        const std::optional<Part> part = ReadPart(file, chunk->packed_offset);
         if (!part) {
             continue;
         }
         size_t block_pos = part->data_begin;
-        size_t out_pos = chunk.unpacked_offset;
+        size_t out_pos = chunk->unpacked_offset;
         for (const Block& block : part->blocks) {
             const std::span<const u8> in = file.subspan(block_pos, block.packed);
+            // A chunk list that disagrees with its parts must not write past the image.
+            if (out_pos + block.unpacked > image.size() - Ooz::OUTPUT_SLACK) {
+                ++failed_blocks;
+                break;
+            }
             const std::span<u8> out{image.data() + out_pos, block.unpacked};
             const Method method = DecompressBlock(in, out, last_method, true);
             if (method == Method::OodleFailed || method == Method::Unknown) {
@@ -761,6 +777,13 @@ bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u
                 ++failed_blocks;
             } else {
                 any = true;
+                if (!spans.empty() &&
+                    spans.back().image_offset + spans.back().size == out_pos) {
+                    spans.back().size += block.unpacked;
+                } else {
+                    spans.push_back({unpacked_pos, out_pos, block.unpacked});
+                }
+                unpacked_pos += block.unpacked;
             }
             block_pos += block.packed;
             out_pos += block.unpacked;
@@ -770,18 +793,19 @@ bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u
     return any;
 }
 
-std::optional<u64> ImageOffset(const Summary& summary, u64 unpacked_offset) {
-    if (summary.chunks.empty()) {
-        return unpacked_offset;
-    }
-    // Unpack hands out the chunks one after another, and their unpacked ranges follow one
-    // another too, so the data is the image from the first chunk on.
-    const Summary::Chunk& last = summary.chunks.back();
-    const u64 image_offset = summary.chunks.front().unpacked_offset + unpacked_offset;
-    if (image_offset >= u64{last.unpacked_offset} + last.unpacked_size) {
+std::optional<u64> ImageOffset(std::span<const ImageSpan> spans, u64 unpacked_offset) {
+    // The last span that starts at or before the offset.
+    const auto after = std::upper_bound(
+        spans.begin(), spans.end(), unpacked_offset,
+        [](u64 offset, const ImageSpan& span) { return offset < span.unpacked_offset; });
+    if (after == spans.begin()) {
         return std::nullopt;
     }
-    return image_offset;
+    const ImageSpan& span = *(after - 1);
+    if (unpacked_offset - span.unpacked_offset >= span.size) {
+        return std::nullopt;
+    }
+    return span.image_offset + (unpacked_offset - span.unpacked_offset);
 }
 
 Tables ReadTables(std::span<const u8> data, u64 data_offset, const Summary& summary) {

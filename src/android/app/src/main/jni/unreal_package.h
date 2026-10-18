@@ -137,15 +137,25 @@ struct Tables {
 /// header are skipped. Returns nothing for data that is not an Unreal Engine 3 package.
 [[nodiscard]] std::optional<Summary> ReadSummary(std::span<const u8> file);
 
+/// A run of the data Unpack hands out and where it lies in the uncompressed layout.
+struct ImageSpan {
+    u64 unpacked_offset; ///< Offset in what Unpack hands out
+    u64 image_offset;    ///< Offset in the uncompressed layout
+    u64 size;
+};
+
 /// Unpacks a whole package into its uncompressed layout, where the offsets of the header and
 /// tables apply: the header as stored, then each chunk at its unpacked offset. Blocks that do
 /// not unpack stay zero and are counted in `failed_blocks`. Returns false when nothing unpacked.
+/// `spans` gets where each block Unpack hands out lies in the layout. Unpack leaves out the
+/// blocks that do not unpack, so its offsets move back by their size after each one.
 bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u8>& image,
-                 size_t& failed_blocks);
+                 size_t& failed_blocks, std::vector<ImageSpan>& spans);
 
-/// Maps an offset in the data Unpack hands out (the chunks one after another) to the offset in
-/// the uncompressed layout. Returns nothing past the last chunk.
-[[nodiscard]] std::optional<u64> ImageOffset(const Summary& summary, u64 unpacked_offset);
+/// Maps an offset in the data Unpack hands out to the offset in the uncompressed layout, with
+/// the spans UnpackImage gave. Returns nothing for offsets past the last span.
+[[nodiscard]] std::optional<u64> ImageOffset(std::span<const ImageSpan> spans,
+                                             u64 unpacked_offset);
 
 /// Reads the name, import and export tables from `data`, which holds the uncompressed layout
 /// starting at `data_offset`.

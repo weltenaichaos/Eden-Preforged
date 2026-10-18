@@ -67,6 +67,9 @@ constexpr u64 MAX_DICTIONARY_SEARCH_BYTES = 256ULL << 20;
 /// How long the walk over all files may look for dictionaries when none is in a file named like
 /// one. Tears of the Kingdom's 304,207 files took 187 s, most of the search's time.
 constexpr auto DICTIONARY_SEARCH_TIME = std::chrono::seconds{45};
+/// Files looked at to tell whether a game's zstd frames name dictionaries at all. XCOM 2 has no
+/// zstd files, and looking at all its 33,550 files took 22 s.
+constexpr size_t DICTIONARY_SAMPLE_FILES = 2000;
 /// Unreal packages up to this size are read whole, so their compressed parts can be unpacked.
 constexpr size_t MAX_WHOLE_PACKAGE = 384ULL << 20;
 constexpr u32 FILTER_BITS = 22;
@@ -595,7 +598,9 @@ public:
         size_t by_name = 0;
         u64 by_name_read = 0;
         std::string by_name_examples;
+        size_t file_count = 0;
         for_each_file([&](const FileSys::VirtualFile& file, const std::string& name) {
+            ++file_count;
             const size_t size = file->GetSize();
             if (size >= 8 && size <= MAX_DICTIONARY_ARCHIVE &&
                 by_name_read + size <= MAX_DICTIONARY_SEARCH_BYTES &&
@@ -620,10 +625,45 @@ public:
             return;
         }
 
-        // None found by name: look at the start of every file for dictionaries and for the ids
-        // of the dictionaries zstd frames name, then unpack the small zstd files that name none,
-        // smallest first, until every named dictionary is found.
-        const auto walk_deadline = Clock::now() + DICTIONARY_SEARCH_TIME;
+        // None found by name. Look at the start of a sample of the files first, so a game whose
+        // files name no dictionary doesn't pay for looking at all of them.
+        const size_t step = std::max<size_t>(1, file_count / DICTIONARY_SAMPLE_FILES);
+        size_t sampled = 0;
+        size_t sample_naming = 0;
+        size_t index = 0;
+        for_each_file([&](const FileSys::VirtualFile& file, const std::string&) {
+            if (index++ % step != 0) {
+                return true;
+            }
+            const size_t size = file->GetSize();
+            if (size < 8 || size > MAX_WHOLE_FILE) {
+                return true;
+            }
+            ++sampled;
+            const std::vector<u8> head = file->ReadBytes(std::min<size_t>(size, 18), 0);
+            sample_naming += Common::Compression::IsZstdDictionary(head) ||
+                                     (IsZstd(head) &&
+                                      Common::Compression::ZstdFrameDictionaryId(head) != 0)
+                                 ? 1
+                                 : 0;
+            return true;
+        });
+        const auto sample_time = Clock::now() - start - by_name_time;
+        if (sample_naming == 0) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] zstd dictionaries: none in {} files named like dictionaries "
+                     "({}) read in {} ms, and none named in a sample of {} of the {} files "
+                     "looked at in {} ms, so not all files are looked at",
+                     by_name, by_name_examples.empty() ? std::string{"none"} : by_name_examples,
+                     ms(by_name_time), sampled, file_count, ms(sample_time));
+            return;
+        }
+
+        // Look at the start of every file for dictionaries and for the ids of the dictionaries
+        // zstd frames name, then unpack the small zstd files that name none, smallest first,
+        // until every named dictionary is found.
+        const auto walk_start = Clock::now();
+        const auto walk_deadline = walk_start + DICTIONARY_SEARCH_TIME;
         std::map<u32, size_t> named;
         std::vector<std::tuple<size_t, std::string, FileSys::VirtualFile>> containers;
         size_t looked_at = 0;
@@ -652,7 +692,7 @@ public:
             }
             return true;
         });
-        const auto walk_time = Clock::now() - start - by_name_time;
+        const auto walk_time = Clock::now() - walk_start;
         const auto all_found = [&] {
             return std::ranges::all_of(
                 named, [&](const auto& entry) { return zstd_dictionaries.Has(entry.first); });
@@ -685,14 +725,15 @@ public:
         }
         LOG_INFO(Frontend,
                  "[ShaderScan] zstd dictionaries: {} found: {}; {} files named like "
-                 "dictionaries ({}) read in {} ms; files name {}; looked at the start of {} "
-                 "files in {} ms{}; unpacked {} of {} small zstd files that name none ({} KiB) "
-                 "in {} ms{}",
+                 "dictionaries ({}) read in {} ms; {} of a sample of {} files name one; files "
+                 "name {}; looked at the start of {} files in {} ms{}; unpacked {} of {} small "
+                 "zstd files that name none ({} KiB) in {} ms{}",
                  zstd_dictionaries.Sizes().size(), found_list(), by_name,
                  by_name_examples.empty() ? std::string{"none"} : by_name_examples,
-                 ms(by_name_time), wanted.empty() ? std::string{"none"} : wanted, looked_at,
-                 ms(walk_time), walk_done ? "" : " (stopped at the time limit)", unpacked,
-                 containers.size(), read >> 10, ms(Clock::now() - start - by_name_time - walk_time),
+                 ms(by_name_time), sample_naming, sampled,
+                 wanted.empty() ? std::string{"none"} : wanted, looked_at, ms(walk_time),
+                 walk_done ? "" : " (stopped at the time limit)", unpacked, containers.size(),
+                 read >> 10, ms(Clock::now() - walk_start - walk_time),
                  unpack_done ? "" : " (stopped at the time or size limit)");
     }
 

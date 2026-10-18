@@ -504,6 +504,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     Impl& s = *impl;
     std::optional<Summary> summary = ReadSummary(file);
     std::vector<u8> image;
+    std::vector<ImageSpan> spans;
     size_t failed_blocks = 0;
     bool whole = false;
     if (!summary) {
@@ -520,7 +521,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
                      name, Hex(file, 0, 128));
             return;
         }
-    } else if (!UnpackImage(file, *summary, image, failed_blocks)) {
+    } else if (!UnpackImage(file, *summary, image, failed_blocks, spans)) {
         LOG_INFO(Frontend, "[ShaderScan] Unreal links: nothing in {} unpacked", name);
         return;
     }
@@ -543,7 +544,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     for (const CodeHeader& header : headers) {
         const std::optional<u64> offset =
             whole ? std::optional<u64>{header.unpacked_offset}
-                  : ImageOffset(*summary, header.unpacked_offset);
+                  : ImageOffset(spans, header.unpacked_offset);
         if (offset && *offset + 4 <= image.size() &&
             Load32(image.data() + *offset) == NVN_CODE_MAGIC) {
             hash_at.emplace(*offset, header.hash);
