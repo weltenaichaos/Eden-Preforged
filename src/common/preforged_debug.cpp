@@ -64,6 +64,7 @@ void LoadOptions() {
     options.merge_gpu_work = Settings::values.preforged_merge_gpu_work.GetValue();
     options.unpack_unreal_packages = Settings::values.preforged_unpack_unreal_packages.GetValue();
     options.unpack_oodle = Settings::values.preforged_unpack_oodle.GetValue();
+    options.zstd_dictionaries = Settings::values.preforged_zstd_dictionaries.GetValue();
     FrameStats::SetEnabled(options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
@@ -84,9 +85,10 @@ void LoadOptions() {
              options.precompile_cpu_code, options.start_after_loading);
     LOG_INFO(Common,
              "[Preforged] limit GPU lag {} (at most {} submits), merge GPU work {} (from {} "
-             "submits left), unpack Unreal packages {}, unpack Oodle blocks {}",
+             "submits left), unpack Unreal packages {}, unpack Oodle blocks {}, zstd "
+             "dictionaries {}",
              options.limit_gpu_lag, MaxGpuLag, options.merge_gpu_work, MergeGpuLag,
-             options.unpack_unreal_packages, options.unpack_oodle);
+             options.unpack_unreal_packages, options.unpack_oodle, options.zstd_dictionaries);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {

@@ -8,11 +8,13 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -55,6 +57,10 @@ constexpr size_t MAX_WHOLE_FILE = 64ULL << 20;
 constexpr size_t CHUNK_SIZE = 64ULL << 20;
 constexpr size_t CHUNK_OVERLAP = 1ULL << 20;
 constexpr size_t MAX_DECOMPRESSED = 256ULL << 20;
+/// zstd files that name no dictionary are unpacked to look for dictionaries up to this size,
+/// and up to this much in all.
+constexpr size_t MAX_DICTIONARY_ARCHIVE = 16ULL << 20;
+constexpr u64 MAX_DICTIONARY_SEARCH_BYTES = 256ULL << 20;
 /// Unreal packages up to this size are read whole, so their compressed parts can be unpacked.
 constexpr size_t MAX_WHOLE_PACKAGE = 384ULL << 20;
 constexpr u32 FILTER_BITS = 22;
@@ -181,20 +187,62 @@ u64 ZstdContentSize(std::span<const u8> data) {
     return field_size == 2 ? size + 256 : size;
 }
 
-// Returns the decompressed contents when the data is a compressed container we understand.
-std::vector<u8> Decompress(std::span<const u8> data) {
-    if (data.size() >= 4 && std::memcmp(data.data(), "Yaz0", 4) == 0) {
-        return DecompressYaz0(data);
+bool IsYaz0(std::span<const u8> data) {
+    return data.size() >= 4 && std::memcmp(data.data(), "Yaz0", 4) == 0;
+}
+
+bool IsZstd(std::span<const u8> data) {
+    return data.size() >= 4 && data[0] == 0x28 && data[1] == 0xB5 && data[2] == 0x2F &&
+           data[3] == 0xFD;
+}
+
+/// The first 4 bytes of a buffer, as the search counts what it could not unpack.
+u32 Start32(std::span<const u8> data) {
+    u32 value = 0;
+    std::memcpy(&value, data.data(), std::min<size_t>(data.size(), sizeof(value)));
+    return value;
+}
+
+/// The files of a SARC archive. Returns false when the data is not one.
+bool SarcEntries(std::span<const u8> data, std::vector<std::span<const u8>>& entries) {
+    entries.clear();
+    if (data.size() < 0x14 || std::memcmp(data.data(), "SARC", 4) != 0) {
+        return false;
     }
-    if (data.size() >= 4 && data[0] == 0x28 && data[1] == 0xB5 && data[2] == 0x2F &&
-        data[3] == 0xFD) {
-        const u64 size = ZstdContentSize(data);
-        if (size == 0 || size > MAX_DECOMPRESSED) {
-            return {};
+    u16 header_size;
+    u16 bom;
+    u32 data_offset;
+    std::memcpy(&header_size, data.data() + 4, 2);
+    std::memcpy(&bom, data.data() + 6, 2);
+    std::memcpy(&data_offset, data.data() + 0xC, 4);
+    if (bom != 0xFEFF || size_t{header_size} + 0xC > data.size() || data_offset > data.size()) {
+        return false;
+    }
+    const u8* const sfat = data.data() + header_size;
+    if (std::memcmp(sfat, "SFAT", 4) != 0) {
+        return false;
+    }
+    u16 sfat_size;
+    u16 node_count;
+    std::memcpy(&sfat_size, sfat + 4, 2);
+    std::memcpy(&node_count, sfat + 6, 2);
+    const size_t nodes_offset = size_t{header_size} + sfat_size;
+    if (nodes_offset + size_t{node_count} * 16 > data.size()) {
+        return false;
+    }
+    for (size_t node = 0; node < node_count; ++node) {
+        const u8* const entry = data.data() + nodes_offset + node * 16;
+        u32 start;
+        u32 end;
+        std::memcpy(&start, entry + 8, 4);
+        std::memcpy(&end, entry + 12, 4);
+        if (end < start || size_t{data_offset} + end > data.size()) {
+            entries.clear();
+            return false;
         }
-        return Common::Compression::DecompressDataZSTD(data);
+        entries.push_back(data.subspan(data_offset + start, end - start));
     }
-    return {};
+    return true;
 }
 
 struct HeaderInfo {
@@ -482,6 +530,236 @@ public:
         }
         LOG_INFO(Frontend, "[ShaderScan] files with hits: {}, shaders in them (estimate): {}",
                  hits_per_file.size(), total_terminators);
+    }
+
+    // Finds the zstd dictionaries in the game files before the search, so the files packed with
+    // them can be unpacked wherever they come. A dictionary is a file of its own, or a file in an
+    // archive packed with zstd without one.
+    void FindZstdDictionaries(const FileSys::VirtualDir& root) {
+        if (!Common::Preforged::Options().zstd_dictionaries) {
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        std::map<u32, size_t> named;
+        std::vector<std::tuple<size_t, std::string, FileSys::VirtualFile>> containers;
+        size_t looked_at = 0;
+        const std::function<void(const FileSys::VirtualDir&, const std::string&)> walk =
+            [&](const FileSys::VirtualDir& dir, const std::string& path) {
+                if (!dir || Stopped()) {
+                    return;
+                }
+                for (const auto& file : dir->GetFiles()) {
+                    const size_t size = file->GetSize();
+                    if (size < 8 || size > MAX_WHOLE_FILE) {
+                        continue;
+                    }
+                    ++looked_at;
+                    // The longest zstd frame header.
+                    const std::vector<u8> head = file->ReadBytes(std::min<size_t>(size, 18), 0);
+                    const std::string name = path + "/" + file->GetName();
+                    if (Common::Compression::IsZstdDictionary(head)) {
+                        AddDictionary(file->ReadAllBytes(), name);
+                    } else if (IsZstd(head)) {
+                        const u32 id = Common::Compression::ZstdFrameDictionaryId(head);
+                        if (id != 0) {
+                            ++named[id];
+                        } else if (size <= MAX_DICTIONARY_ARCHIVE) {
+                            containers.emplace_back(size, name, file);
+                        }
+                    }
+                }
+                for (const auto& subdir : dir->GetSubdirectories()) {
+                    walk(subdir, path + "/" + subdir->GetName());
+                }
+            };
+        walk(root, "");
+        const auto all_found = [&] {
+            return std::ranges::all_of(named, [&](const auto& entry) {
+                return zstd_dictionaries.Has(entry.first);
+            });
+        };
+        // Unpack the small zstd files that name no dictionary, smallest first, until every
+        // dictionary the other files name is found.
+        std::sort(containers.begin(), containers.end(),
+                  [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+        size_t unpacked = 0;
+        u64 read = 0;
+        for (const auto& [size, name, file] : containers) {
+            if (named.empty() || all_found() || read + size > MAX_DICTIONARY_SEARCH_BYTES ||
+                Stopped()) {
+                break;
+            }
+            read += size;
+            ++unpacked;
+            const std::vector<u8> data = file->ReadAllBytes();
+            u32 used = 0;
+            const std::vector<u8> out = zstd_dictionaries.Decompress(data, MAX_DECOMPRESSED, used);
+            FindDictionariesIn(out, name, 0);
+        }
+        std::string found;
+        for (const auto& [id, bytes] : zstd_dictionaries.Sizes()) {
+            found += fmt::format("{}{:08x} ({} KiB)", found.empty() ? "" : ", ", id, bytes >> 10);
+        }
+        std::string wanted;
+        for (const auto& [id, frames] : named) {
+            wanted += fmt::format("{}{:08x} x{}{}", wanted.empty() ? "" : ", ", id, frames,
+                                  zstd_dictionaries.Has(id) ? "" : " (not found)");
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] zstd dictionaries: {} found: {}; files name {}; looked at the "
+                 "start of {} files and unpacked {} small zstd files that name none ({} KiB) in "
+                 "{} ms",
+                 zstd_dictionaries.Sizes().size(), found.empty() ? "none" : found,
+                 wanted.empty() ? "none" : wanted, looked_at, unpacked, read >> 10,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count());
+    }
+
+    void FindDictionariesIn(std::span<const u8> data, const std::string& name, int depth) {
+        if (data.empty() || depth > 2) {
+            return;
+        }
+        if (Common::Compression::IsZstdDictionary(data)) {
+            AddDictionary(data, name);
+            return;
+        }
+        if (IsZstd(data)) {
+            u32 used = 0;
+            FindDictionariesIn(zstd_dictionaries.Decompress(data, MAX_DECOMPRESSED, used), name,
+                               depth + 1);
+            return;
+        }
+        std::vector<std::span<const u8>> entries;
+        if (SarcEntries(data, entries)) {
+            for (size_t node = 0; node < entries.size(); ++node) {
+                FindDictionariesIn(entries[node], fmt::format("{}#{}", name, node), depth + 1);
+            }
+        }
+    }
+
+    void AddDictionary(std::span<const u8> data, const std::string& name) {
+        if (const u32 id = zstd_dictionaries.Add(data); id != 0) {
+            LOG_INFO(Frontend, "[ShaderScan] zstd dictionary {:08x} ({} KiB) in {}", id,
+                     data.size() >> 10, name);
+        }
+    }
+
+    // Returns the decompressed contents when the data is a compressed container we understand.
+    std::vector<u8> Decompress(std::span<const u8> data) {
+        if (IsYaz0(data)) {
+            std::vector<u8> out = DecompressYaz0(data);
+            formats.yaz0 += out.empty() ? 0 : 1;
+            return out;
+        }
+        if (!IsZstd(data)) {
+            return {};
+        }
+        std::vector<u8> out;
+        u32 used = 0;
+        if (Common::Preforged::Options().zstd_dictionaries) {
+            out = zstd_dictionaries.Decompress(data, MAX_DECOMPRESSED, used);
+        } else if (const u64 size = ZstdContentSize(data); size != 0 && size <= MAX_DECOMPRESSED) {
+            out = Common::Compression::DecompressDataZSTD(data);
+        }
+        if (!out.empty()) {
+            if (used != 0) {
+                ++formats.zstd_with_dictionary[used];
+            } else {
+                ++formats.zstd_plain;
+            }
+            return out;
+        }
+        const u32 id = Common::Compression::ZstdFrameDictionaryId(data);
+        if (id != 0 && !zstd_dictionaries.Has(id)) {
+            ++formats.zstd_missing_dictionary[id];
+        } else {
+            ++formats.zstd_failed;
+            if (formats.zstd_failed_examples.size() < 4) {
+                formats.zstd_failed_examples.push_back(
+                    fmt::format("{} bytes, dictionary {:08x}, records {} bytes: {}", data.size(),
+                                id, ZstdContentSize(data), Hex(data, 0, 32)));
+            }
+        }
+        return {};
+    }
+
+    static std::string DescribeStart(u32 start) {
+        std::string text;
+        for (size_t i = 0; i < 4; ++i) {
+            const char c = static_cast<char>((start >> (i * 8)) & 0xFF);
+            text += std::isprint(static_cast<unsigned char>(c)) ? c : '.';
+        }
+        return fmt::format("{:02x}{:02x}{:02x}{:02x} '{}'", start & 0xFF, (start >> 8) & 0xFF,
+                           (start >> 16) & 0xFF, start >> 24, text);
+    }
+
+    static std::string TopStarts(const std::map<u32, std::pair<size_t, u64>>& starts,
+                                 size_t limit) {
+        std::vector<std::pair<u64, u32>> by_bytes;
+        for (const auto& [start, entry] : starts) {
+            by_bytes.emplace_back(entry.second, start);
+        }
+        std::sort(by_bytes.rbegin(), by_bytes.rend());
+        std::string out;
+        for (size_t i = 0; i < std::min(limit, by_bytes.size()); ++i) {
+            const auto& [count, bytes] = starts.at(by_bytes[i].second);
+            out += fmt::format("{}{} x{} ({} MiB)", out.empty() ? "" : ", ",
+                               DescribeStart(by_bytes[i].second), count, bytes >> 20);
+        }
+        return out.empty() ? std::string{"none"} : out;
+    }
+
+    // Logs what the search unpacked and what it could not, so a game whose shaders it does not
+    // find shows which of its formats the search does not read.
+    void ReportFormats() const {
+        std::string with;
+        for (const auto& [id, count] : formats.zstd_with_dictionary) {
+            with += fmt::format("{}{:08x} x{}", with.empty() ? "" : ", ", id, count);
+        }
+        std::string missing;
+        for (const auto& [id, count] : formats.zstd_missing_dictionary) {
+            missing += fmt::format("{}{:08x} x{}", missing.empty() ? "" : ", ", id, count);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] unpacked: Yaz0 {}, zstd {} without a dictionary and {} with one "
+                 "({}); not unpacked: zstd {} naming a dictionary the game files don't have ({}), "
+                 "zstd {} that did not unpack",
+                 formats.yaz0, formats.zstd_plain,
+                 std::accumulate(formats.zstd_with_dictionary.begin(),
+                                 formats.zstd_with_dictionary.end(), size_t{0},
+                                 [](size_t sum, const auto& entry) { return sum + entry.second; }),
+                 with.empty() ? "none" : with,
+                 std::accumulate(formats.zstd_missing_dictionary.begin(),
+                                 formats.zstd_missing_dictionary.end(), size_t{0},
+                                 [](size_t sum, const auto& entry) { return sum + entry.second; }),
+                 missing.empty() ? "none" : missing, formats.zstd_failed);
+        for (const std::string& example : formats.zstd_failed_examples) {
+            LOG_INFO(Frontend, "[ShaderScan] zstd that did not unpack: {}", example);
+        }
+        LOG_INFO(Frontend, "[ShaderScan] searched as stored, by their first bytes: {}",
+                 TopStarts(formats.stored_starts, 16));
+        LOG_INFO(Frontend,
+                 "[ShaderScan] files too large to read whole, searched in pieces as stored: {}",
+                 TopStarts(formats.large_starts, 8));
+    }
+
+    // Says in one line how much of what the game drew the search found, and where to look when
+    // it found little.
+    void ReportResult() const {
+        size_t found = 0;
+        for (const auto& result : results) {
+            found += result.kind == MatchKind::Exact || result.kind == MatchKind::CodeOnly ? 1 : 0;
+        }
+        const size_t percent = shaders.empty() ? 0 : found * 100 / shaders.size();
+        LOG_INFO(Frontend,
+                 "[ShaderScan] result: {} of the {} shaders the game drew found in its files "
+                 "({}%), {} shaders taken from the files{}",
+                 found, shaders.size(), percent, extracted.size(),
+                 percent >= 50 ? ""
+                               : "; most were not found, so the rest are likely in files the "
+                                 "search can't unpack (see the 'unpacked' and 'searched as "
+                                 "stored' lines above)");
     }
 
     void ReportUnreal() const {
@@ -1023,6 +1301,11 @@ private:
                 const size_t length = std::min(size - offset, CHUNK_SIZE + CHUNK_OVERLAP);
                 chunk = file->ReadBytes(length, offset);
                 bytes_scanned += std::min(length, CHUNK_SIZE);
+                if (offset == 0) {
+                    auto& large = formats.large_starts[Start32(chunk)];
+                    ++large.first;
+                    large.second += size;
+                }
                 SearchShaders(chunk, name, offset);
             }
         }
@@ -1057,43 +1340,24 @@ private:
             ScanSarc(data, name, depth)) {
             return;
         }
+        if (Common::Preforged::Options().zstd_dictionaries &&
+            Common::Compression::IsZstdDictionary(data)) {
+            AddDictionary(data, name);
+        }
+        auto& stored = formats.stored_starts[Start32(data)];
+        ++stored.first;
+        stored.second += data.size();
         SearchShaders(data, name, 0);
     }
 
     // Walks the files inside a SARC archive so compressed entries are unpacked before searching.
     bool ScanSarc(std::span<const u8> data, const std::string& name, int depth) {
-        u16 header_size;
-        u16 bom;
-        u32 data_offset;
-        std::memcpy(&header_size, data.data() + 4, 2);
-        std::memcpy(&bom, data.data() + 6, 2);
-        std::memcpy(&data_offset, data.data() + 0xC, 4);
-        if (bom != 0xFEFF || size_t{header_size} + 0xC > data.size() || data_offset > data.size()) {
+        std::vector<std::span<const u8>> entries;
+        if (!SarcEntries(data, entries)) {
             return false;
         }
-        const u8* const sfat = data.data() + header_size;
-        if (std::memcmp(sfat, "SFAT", 4) != 0) {
-            return false;
-        }
-        u16 sfat_size;
-        u16 node_count;
-        std::memcpy(&sfat_size, sfat + 4, 2);
-        std::memcpy(&node_count, sfat + 6, 2);
-        const size_t nodes_offset = header_size + sfat_size;
-        if (nodes_offset + size_t{node_count} * 16 > data.size()) {
-            return false;
-        }
-        for (size_t node = 0; node < node_count; ++node) {
-            const u8* const entry = data.data() + nodes_offset + node * 16;
-            u32 start;
-            u32 end;
-            std::memcpy(&start, entry + 8, 4);
-            std::memcpy(&end, entry + 12, 4);
-            if (end < start || size_t{data_offset} + end > data.size()) {
-                return false;
-            }
-            ScanBuffer(data.subspan(data_offset + start, end - start),
-                       fmt::format("{}#{}", name, node), depth + 1);
+        for (size_t node = 0; node < entries.size(); ++node) {
+            ScanBuffer(entries[node], fmt::format("{}#{}", name, node), depth + 1);
         }
         return true;
     }
@@ -1390,6 +1654,23 @@ private:
     size_t extracted_bytes = 0;
     size_t code_headers = 0;
     Preforged::Unreal::Stats unreal_stats;
+    Common::Compression::ZstdDictionaries zstd_dictionaries;
+    /// What the search unpacked, and what it searched as stored because it could not.
+    struct FormatStats {
+        size_t yaz0 = 0;
+        size_t zstd_plain = 0;
+        std::map<u32, size_t> zstd_with_dictionary;
+        /// zstd frames that name a dictionary the game files don't have, by its id.
+        std::map<u32, size_t> zstd_missing_dictionary;
+        /// zstd frames that did not unpack otherwise: damaged, too large, or packed with a
+        /// dictionary they don't name.
+        size_t zstd_failed = 0;
+        std::vector<std::string> zstd_failed_examples;
+        /// Buffers searched as they are, by their first 4 bytes: how many, and their bytes.
+        std::map<u32, std::pair<size_t, u64>> stored_starts;
+        /// Files too large to read whole, searched in pieces as they are, by their first 4 bytes.
+        std::map<u32, std::pair<size_t, u64>> large_starts;
+    } formats;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
@@ -1472,7 +1753,11 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     std::filesystem::copy_file(shader_dir / "vulkan.bin", copy,
                                std::filesystem::copy_options::overwrite_existing, error);
     if (error) {
-        LOG_INFO(Frontend, "[ShaderScan] no pipeline cache to compare against: {}",
+        LOG_INFO(Frontend,
+                 "[ShaderScan] not searching on this start: the game has no shader cache yet "
+                 "({}), as on its first start or after the cache was deleted. The search "
+                 "compares the game files with the shaders the game drew and compiles them with "
+                 "the states it drew them with, so it runs on the next start.",
                  error.message());
         return;
     }
@@ -1481,7 +1766,9 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         Vulkan::PipelineCache::ReadCachedShaderCode(copy, stop, &graphics_keys);
     std::filesystem::remove(copy, error);
     if (shaders.empty()) {
-        LOG_INFO(Frontend, "[ShaderScan] pipeline cache has no shaders");
+        LOG_INFO(Frontend,
+                 "[ShaderScan] not searching on this start: the shader cache holds no shaders "
+                 "yet, so the search runs on the next start");
         return;
     }
 
@@ -1493,12 +1780,14 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
     scanner.SetProgress(&progress, std::max<size_t>(Scanner::CountFiles(root, "") + 1, 2));
     scanner.ReportProgress(true);
+    scanner.FindZstdDictionaries(root);
     scanner.ScanDir(root, "", true);
     scanner.Report("shader-named files");
     if (!scanner.Stopped()) {
         scanner.ScanDir(root, "", false);
         scanner.Report("all files");
     }
+    scanner.ReportFormats();
     scanner.ReportUnreal();
     scanner.ReportExtraction();
     scanner.ReportPairing(graphics_keys);
@@ -1518,6 +1807,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         Common::Log::SetGlobalFilter(normal);
     }
     scanner.SavePrograms(shader_dir / "preforged_programs.bin");
+    scanner.ReportResult();
     if (progress) {
         progress(1, 1);
     }

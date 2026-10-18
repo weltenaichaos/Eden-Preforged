@@ -395,6 +395,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_ZSTD_DICTIONARIES,
+                    titleId = R.string.preforged_zstd_dictionaries,
+                    descriptionId = R.string.preforged_zstd_dictionaries_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description
