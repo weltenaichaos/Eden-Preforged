@@ -57,8 +57,6 @@ class DriverViewModel : ViewModel() {
     private val _showClearButton = MutableStateFlow(false)
     val showClearButton = _showClearButton.asStateFlow()
 
-    private val driversToDelete = mutableListOf<String>()
-
     private var previousDriverPath: String = ""
     private var activeGame: Game? = null
 
@@ -74,8 +72,6 @@ class DriverViewModel : ViewModel() {
     fun reloadDriverData() {
         _areDriversLoading.value = true
         driverData = GpuDriverHelper.getDrivers()
-            .filterNot { driversToDelete.contains(it.first) }
-            .toMutableList()
         updateDriverList()
         _areDriversLoading.value = false
     }
@@ -174,17 +170,21 @@ class DriverViewModel : ViewModel() {
             return
         }
 
-        driversToDelete.add(driverData[driverIndex].first)
+        // The file goes now. Deleting it only when the driver manager closed left it on disk
+        // while the list no longer showed it, so the download list called it installed and the
+        // driver could be neither picked nor installed again.
+        val driverPath = driverData[driverIndex].first
+        val deleted = File(driverPath).let { !it.exists() || it.delete() }
+        Log.info(
+            "[DriverViewModel] GPU driver file '$driverPath' " +
+                if (deleted) "deleted" else "could not be deleted"
+        )
         driverData.removeAt(driverIndex)
         val safeSelectedPosition = selectedPosition.coerceIn(0, driverData.size)
         onDriverSelected(safeSelectedPosition)
     }
 
     fun onDriverAdded(driver: Pair<String, GpuDriverMetadata>) {
-        if (driversToDelete.contains(driver.first)) {
-            driversToDelete.remove(driver.first)
-        }
-
         val existingDriverIndex = driverData.indexOfFirst {
             it.first == driver.first || it.second == driver.second
         }
@@ -207,14 +207,6 @@ class DriverViewModel : ViewModel() {
                 NativeConfig.unloadPerGameConfig()
                 NativeConfig.reloadGlobalConfig()
             }
-
-            driversToDelete.forEach {
-                val driver = File(it)
-                if (driver.exists()) {
-                    driver.delete()
-                }
-            }
-            driversToDelete.clear()
         } finally {
             activeGame = null
             _isDeletingDrivers.value = false

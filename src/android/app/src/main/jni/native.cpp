@@ -97,6 +97,7 @@ extern "C" {
 #include <unistd.h>
 
 #include "jni/crash_report.h"
+#include "jni/gpu_driver_check.h"
 #include "jni/shader_file_scan.h"
 #include "common/fs/fs_paths.h"
 #include "common/preforged_debug.h"
@@ -193,15 +194,19 @@ void EmulationSession::InitializeGpuDriver(const std::string& hook_lib_dir,
             RTLD_NOW, featureFlags | ADRENOTOOLS_DRIVER_CUSTOM, nullptr, hook_lib_dir.c_str(),
             custom_driver_dir.c_str(), custom_driver_name.c_str(), file_redirect_dir_, nullptr);
         // Without this line a driver that fails to load looks like the system driver was chosen.
+        // This only sets up Vulkan's loader to use it; the driver itself loads when Vulkan
+        // starts, which LogCustomDriverCheck below checks.
         const char* const reason = handle ? nullptr : dlerror();
         LOG_INFO(Frontend, "[Preforged] GPU driver: custom driver {} in {}: {}{}",
                  custom_driver_name, custom_driver_dir,
-                 handle ? "loaded" : "failed to load, using the system driver",
+                 handle ? "set up" : "could not be set up, using the system driver",
                  reason ? fmt::format(" ({})", reason) : std::string{});
     } else {
         LOG_INFO(Frontend, "[Preforged] GPU driver: no custom driver installed, using the "
                            "system driver");
     }
+
+    const bool custom_handle = handle != nullptr;
 
     // Try to load the system driver.
     if (!handle) {
@@ -210,6 +215,9 @@ void EmulationSession::InitializeGpuDriver(const std::string& hook_lib_dir,
     }
 
     m_vulkan_library = std::make_shared<Common::DynamicLibrary>(handle);
+    if (custom_handle) {
+        Preforged::LogCustomDriverCheck(*m_vulkan_library, custom_driver_dir, custom_driver_name);
+    }
 #endif
 }
 

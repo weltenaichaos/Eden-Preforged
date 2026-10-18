@@ -20,6 +20,8 @@ add_library(yuzu-android SHARED
     native_post_processing.cpp
     crash_report.cpp
     crash_report.h
+    gpu_driver_check.cpp
+    gpu_driver_check.h
     shader_file_scan.cpp
     shader_file_scan.h
     unreal_links.cpp
