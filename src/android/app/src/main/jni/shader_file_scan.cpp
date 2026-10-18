@@ -21,6 +21,7 @@
 #include <fmt/ranges.h>
 
 #include "common/cityhash.h"
+#include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -499,10 +500,25 @@ public:
         }
         LOG_INFO(Frontend,
                  "[ShaderScan] Unreal packages: {} ({} with compressed parts), {} compressed "
-                 "parts, blocks: {}; {} MiB packed unpacked into {} MiB",
+                 "parts, blocks: {}; {} MiB packed unpacked into {} MiB in {} ms",
                  stats.packages, stats.compressed_packages, stats.parts,
                  blocks.empty() ? std::string{"none"} : blocks, stats.packed_bytes >> 20,
-                 stats.unpacked_bytes >> 20);
+                 stats.unpacked_bytes >> 20,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(stats.unpack_time).count());
+        std::string oodle;
+        for (size_t compressor = 0; compressor < stats.oodle_compressors.size(); ++compressor) {
+            if (stats.oodle_compressors[compressor] != 0) {
+                oodle += fmt::format("{}{} ({}) {}", oodle.empty() ? "" : ", ",
+                                     Preforged::Unreal::OodleCompressorName(compressor),
+                                     compressor, stats.oodle_compressors[compressor]);
+            }
+        }
+        if (!oodle.empty()) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal Oodle blocks by decoder: {}", oodle);
+        }
+        for (const std::string& example : stats.oodle_examples) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal Oodle block that did not unpack: {}", example);
+        }
         for (const std::string& example : stats.header_examples) {
             LOG_INFO(Frontend, "[ShaderScan] Unreal package header: {}", example);
         }
@@ -1031,7 +1047,8 @@ private:
                 [&](std::span<const u8> piece, u64 offset) {
                     SearchShaders(piece, unpacked_name, offset);
                     return !Stopped();
-                });
+                },
+                Common::Preforged::Options().unpack_oodle);
             if (unpacked) {
                 return;
             }
@@ -1376,6 +1393,30 @@ private:
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
+/// Lists every file the game sees with its size, sorted by path, one per line. An update or a
+/// mod changes the list.
+void ListGameFiles(const FileSys::VirtualDir& dir, const std::string& path, std::string& out,
+                   size_t& count) {
+    if (!dir) {
+        return;
+    }
+    std::vector<std::pair<std::string, size_t>> files;
+    for (const auto& file : dir->GetFiles()) {
+        files.emplace_back(file->GetName(), file->GetSize());
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto& [name, size] : files) {
+        out += fmt::format("{}/{} {}\n", path, name, size);
+    }
+    count += files.size();
+    std::vector<FileSys::VirtualDir> subdirs = dir->GetSubdirectories();
+    std::sort(subdirs.begin(), subdirs.end(),
+              [](const auto& a, const auto& b) { return a->GetName() < b->GetName(); });
+    for (const auto& subdir : subdirs) {
+        ListGameFiles(subdir, path + "/" + subdir->GetName(), out, count);
+    }
+}
+
 } // namespace
 
 void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token stop,
@@ -1383,18 +1424,47 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto start_time = std::chrono::steady_clock::now();
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
                             fmt::format("{:016x}", program_id);
-    // v9: runs once more for every game, since it now unpacks Unreal Engine packages.
-    const auto done_marker = shader_dir / "shader_scan_done_v9";
+    // v10: runs once more, since it now unpacks Oodle blocks too. The marker holds an id of the
+    // game files the search read, so it runs again when an update or a mod changes them.
+    const auto done_marker = shader_dir / "shader_scan_done_v10";
     std::error_code error;
     const auto& options = Common::Preforged::Options();
     if (!options.scan_game_files) {
         LOG_INFO(Frontend, "[ShaderScan] switched off in the settings");
         return;
     }
-    if (std::filesystem::exists(done_marker, error) && !options.rescan_game_files) {
-        LOG_INFO(Frontend, "[ShaderScan] already ran for this game, delete {} to run it again",
-                 Common::FS::PathToUTF8String(done_marker));
+
+    FileSys::RomFSFactory factory{system.GetAppLoader(), system.GetContentProvider(),
+                                  system.GetFileSystemController()};
+    const FileSys::VirtualFile romfs = factory.OpenCurrentProcess(program_id);
+    const FileSys::VirtualDir root = romfs ? FileSys::ExtractRomFS(romfs) : nullptr;
+    if (!root) {
+        LOG_INFO(Frontend, "[ShaderScan] could not open the game's RomFS");
         return;
+    }
+    std::string file_list;
+    size_t file_count = 0;
+    ListGameFiles(root, "", file_list, file_count);
+    const std::string files_id =
+        fmt::format("{:016x}", Common::CityHash64(file_list.data(), file_list.size()));
+    LOG_INFO(Frontend, "[ShaderScan] game files: {} files, id {}, opened and listed in {} ms",
+             file_count, files_id,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start_time)
+                 .count());
+    if (std::filesystem::exists(done_marker, error) && !options.rescan_game_files) {
+        const std::string searched_id =
+            Common::FS::ReadStringFromFile(done_marker, Common::FS::FileType::TextFile);
+        if (searched_id == files_id) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] already ran for these game files, delete {} to run it again",
+                     Common::FS::PathToUTF8String(done_marker));
+            return;
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] the game files changed since the last search (id {}), for "
+                 "example by an update or a mod, so it runs again",
+                 searched_id.empty() ? std::string{"none"} : searched_id);
     }
 
     // Read from a copy, because a damaged cache file is deleted while it is read.
@@ -1415,18 +1485,10 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         return;
     }
 
-    FileSys::RomFSFactory factory{system.GetAppLoader(), system.GetContentProvider(),
-                                  system.GetFileSystemController()};
-    const FileSys::VirtualFile romfs = factory.OpenCurrentProcess(program_id);
-    const FileSys::VirtualDir root = romfs ? FileSys::ExtractRomFS(romfs) : nullptr;
-    if (!root) {
-        LOG_INFO(Frontend, "[ShaderScan] could not open the game's RomFS");
-        return;
-    }
     LOG_INFO(Frontend, "[ShaderScan] searching game files for {} cached shaders", shaders.size());
 
     // Mark the scan as done up front, so a crash during it never blocks the game twice.
-    void(Common::FS::NewFile(done_marker));
+    void(Common::FS::WriteStringToFile(done_marker, Common::FS::FileType::TextFile, files_id));
 
     Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
     scanner.SetProgress(&progress, std::max<size_t>(Scanner::CountFiles(root, "") + 1, 2));

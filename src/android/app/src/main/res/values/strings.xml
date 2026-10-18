@@ -667,7 +667,7 @@
     <string name="preforged_bake_driver_constants">Bake constant buffer into shaders</string>
     <string name="preforged_bake_driver_constants_description">Bakes constant buffer 1 values into shaders like upstream Eden. Off lets shaders from the game files match the game\'s own. Restart the game after changing.</string>
     <string name="preforged_scan_game_files">Search game files for shaders</string>
-    <string name="preforged_scan_game_files_description">Searches each game\'s files for shaders once, on its first start.</string>
+    <string name="preforged_scan_game_files_description">Searches each game\'s files for shaders once, on its first start, and again when an update or a mod changes its files.</string>
     <string name="preforged_rescan_game_files">Search game files on every start</string>
     <string name="preforged_rescan_game_files_description">Repeats the game file search on every start while on. Takes a few minutes.</string>
     <string name="preforged_precompile_game_shaders">Compile shaders from game files</string>
@@ -693,7 +693,9 @@
     <string name="preforged_start_after_loading">Start the game after loading</string>
     <string name="preforged_start_after_loading_description">Starts running the game only once the game file search, the shaders and the CPU code have loaded. Off starts it while they load, which can corrupt what the game reads from its files during the game file search. Takes effect when a game starts.</string>
     <string name="preforged_unpack_unreal_packages">Unpack Unreal Engine packages</string>
-    <string name="preforged_unpack_unreal_packages_description">During the game file search, unpacks the compressed parts of Unreal Engine packages (zlib, LZO, LZ4 and zstd) and searches them for shaders. Games built on the engine keep their shaders in these packages. Takes effect at the next game file search.</string>
+    <string name="preforged_unpack_unreal_packages_description">During the game file search, unpacks the compressed parts of Unreal Engine packages (zlib, LZO, LZ4, zstd and Oodle) and searches them for shaders. Games built on the engine keep their shaders in these packages. Takes effect at the next game file search.</string>
+    <string name="preforged_unpack_oodle">Unpack Oodle blocks</string>
+    <string name="preforged_unpack_oodle_description">Also unpacks the parts of those packages that are packed with Oodle (Kraken, Mermaid, Selkie and Leviathan), as in XCOM 2. Off leaves them packed. Takes effect at the next game file search.</string>
     <string name="preforged_limit_gpu_lag">Limit how far ahead of the GPU Eden runs</string>
     <string name="preforged_limit_gpu_lag_description">Waits for the GPU once it has 32 batches of work left to finish. Every waiting batch holds command buffers and queries that the GPU driver keeps in memory, and Eden never frees them, so without the limit, scenes that send many small batches can fill the memory until the app closes. Takes effect when a game starts.</string>
     <string name="preforged_merge_gpu_work">Merge GPU work while the GPU is behind</string>

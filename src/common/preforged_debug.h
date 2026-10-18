@@ -15,12 +15,14 @@ struct DebugOptions {
     /// Bakes the values of constant buffer 1 into shaders, as upstream Eden does. Off makes
     /// shaders built from the game files match the game's own.
     bool bake_driver_constants = false;
-    /// Searches the game files for shaders once per game.
+    /// Searches the game files for shaders once per game, and again when they change.
     bool scan_game_files = true;
     /// Searches the game files again on every start while on.
     bool rescan_game_files = false;
     /// Unpacks the compressed parts of Unreal Engine packages during the game file search.
     bool unpack_unreal_packages = true;
+    /// Unpacks the Oodle blocks of those packages too (Kraken, Mermaid, Selkie, Leviathan).
+    bool unpack_oodle = true;
     /// Compiles the shader pairs found in the game files while the game loads.
     bool precompile_game_shaders = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.

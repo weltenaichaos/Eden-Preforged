@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <optional>
 
@@ -10,6 +11,7 @@
 
 #include "common/lz4_compression.h"
 #include "common/zstd_compression.h"
+#include "jni/ooz/ooz.h"
 #include "jni/unreal_package.h"
 
 namespace Preforged::Unreal {
@@ -123,10 +125,21 @@ bool IsZstdFrame(std::span<const u8> in) {
     return in.size() >= 4 && in[0] == 0x28 && in[1] == 0xB5 && in[2] == 0x2F && in[3] == 0xFD;
 }
 
-/// Oodle streams start with a byte whose low six bits are 0x0C, followed by the compressor
-/// (Kraken 6, Mermaid 10, Selkie 11, Leviathan 12, Hydra 13, older ones below 6).
+/// Oodle streams start with a byte whose low six bits are 0x0C, followed by the decoder in the
+/// low seven bits (Kraken 6, Mermaid and Selkie 10, Leviathan 12, LZNA 5, BitKnit 11). The top
+/// bit marks streams with checksums, which unpack without checking them.
 bool IsOodleHeader(std::span<const u8> in) {
-    return in.size() >= 2 && (in[0] & 0x3F) == 0x0C && in[1] <= 0x0D;
+    return in.size() >= 2 && (in[0] & 0x3F) == 0x0C && (in[1] & 0x7F) <= 0x0D;
+}
+
+/// Unpacks an Oodle block with ooz. The decoder may read a little past its input, so it gets a
+/// copy with zeros after it. `out` must have Ooz::OUTPUT_SLACK bytes of room after it.
+bool DecompressOodle(std::span<const u8> in, std::span<u8> out) {
+    thread_local std::vector<u8> padded;
+    padded.assign(in.begin(), in.end());
+    padded.resize(in.size() + Ooz::OUTPUT_SLACK, 0);
+    const int size = Ooz::Kraken_Decompress(padded.data(), in.size(), out.data(), out.size());
+    return size >= 0 && static_cast<size_t>(size) == out.size();
 }
 
 bool Inflate(std::span<const u8> in, std::span<u8> out, bool raw) {
@@ -169,6 +182,8 @@ bool DecompressWith(Method method, std::span<const u8> in, std::span<u8> out) {
         return DecompressLz4(in, out);
     case Method::Zstd:
         return DecompressZstd(in, out);
+    case Method::Oodle:
+        return IsOodleHeader(in) && DecompressOodle(in, out);
     case Method::Stored:
         if (in.size() != out.size()) {
             return false;
@@ -181,8 +196,11 @@ bool DecompressWith(Method method, std::span<const u8> in, std::span<u8> out) {
 }
 
 /// Unpacks one block, trying the method that worked for the package's earlier blocks first.
-/// Returns the method that fit, or Oodle or Unknown when none did.
-Method DecompressBlock(std::span<const u8> in, std::span<u8> out, Method& last_method) {
+/// Oodle comes after the methods that check their data, since ooz was written for files it
+/// could trust: a block that only starts like Oodle reaches it only when nothing else unpacks
+/// it. Returns the method that fit, or OodleFailed or Unknown when none did.
+Method DecompressBlock(std::span<const u8> in, std::span<u8> out, Method& last_method,
+                       bool unpack_oodle) {
     if (in.size() == out.size()) {
         std::memcpy(out.data(), in.data(), in.size());
         return Method::Stored;
@@ -196,16 +214,18 @@ Method DecompressBlock(std::span<const u8> in, std::span<u8> out, Method& last_m
     if (last_method != Method::Unknown && DecompressWith(last_method, in, out)) {
         return last_method;
     }
-    if (IsOodleHeader(in)) {
-        return Method::Oodle;
-    }
     for (const Method method : {Method::Lzo, Method::Lz4, Method::Zlib}) {
         if (method != last_method && DecompressWith(method, in, out)) {
             last_method = method;
             return method;
         }
     }
-    return Method::Unknown;
+    const bool oodle = IsOodleHeader(in);
+    if (oodle && unpack_oodle && last_method != Method::Oodle && DecompressOodle(in, out)) {
+        last_method = Method::Oodle;
+        return Method::Oodle;
+    }
+    return oodle ? Method::OodleFailed : Method::Unknown;
 }
 
 /// Reads the length that follows a zero length code: each zero byte adds 255, and the first
@@ -241,9 +261,28 @@ const char* MethodName(Method method) {
     case Method::Stored:
         return "stored";
     case Method::Oodle:
-        return "Oodle (not supported)";
+        return "Oodle";
+    case Method::OodleFailed:
+        return "Oodle (did not unpack)";
     default:
         return "unknown";
+    }
+}
+
+const char* OodleCompressorName(size_t compressor) {
+    switch (compressor) {
+    case 5:
+        return "LZNA";
+    case 6:
+        return "Kraken";
+    case 10:
+        return "Mermaid or Selkie";
+    case 11:
+        return "BitKnit";
+    case 12:
+        return "Leviathan";
+    default:
+        return "other";
     }
 }
 
@@ -388,7 +427,8 @@ bool DecompressLzo1x(std::span<const u8> in, std::span<u8> out) {
 }
 
 bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& stats,
-            const std::function<bool(std::span<const u8> piece, u64 offset)>& consume) {
+            const std::function<bool(std::span<const u8> piece, u64 offset)>& consume,
+            bool unpack_oodle) {
     if (!IsPackage(data)) {
         return false;
     }
@@ -444,13 +484,25 @@ bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& 
             const std::span<const u8> in = data.subspan(block_pos, block.packed);
             block_pos += block.packed;
             const size_t old_size = buffer.size();
-            buffer.resize(old_size + block.unpacked);
+            // Room for the Oodle decoder, which may write a little past the block.
+            buffer.resize(old_size + block.unpacked + Ooz::OUTPUT_SLACK);
             const std::span<u8> out{buffer.data() + old_size, block.unpacked};
-            const Method method = DecompressBlock(in, out, last_method);
+            const auto unpack_start = std::chrono::steady_clock::now();
+            const Method method = DecompressBlock(in, out, last_method, unpack_oodle);
+            stats.unpack_time += std::chrono::steady_clock::now() - unpack_start;
+            buffer.resize(old_size + block.unpacked);
             ++stats.blocks[static_cast<size_t>(method)];
             stats.packed_bytes += block.packed;
-            if (method == Method::Oodle || method == Method::Unknown) {
+            if (IsOodleHeader(in)) {
+                ++stats.oodle_compressors[std::min<size_t>(in[1] & 0x7F, 15)];
+            }
+            if (method == Method::OodleFailed || method == Method::Unknown) {
                 buffer.resize(old_size);
+                if (method == Method::OodleFailed && unpack_oodle &&
+                    stats.oodle_examples.size() < EXAMPLES) {
+                    stats.oodle_examples.push_back(fmt::format(
+                        "{} -> {} bytes: {}", block.packed, block.unpacked, Hex(in, 16)));
+                }
                 if (method == Method::Unknown && stats.unknown_examples.size() < EXAMPLES) {
                     stats.unknown_examples.push_back(fmt::format(
                         "{} -> {} bytes: {}", block.packed, block.unpacked, Hex(in, 16)));
