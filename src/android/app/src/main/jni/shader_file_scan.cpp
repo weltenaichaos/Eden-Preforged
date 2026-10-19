@@ -1355,8 +1355,12 @@ public:
         links_studied = true;
         const auto start = std::chrono::steady_clock::now();
         std::vector<Preforged::Unreal::LinkSurvey::CodeHeader> code;
+        using Stage = Preforged::Unreal::LinkSurvey::Stage;
         for (const auto& [offset, header] : headers[file_ids.at(best + UNPACKED_SUFFIX)]) {
-            code.push_back({offset, header.hash});
+            code.push_back({offset, header.hash,
+                            header.stage == Shader::Stage::VertexB    ? Stage::Vertex
+                            : header.stage == Shader::Stage::Fragment ? Stage::Fragment
+                                                                      : Stage::Other});
         }
         std::vector<std::pair<u64, u64>> played;
         for (const auto& key : keys) {
@@ -1371,6 +1375,23 @@ public:
                  std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - start)
                      .count());
+        // Pairs the played pairs taught, for compiling them ahead of time.
+        const auto& learned = links->LearnedPairs();
+        if (learned.empty()) {
+            return;
+        }
+        if (!Common::Preforged::Options().unreal_learned_pairs) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: {} learned pairs not kept, the switch "
+                     "\"Pre-compile Unreal pairs learned from played ones\" is off",
+                     learned.size());
+            return;
+        }
+        const size_t before = program_pairs.size();
+        program_pairs.insert(learned.begin(), learned.end());
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {} learned pairs kept for pre-compiling ({} new)",
+                 learned.size(), program_pairs.size() - before);
     }
 
     void ReportUnrealLinks() const {

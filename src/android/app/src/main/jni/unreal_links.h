@@ -8,6 +8,7 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -19,9 +20,12 @@ namespace Preforged::Unreal {
 
 class LinkSurvey {
 public:
+    enum class Stage : u8 { Other, Vertex, Fragment };
+
     struct CodeHeader {
         u64 unpacked_offset; ///< Where Unpack handed out the code header
         u64 hash;            ///< The shader's hash, as in the pipeline cache
+        Stage stage;
     };
 
     /// `overlap` is how many bytes each piece handed to SearchPiece repeats from the one before.
@@ -46,6 +50,10 @@ public:
 
     /// Logs what SearchPiece found and how the packages' objects divide into classes.
     void Report() const;
+
+    /// Vertex and fragment shader hashes that a field the played pairs share ties together,
+    /// most likely first. Empty when StudyCodePackage found no such field.
+    [[nodiscard]] const std::vector<std::pair<u64, u64>>& LearnedPairs() const;
 
 private:
     struct Impl;

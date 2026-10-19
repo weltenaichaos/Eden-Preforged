@@ -27,6 +27,8 @@ struct DebugOptions {
     bool zstd_dictionaries = true;
     /// Logs how an Unreal game's packages refer to their shader code, during the search.
     bool log_unreal_links = true;
+    /// Keeps the shader pairs that log learns from the played pairs, for pre-compiling.
+    bool unreal_learned_pairs = true;
     /// Compiles the shader pairs found in the game files while the game loads.
     bool precompile_game_shaders = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.

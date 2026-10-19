@@ -949,6 +949,7 @@ struct Values {
     Setting<bool> preforged_unpack_oodle{linkage, true, "preforged_unpack_oodle", Category::Miscellaneous};
     Setting<bool> preforged_zstd_dictionaries{linkage, true, "preforged_zstd_dictionaries", Category::Miscellaneous};
     Setting<bool> preforged_log_unreal_links{linkage, true, "preforged_log_unreal_links", Category::Miscellaneous};
+    Setting<bool> preforged_unreal_learned_pairs{linkage, true, "preforged_unreal_learned_pairs", Category::Miscellaneous};
     Setting<u32, true> preforged_precompile_percent{linkage, 100, 0, 100, "preforged_compile_share", Category::Miscellaneous, Specialization::Scalar};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};

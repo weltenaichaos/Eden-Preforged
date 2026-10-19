@@ -409,6 +409,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_UNREAL_LEARNED_PAIRS,
+                    titleId = R.string.preforged_unreal_learned_pairs,
+                    descriptionId = R.string.preforged_unreal_learned_pairs_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description
