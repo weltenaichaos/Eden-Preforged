@@ -78,8 +78,8 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // searched is searched once more. 10: Oodle blocks in Unreal packages. 11: zstd files packed
 // with a dictionary (dictionaries looked for in files named like them first), the Unreal shader
 // link log. 12: Unreal shader pairs learned from the played ones, in the code package and in
-// the other packages.
-constexpr u32 SEARCH_VERSION = 12;
+// the other packages. 13: Unreal shader caches read for the pairs.
+constexpr u32 SEARCH_VERSION = 13;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
@@ -1395,6 +1395,39 @@ public:
                  learned.size(), program_pairs.size() - before);
     }
 
+    // Reads the shader caches of the Unreal packages searched so far, once the code package is
+    // read, and keeps the pairs they teach for compiling them ahead of time.
+    void StudyUnrealCaches() {
+        if (!links || !links_studied) {
+            return;
+        }
+        for (const auto& [name, file] : unreal_cache_files) {
+            if (stop.stop_requested() || !unreal_caches_read.insert(name).second) {
+                continue;
+            }
+            const std::vector<u8> data = file->ReadAllBytes();
+            links->StudyShaderCache(name, data, [this] { return stop.stop_requested(); });
+        }
+        const auto& learned = links->LearnedFromShaderCache();
+        if (learned.empty() || unreal_cache_pairs_kept) {
+            return;
+        }
+        unreal_cache_pairs_kept = true;
+        if (!Common::Preforged::Options().unreal_learned_pairs) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: {} pairs learned from the shader cache not kept, "
+                     "the switch \"Pre-compile Unreal pairs learned from played ones\" is off",
+                     learned.size());
+            return;
+        }
+        const size_t before = program_pairs.size();
+        program_pairs.insert(learned.begin(), learned.end());
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {} pairs learned from the shader cache kept for "
+                 "pre-compiling ({} new)",
+                 learned.size(), program_pairs.size() - before);
+    }
+
     void ReportUnrealLinks() const {
         if (links) {
             links->Report();
@@ -1530,6 +1563,10 @@ private:
                 const auto it = file_ids.find(name + UNPACKED_SUFFIX);
                 if (it != file_ids.end() && !headers[it->second].empty()) {
                     unreal_code_files.emplace(name, file);
+                }
+                // And those that hold a shader cache, to read once the code package is.
+                if (links->HoldsShaderCache(name)) {
+                    unreal_cache_files.emplace(name, file);
                 }
             }
         } else {
@@ -1927,6 +1964,9 @@ private:
     std::unique_ptr<Preforged::Unreal::LinkSurvey> links;
     bool links_studied = false;
     std::map<std::string, FileSys::VirtualFile> unreal_code_files;
+    std::map<std::string, FileSys::VirtualFile> unreal_cache_files;
+    std::set<std::string> unreal_caches_read;
+    bool unreal_cache_pairs_kept = false;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
@@ -2118,6 +2158,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.ScanDir(root, "", true);
     scanner.Report("shader-named files");
     scanner.StudyUnrealLinks(graphics_keys);
+    scanner.StudyUnrealCaches();
     if (!scanner.Stopped()) {
         scanner.ScanDir(root, "", false);
         scanner.Report("all files");
@@ -2127,6 +2168,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     // When the code is in a package the first pass didn't read, the other packages were
     // searched before it was known.
     scanner.StudyUnrealLinks(graphics_keys);
+    scanner.StudyUnrealCaches();
     scanner.ReportUnreal();
     scanner.ReportUnrealLinks();
     scanner.LearnUnrealLinksFromOtherPackages();

@@ -60,6 +60,18 @@ public:
     /// first. Call once, after all packages are searched.
     [[nodiscard]] const std::vector<std::pair<u64, u64>>& LearnFromOtherPackages();
 
+    /// Whether AddPackage saw an object of class ShaderCache in the package `name`.
+    [[nodiscard]] bool HoldsShaderCache(std::string_view name) const;
+
+    /// Reads the ShaderCache objects of a package, after StudyCodePackage: finds each shader's
+    /// entry by its reference to the code, the places of the shaders' ids, where else the ids
+    /// are, and learns pairs when the played pairs' ids meet there more than the controls'.
+    void StudyShaderCache(std::string_view name, std::span<const u8> file,
+                          const std::function<bool()>& stopped);
+
+    /// Vertex and fragment shader hashes StudyShaderCache tied together, most likely first.
+    [[nodiscard]] const std::vector<std::pair<u64, u64>>& LearnedFromShaderCache() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

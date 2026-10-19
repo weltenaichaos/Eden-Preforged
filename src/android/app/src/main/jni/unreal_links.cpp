@@ -56,6 +56,23 @@ constexpr u32 MIN_FOREIGN_INDEX = 64;
 constexpr auto ID_ONLY_SEARCH_TIME = std::chrono::seconds{20};
 constexpr size_t ID_EXAMPLES = 12;
 constexpr size_t ID_EXAMPLES_PER_CLASS = 3;
+/// Shader cache objects read per package; bytes of each shown; references to the code kept;
+/// how far before a reference its tag is looked for, and its ids before and after it.
+constexpr size_t MAX_CACHE_OBJECTS = 2;
+constexpr u64 CACHE_DUMP = 0x400;
+constexpr size_t MAX_CACHE_REFS = size_t{1} << 21;
+constexpr s32 CACHE_TAG_RANGE = 0x20;
+constexpr s32 CACHE_LOOK_BACK = 0x80;
+constexpr s32 CACHE_LOOK_AHEAD = 0x40;
+constexpr size_t CACHE_ID_WINDOWS = 6;
+constexpr size_t CACHE_SAMPLE = 2048;
+constexpr size_t CACHE_FRONTS = 4096;
+constexpr size_t CACHE_TAG_CANDIDATES = 3;
+constexpr int CACHE_ID_MIN_BITS = 16;
+/// The most ids between two shaders of a pair that are checked for being in one shader map.
+constexpr u32 CACHE_MAP_HITS = 256;
+/// How close the ids of a pair's two shaders are counted in a shader cache.
+constexpr std::array<u64, 7> CACHE_LIMITS{0x40, 0x100, 0x400, 0x1000, 0x4000, 0x10000, 0x40000};
 constexpr size_t NAMES_LOGGED = 4000;
 constexpr size_t EXAMPLES = 3;
 /// Bytes shown before and after the two references of a pair example.
@@ -116,6 +133,22 @@ u64 MixId(u64 value) {
 /// times fewer bytes of other data pass it, so the search for ids alone is about twice as fast.
 u64 MixId2(u64 value) {
     return ((value ^ (value >> 31)) * 0xBF58476D1CE4E5B9ULL) >> (64 - ID_FILTER_BITS);
+}
+
+/// Whether 8 bytes look like an id: random bits, not a small number, a name or a float.
+bool IdLike(u64 value) {
+    return std::popcount(value) >= CACHE_ID_MIN_BITS;
+}
+
+/// 8 bytes as a name of the package (index and number) when they can be one, else as hex.
+std::string KeyName(const Tables& tables, u64 key) {
+    const u32 index = static_cast<u32>(key);
+    const u32 number = static_cast<u32>(key >> 32);
+    if (index < tables.names.size() && number < 0x10000) {
+        return number == 0 ? tables.names[index]
+                           : fmt::format("{}_{}", tables.names[index], number - 1);
+    }
+    return fmt::format("0x{:016x}", key);
 }
 
 std::string Lower(std::string_view text) {
@@ -215,6 +248,22 @@ struct IdCandidates {
     std::vector<std::pair<u32, u32>> pairs;
     /// More were found than are kept.
     bool full = false;
+};
+
+/// A reference to a code header in a shader cache object.
+struct CacheRef {
+    u64 pos;
+    u32 code;
+};
+
+/// Vertex and fragment shader pairs whose ids were found close together, by (first kind << 48) |
+/// (second kind << 32) | distance, and the ids found by stage.
+struct CandidateStore {
+    std::unordered_map<u64, IdCandidates> buckets;
+    size_t count = 0;
+    /// More were found than are kept.
+    bool capped = false;
+    std::array<size_t, 3> hits{};
 };
 
 /// A shader or material object of the package being searched, as offsets in what Unpack
@@ -1574,7 +1623,9 @@ std::optional<Window> FindRecords(std::span<const u8> image, const std::vector<u
 }
 
 /// Where an id of a shader is: near its table entry, by its code header, or in its record.
-enum class IdSource : u8 { Entry, CodeHeader, Record };
+/// Where an id place is: by a table entry, by the code header, in the shader record, or before
+/// a shader cache entry's reference to the code (only read in the shader cache).
+enum class IdSource : u8 { Entry, CodeHeader, Record, CacheEntry };
 
 struct IdPlace {
     s32 at;
@@ -1702,16 +1753,18 @@ struct LinkSurvey::Impl {
     std::unordered_map<std::string, size_t> id_example_classes;
     std::map<std::pair<u32, u32>, PairFinds> finds;
     /// What the search for ids alone found: the played and control pairs, and all vertex and
-    /// fragment shader pairs close together by (first kind << 48) | (second kind << 32) |
-    /// distance.
+    /// fragment shader pairs close together.
     std::map<std::pair<u32, u32>, PairFinds> id_finds;
-    std::unordered_map<u64, IdCandidates> id_candidates;
-    size_t id_candidate_count = 0;
-    bool id_candidates_capped = false;
-    /// Ids of all shaders found there, by stage.
-    std::array<size_t, 3> all_id_hits{};
+    CandidateStore id_store;
     /// Pairs learned from them, for pre-compiling.
     std::vector<std::pair<u64, u64>> learned_elsewhere;
+    /// The control pairs, for the shader cache.
+    Controls study_controls;
+    /// Packages AddPackage saw a shader cache object in, and what reading those found.
+    std::set<std::string> cache_packages;
+    std::map<std::pair<u32, u32>, PairFinds> cache_finds;
+    CandidateStore cache_store;
+    std::vector<std::pair<u64, u64>> learned_cache;
 
     std::string KindName(u32 kind) const {
         if (kind < KIND_COUNT) {
@@ -1723,6 +1776,8 @@ struct LinkSurvey::Impl {
             return fmt::format("id at {:+#x} from the code header", place.at);
         case IdSource::Record:
             return fmt::format("id at {:+#x} in the shader record", place.at);
+        case IdSource::CacheEntry:
+            return fmt::format("id at {:+#x} from the shader cache entry's code offset", place.at);
         default:
             return fmt::format("id at {:+d} from the entry", place.at);
         }
@@ -1735,6 +1790,8 @@ struct LinkSurvey::Impl {
             return code_window.Read64(data, code, place.at);
         case IdSource::Record:
             return record_window ? record_window->Read64(data, code, place.at) : std::nullopt;
+        case IdSource::CacheEntry:
+            return std::nullopt;
         default: {
             const u64 entry = entries.empty() ? 0 : entries[code];
             const s64 pos = static_cast<s64>(entry) + place.at;
@@ -1753,6 +1810,8 @@ struct LinkSurvey::Impl {
             return code_window.At(code, place.at, 8);
         case IdSource::Record:
             return record_window ? record_window->At(code, place.at, 8) : std::nullopt;
+        case IdSource::CacheEntry:
+            return std::nullopt;
         default: {
             const u64 entry = entries.empty() ? 0 : entries[code];
             if (entry == 0 || static_cast<s64>(entry) + place.at < 0) {
@@ -2026,13 +2085,13 @@ struct LinkSurvey::Impl {
     /// which are sorted by position, by the two kinds and the distance, to learn the pairs of
     /// a link from once all packages are searched. Pairs whose vertex id is before `min_first`
     /// were kept with the piece before.
-    void KeepIdCandidates(const std::vector<Hit>& hits, u64 min_first) {
+    void KeepIdCandidates(CandidateStore& store, const std::vector<Hit>& hits, u64 min_first) {
         std::vector<u32> vertex;
         std::vector<u32> fragment;
         for (u32 i = 0; i < hits.size(); ++i) {
             const Stage stage = code_stages[hits[i].code];
             if (hits[i].pos >= min_first) {
-                ++all_id_hits[static_cast<size_t>(stage)];
+                ++store.hits[static_cast<size_t>(stage)];
             }
             if (stage == Stage::Vertex) {
                 vertex.push_back(i);
@@ -2061,13 +2120,13 @@ struct LinkSurvey::Impl {
                 if (distance > -8 && distance < 8) {
                     continue;
                 }
-                if (id_candidate_count >= MAX_ID_CANDIDATES) {
-                    id_candidates_capped = true;
+                if (store.count >= MAX_ID_CANDIDATES) {
+                    store.capped = true;
                     return;
                 }
                 const u64 key = (u64{first.kind} << 48) | (u64{second.kind} << 32) |
                                 static_cast<u32>(static_cast<s32>(distance));
-                IdCandidates& at = id_candidates[key];
+                IdCandidates& at = store.buckets[key];
                 if (at.full) {
                     continue;
                 }
@@ -2076,14 +2135,14 @@ struct LinkSurvey::Impl {
                     const size_t before = at.pairs.size();
                     std::sort(at.pairs.begin(), at.pairs.end());
                     at.pairs.erase(std::unique(at.pairs.begin(), at.pairs.end()), at.pairs.end());
-                    id_candidate_count -= before - at.pairs.size();
+                    store.count -= before - at.pairs.size();
                     if (at.pairs.size() >= MAX_ID_CANDIDATES_AT * 3 / 4) {
                         at.full = true;
                         continue;
                     }
                 }
                 at.pairs.emplace_back(first.code, second.code);
-                ++id_candidate_count;
+                ++store.count;
             }
         }
     }
@@ -2465,8 +2524,8 @@ struct LinkSurvey::Impl {
         const u64 key = (u64{chosen->kinds.first} << 48) | (u64{chosen->kinds.second} << 32) |
                         static_cast<u32>(static_cast<s32>(chosen->distance));
         std::vector<std::pair<u64, u64>> candidates;
-        const auto it = id_candidates.find(key);
-        if (it != id_candidates.end()) {
+        const auto it = id_store.buckets.find(key);
+        if (it != id_store.buckets.end()) {
             for (const auto& [vertex, fragment] : it->second.pairs) {
                 candidates.emplace_back(code_hashes[vertex], code_hashes[fragment]);
             }
@@ -2476,8 +2535,723 @@ struct LinkSurvey::Impl {
                                        "in other packages",
                                        KindName(chosen->kinds.first),
                                        KindName(chosen->kinds.second), chosen->distance),
-                           id_candidates_capped || (it != id_candidates.end() && it->second.full),
+                           id_store.capped || (it != id_store.buckets.end() && it->second.full),
                            start);
+    }
+
+    /// For each pair of `pairs`, the closest places of its vertex and fragment shader's ids in
+    /// `places` (positions by code header, sorted): the distance and the two positions, or
+    /// nothing when one of the two was not found.
+    static std::vector<std::optional<std::tuple<u64, u64, u64>>> ClosestPlaces(
+        std::span<const PairCopies> pairs,
+        const std::unordered_map<u32, std::vector<u64>>& places) {
+        std::vector<std::optional<std::tuple<u64, u64, u64>>> out;
+        out.reserve(pairs.size());
+        for (const PairCopies& pair : pairs) {
+            std::optional<std::tuple<u64, u64, u64>> best;
+            for (const u32 vertex : pair.vertex) {
+                const auto v = places.find(vertex);
+                if (v == places.end()) {
+                    continue;
+                }
+                for (const u32 fragment : pair.fragment) {
+                    const auto f = places.find(fragment);
+                    if (f == places.end()) {
+                        continue;
+                    }
+                    size_t j = 0;
+                    for (const u64 pv : v->second) {
+                        while (j + 1 < f->second.size() && f->second[j + 1] <= pv) {
+                            ++j;
+                        }
+                        for (size_t k = j; k < std::min(j + 2, f->second.size()); ++k) {
+                            const u64 pf = f->second[k];
+                            const u64 distance = pv > pf ? pv - pf : pf - pv;
+                            if (!best || distance < std::get<0>(*best)) {
+                                best.emplace(distance, pv, pf);
+                            }
+                        }
+                    }
+                }
+            }
+            out.push_back(best);
+        }
+        return out;
+    }
+
+    /// Reads one object of class ShaderCache. Unreal Engine 3 keeps each shader there once,
+    /// with an id, and the materials' shader maps list the ids of the shaders each material
+    /// draws with. Finds the entries by their reference to the code, the places of their ids,
+    /// where else in the object those ids are, and learns pairs when the played pairs' ids
+    /// meet there more than the control pairs' do.
+    void StudyCacheObject(std::span<const u8> data, const std::string& what, const Tables& tables,
+                          const std::function<bool()>& stopped) {
+        const auto start = std::chrono::steady_clock::now();
+        const u32 count = static_cast<u32>(codes.size());
+        for (u64 at = 0; at < std::min<u64>(data.size(), CACHE_DUMP); at += 0x80) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal links: {}: bytes at 0x{:x}: {}", what, at,
+                     Hex(data, at, 0x80));
+        }
+        // References to the code: 4 bytes holding a code header's offset from the first code.
+        // The first code's offset is 0, which is everywhere, so it is left out.
+        std::unordered_map<u32, u32> code_of_offset;
+        std::vector<u64> filter((size_t{1} << ID_FILTER_BITS) / 64, 0);
+        for (u32 code = 1; code < count; ++code) {
+            const u64 offset = codes[code] - first_code;
+            if (offset > 0xFFFFFFFFULL) {
+                continue;
+            }
+            code_of_offset.emplace(static_cast<u32>(offset), code);
+            const u64 bit = MixId(offset);
+            filter[bit >> 6] |= u64{1} << (bit & 63);
+        }
+        std::vector<CacheRef> refs;
+        size_t wide = 0;
+        for (u64 pos = 0; pos + 4 <= data.size(); ++pos) {
+            if ((pos & 0xFFFFF) == 0 && stopped()) {
+                return;
+            }
+            const u32 value = Load32(data.data() + pos);
+            if (value == 0) {
+                continue;
+            }
+            const u64 bit = MixId(value);
+            if (((filter[bit >> 6] >> (bit & 63)) & 1) == 0) {
+                continue;
+            }
+            const auto it = code_of_offset.find(value);
+            if (it == code_of_offset.end() || refs.size() >= MAX_CACHE_REFS) {
+                continue;
+            }
+            refs.push_back({pos, it->second});
+            wide += pos + 8 <= data.size() && Load32(data.data() + pos + 4) == 0 ? 1 : 0;
+        }
+        // The entries: the references with one 4-byte tag at one place before them, for the
+        // most different shaders. Small numbers elsewhere in the object can equal a code's
+        // offset too, but those name the same few codes again and again.
+        struct TagCandidate {
+            s32 at;
+            u32 value;
+            size_t count;
+        };
+        std::vector<TagCandidate> tag_candidates;
+        for (s32 r = -CACHE_TAG_RANGE; r <= -4; ++r) {
+            std::unordered_map<u32, size_t> values;
+            for (const CacheRef& ref : refs) {
+                if (static_cast<s64>(ref.pos) + r >= 0) {
+                    const u32 value = Load32(data.data() + ref.pos - static_cast<u64>(-r));
+                    if (value != 0) {
+                        ++values[value];
+                    }
+                }
+            }
+            std::vector<std::pair<size_t, u32>> by_count;
+            for (const auto& [value, n] : values) {
+                by_count.emplace_back(n, value);
+            }
+            const size_t top = std::min(by_count.size(), CACHE_TAG_CANDIDATES);
+            std::partial_sort(by_count.begin(), by_count.begin() + static_cast<s64>(top),
+                              by_count.end(), std::greater<>());
+            for (size_t i = 0; i < top; ++i) {
+                tag_candidates.push_back({r, by_count[i].second, by_count[i].first});
+            }
+        }
+        std::vector<std::vector<bool>> covered(tag_candidates.size(), std::vector<bool>(count));
+        std::vector<size_t> distinct(tag_candidates.size(), 0);
+        std::vector<bool> referenced(count);
+        size_t codes_referenced = 0;
+        for (const CacheRef& ref : refs) {
+            if (!referenced[ref.code]) {
+                referenced[ref.code] = true;
+                ++codes_referenced;
+            }
+            for (size_t c = 0; c < tag_candidates.size(); ++c) {
+                const TagCandidate& candidate = tag_candidates[c];
+                if (static_cast<s64>(ref.pos) + candidate.at >= 0 && !covered[c][ref.code] &&
+                    Load32(data.data() + ref.pos - static_cast<u64>(-candidate.at)) ==
+                        candidate.value) {
+                    covered[c][ref.code] = true;
+                    ++distinct[c];
+                }
+            }
+        }
+        s32 tag_at = 0;
+        u32 tag = 0;
+        size_t tagged = 0;
+        size_t tag_codes = 0;
+        for (size_t c = 0; c < tag_candidates.size(); ++c) {
+            if (distinct[c] > tag_codes ||
+                (distinct[c] == tag_codes && tag_candidates[c].count > tagged)) {
+                tag_codes = distinct[c];
+                tagged = tag_candidates[c].count;
+                tag = tag_candidates[c].value;
+                tag_at = tag_candidates[c].at;
+            }
+        }
+        std::vector<CacheRef> cache_entries;
+        const bool have_tag = tag_codes >= std::max<size_t>(64, codes_referenced / 4);
+        for (const CacheRef& ref : refs) {
+            if (!have_tag || (static_cast<s64>(ref.pos) + tag_at >= 0 &&
+                              Load32(data.data() + ref.pos - static_cast<u64>(-tag_at)) == tag)) {
+                cache_entries.push_back(ref);
+            }
+        }
+        std::unordered_map<s64, size_t> steps;
+        std::unordered_set<u64> entry_shaders;
+        std::unordered_set<u64> played_shaders;
+        for (const PairCopies& pair : played_copies) {
+            played_shaders.insert(code_hashes[pair.vertex.front()]);
+            played_shaders.insert(code_hashes[pair.fragment.front()]);
+        }
+        size_t played_found = 0;
+        size_t size_is_room = 0;
+        size_t size_fits = 0;
+        for (size_t i = 0; i < cache_entries.size(); ++i) {
+            const CacheRef& entry = cache_entries[i];
+            if (i > 0) {
+                ++steps[static_cast<s64>(entry.pos) - static_cast<s64>(cache_entries[i - 1].pos)];
+            }
+            const u64 hash = code_hashes[entry.code];
+            if (hash != 0 && entry_shaders.insert(hash).second && played_shaders.contains(hash)) {
+                ++played_found;
+            }
+            // Whether the 8 bytes after an 8-byte offset hold the code's size.
+            if (entry.pos + 16 <= data.size()) {
+                const u64 size = Load64(data.data() + entry.pos + 8);
+                const u64 room =
+                    (entry.code + 1 < count ? codes[entry.code + 1] : code_end) - codes[entry.code];
+                size_is_room += size == room ? 1 : 0;
+                size_fits += size > 0 && size < room ? 1 : 0;
+            }
+        }
+        std::string tag_text;
+        for (u32 b = 0; b < 4; ++b) {
+            const char c = static_cast<char>((tag >> (8 * b)) & 0xFF);
+            tag_text += std::isprint(static_cast<unsigned char>(c)) ? c : '.';
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {}: {} references to code headers by their offset "
+                 "from the first code ({} with 4 zero bytes after){}; {}: {} entries for {} "
+                 "different shaders ({} of {} played ones); steps between them: {}; the 8 bytes "
+                 "after the offset hold the room to the next code header for {}, a smaller size "
+                 "for {}",
+                 what, refs.size(), wide, refs.size() >= MAX_CACHE_REFS ? ", more not kept" : "",
+                 have_tag ? fmt::format("{} of them, for {} of the {} code headers named, have "
+                                        "0x{:08x} ('{}') {:+d} bytes before",
+                                        tagged, tag_codes, codes_referenced, tag, tag_text, tag_at)
+                          : fmt::format("no tag before the references to most code headers "
+                                        "(best 0x{:08x} at {:+d}, {} times, for {} of the {} "
+                                        "code headers named)",
+                                        tag, tag_at, tagged, tag_codes, codes_referenced),
+                 cache_entries.size(), entry_shaders.size(), played_found, played_shaders.size(),
+                 Top(steps, 8, [](s64 d, size_t n) { return fmt::format("{:+#x} x{}", d, n); }),
+                 size_is_room, size_fits);
+        const size_t entries_shown = std::min<size_t>(cache_entries.size(), 3);
+        for (size_t i = 0; i < entries_shown; ++i) {
+            const CacheRef& entry = cache_entries[i * cache_entries.size() / entries_shown];
+            const u64 from = entry.pos >= 0x80 ? entry.pos - 0x80 : 0;
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: {}: entry of code header #{} (hash {:016x}) at "
+                     "0x{:x}: bytes from 0x{:x}: {}",
+                     what, entry.code, code_hashes[entry.code], entry.pos, from,
+                     Hex(data, from, 0xc0));
+        }
+        if (cache_entries.size() < 64 || stopped()) {
+            return;
+        }
+        // The places near the offset whose 8 bytes differ per shader may be its ids: the
+        // shader each value there belongs to, or TAKEN when two shaders have it.
+        constexpr u64 TAKEN = ~u64{0};
+        const auto owners_at = [&](s32 d) {
+            std::unordered_map<u64, u64> owner;
+            for (const CacheRef& entry : cache_entries) {
+                const s64 pos = static_cast<s64>(entry.pos) + d;
+                if (pos < 0 || static_cast<u64>(pos) + 8 > data.size()) {
+                    continue;
+                }
+                const u64 value = Load64(data.data() + static_cast<u64>(pos));
+                if (!IdLike(value)) {
+                    continue;
+                }
+                const u64 hash = code_hashes[entry.code] != 0 ? code_hashes[entry.code]
+                                                              : (u64{1} << 63) | entry.code;
+                const auto [it, inserted] = owner.try_emplace(value, hash);
+                if (!inserted && it->second != hash) {
+                    it->second = TAKEN;
+                }
+            }
+            return owner;
+        };
+        std::vector<std::pair<s32, size_t>> unique_at;
+        for (s32 d = -CACHE_LOOK_BACK; d <= CACHE_LOOK_AHEAD && !stopped(); ++d) {
+            if (d > -8 && d < 8) {
+                continue;
+            }
+            size_t unique = 0;
+            for (const auto& [value, hash] : owners_at(d)) {
+                unique += hash != TAKEN ? 1 : 0;
+            }
+            if (unique * 10 >= entry_shaders.size() * 9) {
+                unique_at.emplace_back(d, unique);
+            }
+        }
+        // Which of those places' values the object holds again somewhere else, from a sample
+        // of the entries, and how often the 8 bytes in front of them repeat. A shader map names
+        // a shader's kind and then its id, so the place where an id starts has the same few
+        // values in front of it wherever it is found again.
+        struct SampleId {
+            u64 value;
+            u64 own;
+            u32 place;
+            u32 found;
+            u64 front;
+        };
+        std::vector<SampleId> sample;
+        const size_t sample_step = std::max<size_t>(1, cache_entries.size() / CACHE_SAMPLE);
+        for (u32 p = 0; p < unique_at.size(); ++p) {
+            for (size_t i = 0; i < cache_entries.size(); i += sample_step) {
+                const s64 pos = static_cast<s64>(cache_entries[i].pos) + unique_at[p].first;
+                if (pos < 0 || static_cast<u64>(pos) + 8 > data.size()) {
+                    continue;
+                }
+                const u64 value = Load64(data.data() + static_cast<u64>(pos));
+                if (IdLike(value)) {
+                    sample.push_back({value, static_cast<u64>(pos), p, 0, 0});
+                }
+            }
+        }
+        // A value in the sample twice is no id of one shader.
+        std::sort(sample.begin(), sample.end(),
+                  [](const SampleId& x, const SampleId& y) { return x.value < y.value; });
+        {
+            std::vector<SampleId> single;
+            single.reserve(sample.size());
+            for (size_t i = 0; i < sample.size();) {
+                size_t j = i + 1;
+                while (j < sample.size() && sample[j].value == sample[i].value) {
+                    ++j;
+                }
+                if (j == i + 1) {
+                    single.push_back(sample[i]);
+                }
+                i = j;
+            }
+            sample = std::move(single);
+        }
+        std::vector<u64> sample_bits((size_t{1} << ID_FILTER_BITS) / 64, 0);
+        for (const SampleId& id : sample) {
+            const u64 bit = MixId(id.value);
+            const u64 bit2 = MixId2(id.value);
+            sample_bits[bit >> 6] |= u64{1} << (bit & 63);
+            sample_bits[bit2 >> 6] |= u64{1} << (bit2 & 63);
+        }
+        for (u64 pos = 0; pos + 8 <= data.size(); ++pos) {
+            if ((pos & 0xFFFFF) == 0 && stopped()) {
+                return;
+            }
+            const u64 value = Load64(data.data() + pos);
+            const u64 bit = MixId(value);
+            const u64 bit2 = MixId2(value);
+            if (((sample_bits[bit >> 6] >> (bit & 63)) & 1) == 0 ||
+                ((sample_bits[bit2 >> 6] >> (bit2 & 63)) & 1) == 0) {
+                continue;
+            }
+            const auto it = std::lower_bound(sample.begin(), sample.end(), value,
+                                             [](const SampleId& x, u64 v) { return x.value < v; });
+            if (it == sample.end() || it->value != value || it->own == pos) {
+                continue;
+            }
+            if (it->found++ == 0 && pos >= 8) {
+                it->front = Load64(data.data() + pos - 8);
+            }
+        }
+        // Per place: how many of its sampled ids are found again, how often in all, and how
+        // many of them have in front of them a value that is in front of another one too.
+        std::vector<size_t> again(unique_at.size(), 0);
+        std::vector<size_t> again_ids(unique_at.size(), 0);
+        std::vector<std::unordered_map<u64, size_t>> fronts(unique_at.size());
+        for (const SampleId& id : sample) {
+            if (id.found == 0) {
+                continue;
+            }
+            again[id.place] += id.found;
+            ++again_ids[id.place];
+            if (id.front != 0 && fronts[id.place].size() < CACHE_FRONTS) {
+                ++fronts[id.place][id.front];
+            }
+        }
+        std::vector<size_t> score(unique_at.size(), 0);
+        for (size_t p = 0; p < unique_at.size(); ++p) {
+            for (const auto& [front, n] : fronts[p]) {
+                score[p] += n >= 2 ? n : 0;
+            }
+        }
+        std::vector<size_t> order(unique_at.size());
+        std::iota(order.begin(), order.end(), size_t{0});
+        std::sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+            if (score[x] != score[y]) {
+                return score[x] > score[y];
+            }
+            if (again_ids[x] != again_ids[y]) {
+                return again_ids[x] > again_ids[y];
+            }
+            return std::abs(unique_at[x].first) < std::abs(unique_at[y].first);
+        });
+        std::string sampled;
+        for (size_t i = 0; i < std::min<size_t>(order.size(), 8); ++i) {
+            const size_t p = order[i];
+            sampled += fmt::format(
+                "{}{:+#x}: {} found again, {} times in all, {} with a value in front that "
+                "another one has too ({})",
+                sampled.empty() ? "" : "; ", unique_at[p].first, again_ids[p], again[p], score[p],
+                Top(fronts[p], 3, [&](u64 key, size_t n) {
+                    return fmt::format("{} x{}", KeyName(tables, key), n);
+                }));
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {}: {} ids of {} of the entries looked for at {} "
+                 "places, best first: {}",
+                 what, sample.size(), cache_entries.size() / sample_step, unique_at.size(),
+                 sampled.empty() ? std::string{"none"} : sampled);
+        // The places whose ids are found again, those with kinds in front first. Places less
+        // than 8 bytes from a chosen one hold the same field.
+        const size_t best_score = order.empty() ? 0 : score[order.front()];
+        const size_t min_score = best_score >= 16 ? std::max<size_t>(16, best_score / 10) : 0;
+        std::vector<size_t> chosen;
+        for (const size_t p : order) {
+            if (chosen.size() >= CACHE_ID_WINDOWS) {
+                break;
+            }
+            if (again_ids[p] == 0 || score[p] < min_score) {
+                continue;
+            }
+            if (std::ranges::all_of(chosen, [&](size_t c) {
+                    return std::abs(unique_at[c].first - unique_at[p].first) >= 8;
+                })) {
+                chosen.push_back(p);
+            }
+        }
+        std::string places;
+        for (const size_t c : chosen) {
+            places += fmt::format("{}{:+#x}", places.empty() ? "" : ", ", unique_at[c].first);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {}: 8 bytes that differ per shader at {} places "
+                 "from {:+#x} to {:+#x} around the offset; ids looked for at {}",
+                 what, unique_at.size(), -CACHE_LOOK_BACK, CACHE_LOOK_AHEAD,
+                 places.empty() ? std::string{"none (none found again)"} : places);
+        if (chosen.empty()) {
+            return;
+        }
+        // The ids, and the places they hold in the entries, which are no references.
+        std::unordered_map<u64, std::vector<std::pair<u32, u32>>> cache_ids;
+        std::vector<u64> id_bits((size_t{1} << ID_FILTER_BITS) / 64, 0);
+        std::vector<u64> own;
+        std::vector<u32> kinds;
+        for (const size_t c : chosen) {
+            const s32 d = unique_at[c].first;
+            const u32 kind = KIND_COUNT + static_cast<u32>(windows.size());
+            windows.push_back({d, IdSource::CacheEntry});
+            kinds.push_back(kind);
+            const std::unordered_map<u64, u64> owner = owners_at(d);
+            for (const CacheRef& entry : cache_entries) {
+                const s64 pos = static_cast<s64>(entry.pos) + d;
+                if (pos < 0 || static_cast<u64>(pos) + 8 > data.size()) {
+                    continue;
+                }
+                own.push_back(static_cast<u64>(pos));
+                const u64 value = Load64(data.data() + static_cast<u64>(pos));
+                const auto it = owner.find(value);
+                if (it == owner.end() || it->second == TAKEN) {
+                    continue;
+                }
+                cache_ids[value].emplace_back(entry.code, kind);
+                const u64 bit = MixId(value);
+                const u64 bit2 = MixId2(value);
+                id_bits[bit >> 6] |= u64{1} << (bit & 63);
+                id_bits[bit2 >> 6] |= u64{1} << (bit2 & 63);
+            }
+        }
+        std::sort(own.begin(), own.end());
+        std::vector<Hit> hits;
+        for (u64 pos = 0; pos + 8 <= data.size(); ++pos) {
+            if ((pos & 0xFFFFF) == 0 && stopped()) {
+                return;
+            }
+            const u64 value = Load64(data.data() + pos);
+            const u64 bit = MixId(value);
+            const u64 bit2 = MixId2(value);
+            if (((id_bits[bit >> 6] >> (bit & 63)) & 1) == 0 ||
+                ((id_bits[bit2 >> 6] >> (bit2 & 63)) & 1) == 0) {
+                continue;
+            }
+            const auto it = cache_ids.find(value);
+            if (it == cache_ids.end() || std::binary_search(own.begin(), own.end(), pos)) {
+                continue;
+            }
+            for (const auto& [code, kind] : it->second) {
+                if (hits.size() < MAX_PIECE_HITS) {
+                    hits.push_back({pos, kind, code});
+                }
+            }
+        }
+        // Where each place's ids are found again, and what the 8 bytes before them are: a
+        // shader map lists a shader by its kind's name and then its id.
+        std::unordered_map<u32, std::vector<u64>> places_of;
+        for (const u32 kind : kinds) {
+            size_t found = 0;
+            std::unordered_set<u32> shaders;
+            size_t played_codes = 0;
+            std::unordered_map<std::string, size_t> before;
+            for (const Hit& hit : hits) {
+                if (hit.kind != kind) {
+                    continue;
+                }
+                ++found;
+                if (shaders.insert(hit.code).second && played_role[hit.code] != 0) {
+                    ++played_codes;
+                }
+                if (hit.pos >= 8) {
+                    ++before[KeyName(tables, Load64(data.data() + hit.pos - 8))];
+                }
+            }
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: {}: {}: found again {} times, for {} code "
+                     "headers ({} of them played); 8 bytes before: {}",
+                     what, KindName(kind), found, shaders.size(), played_codes,
+                     Top(before, 6, [](const std::string& key, size_t n) {
+                         return fmt::format("{} x{}", key, n);
+                     }));
+        }
+        for (const Hit& hit : hits) {
+            places_of[hit.code].push_back(hit.pos);
+        }
+        for (auto& [code, list] : places_of) {
+            std::sort(list.begin(), list.end());
+            list.erase(std::unique(list.begin(), list.end()), list.end());
+        }
+        const size_t hits_shown = std::min<size_t>(hits.size(), 4);
+        for (size_t i = 0; i < hits_shown; ++i) {
+            const Hit& hit = hits[i * hits.size() / hits_shown];
+            const u64 from = hit.pos >= 0x60 ? hit.pos - 0x60 : 0;
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: {}: {} of code header #{} found at 0x{:x}: "
+                     "bytes from 0x{:x}: {}",
+                     what, KindName(hit.kind), hit.code, hit.pos, from, Hex(data, from, 0xc0));
+        }
+        // How close the two shaders' ids of the played pairs are, against the controls.
+        const auto closest_played = ClosestPlaces(played_copies, places_of);
+        std::array<std::array<size_t, CACHE_LIMITS.size()>, PAIR_GROUPS> within{};
+        std::array<size_t, PAIR_GROUPS> missing{};
+        const std::array<std::span<const PairCopies>, PAIR_GROUPS> groups{
+            played_copies, study_controls.shuffled, study_controls.shifted};
+        for (size_t g = 0; g < PAIR_GROUPS; ++g) {
+            const auto closest = g == 0 ? closest_played : ClosestPlaces(groups[g], places_of);
+            for (const auto& best : closest) {
+                if (!best) {
+                    ++missing[g];
+                    continue;
+                }
+                for (size_t l = 0; l < CACHE_LIMITS.size(); ++l) {
+                    within[g][l] += std::get<0>(*best) <= CACHE_LIMITS[l] ? 1 : 0;
+                }
+            }
+        }
+        std::string closeness;
+        static constexpr std::array<const char*, PAIR_GROUPS> GROUP_NAMES{"played", "shuffled",
+                                                                          "moved"};
+        for (size_t g = 0; g < PAIR_GROUPS; ++g) {
+            closeness +=
+                fmt::format("{}{} {}:", g == 0 ? "" : "; ", groups[g].size(), GROUP_NAMES[g]);
+            for (size_t l = 0; l < CACHE_LIMITS.size(); ++l) {
+                closeness += fmt::format(" up to 0x{:x} {},", CACHE_LIMITS[l], within[g][l]);
+            }
+            closeness += fmt::format(" not both found {}", missing[g]);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {}: how close the ids of a pair's two shaders are "
+                 "found: {}",
+                 what, closeness);
+        // A link at one distance, as in the other packages.
+        Pair(cache_finds, hits, data, what, 0, 0, false);
+        KeepIdCandidates(cache_store, hits, 0);
+        const size_t need = std::max<size_t>(10, played_copies.size() / 10);
+        // Pairs by closeness first: a link at one distance finds only the pairs of one kind, or
+        // those whose shaders the maps list in one order.
+        std::vector<std::pair<u64, u64>> candidates;
+        std::vector<std::string> ways;
+        bool capped = false;
+        LearnByCloseness(data, what, tables, hits, closest_played, within, need, candidates, ways,
+                         capped);
+        if (const std::optional<LinkCount> link =
+                ChooseLink(cache_finds, played_copies.size(), "in the shader cache");
+            link && candidates.empty()) {
+            const u64 key = (u64{link->kinds.first} << 48) | (u64{link->kinds.second} << 32) |
+                            static_cast<u32>(static_cast<s32>(link->distance));
+            const auto it = cache_store.buckets.find(key);
+            if (it != cache_store.buckets.end()) {
+                for (const auto& [vertex, fragment] : it->second.pairs) {
+                    candidates.emplace_back(code_hashes[vertex], code_hashes[fragment]);
+                }
+            }
+            capped = cache_store.capped || (it != cache_store.buckets.end() && it->second.full);
+            ways.push_back(fmt::format("vertex by {}, fragment by {} {:+d} bytes on",
+                                       KindName(link->kinds.first), KindName(link->kinds.second),
+                                       link->distance));
+        }
+        if (candidates.empty()) {
+            return;
+        }
+        std::string joined;
+        for (const std::string& way : ways) {
+            joined += fmt::format("{}{}", joined.empty() ? "" : " and ", way);
+        }
+        learned_cache =
+            RankLearned(std::move(candidates), played_copies, code_hashes,
+                        fmt::format("learned link in the shader cache: {}", joined), capped, start);
+    }
+
+    /// Whether the ids between two hits, both included, name one kind of shader twice: a
+    /// shader map lists one shader of a kind, so then the two are in different maps.
+    static bool CrossesMaps(std::span<const u8> data, const std::vector<Hit>& hits, u32 a, u32 b) {
+        const u32 from = std::min(a, b);
+        const u32 to = std::max(a, b);
+        if (to - from > CACHE_MAP_HITS) {
+            return false;
+        }
+        std::vector<u64> kinds;
+        for (u32 i = from; i <= to; ++i) {
+            if (hits[i].pos < 8 || (i > from && hits[i].pos == hits[i - 1].pos)) {
+                continue;
+            }
+            const u64 kind = Load64(data.data() + hits[i].pos - 8);
+            if (std::ranges::find(kinds, kind) != kinds.end()) {
+                return true;
+            }
+            kinds.push_back(kind);
+        }
+        return false;
+    }
+
+    /// Shader maps list a material's shaders together, but not in a fixed order. When the
+    /// played pairs' ids are much closer than the controls', the kinds of shader that pair,
+    /// named by the 8 bytes before each id, tell which of the close ids pair: each vertex
+    /// shader id pairs with the closest fragment shader id before it and after it of each kind
+    /// its kind pairs with, as a map holds one shader of a kind.
+    void LearnByCloseness(
+        std::span<const u8> data, const std::string& what, const Tables& tables,
+        const std::vector<Hit>& hits,
+        const std::vector<std::optional<std::tuple<u64, u64, u64>>>& closest_played,
+        const std::array<std::array<size_t, CACHE_LIMITS.size()>, PAIR_GROUPS>& within, size_t need,
+        std::vector<std::pair<u64, u64>>& candidates, std::vector<std::string>& ways,
+        bool& capped) {
+        // The distance that holds the most played pairs while they are still five times the
+        // controls.
+        std::optional<size_t> limit;
+        for (size_t l = 0; l < CACHE_LIMITS.size(); ++l) {
+            const size_t controls = std::max(within[ShuffledGroup][l], within[MovedGroup][l]);
+            if (within[PlayedGroup][l] >= need &&
+                within[PlayedGroup][l] >= 5 * std::max<size_t>(controls, 1) &&
+                (!limit || within[PlayedGroup][l] > within[PlayedGroup][*limit])) {
+                limit = l;
+            }
+        }
+        if (!limit) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: {}: the played pairs' ids are not {} or more "
+                     "times close together where the controls' are few, so no pairs are learned "
+                     "by closeness",
+                     what, need);
+            return;
+        }
+        const u64 window = CACHE_LIMITS[*limit];
+        std::map<std::pair<u64, u64>, size_t> kinds_played;
+        for (const auto& best : closest_played) {
+            if (best && std::get<0>(*best) <= window && std::get<1>(*best) >= 8 &&
+                std::get<2>(*best) >= 8) {
+                ++kinds_played[{Load64(data.data() + std::get<1>(*best) - 8),
+                                Load64(data.data() + std::get<2>(*best) - 8)}];
+            }
+        }
+        std::set<std::pair<u64, u64>> kept_kinds;
+        std::vector<std::pair<size_t, std::pair<u64, u64>>> by_count;
+        for (const auto& [kinds_pair, n] : kinds_played) {
+            if (n >= 2) {
+                kept_kinds.insert(kinds_pair);
+            }
+            by_count.emplace_back(n, kinds_pair);
+        }
+        std::sort(by_count.rbegin(), by_count.rend());
+        std::string shown;
+        for (size_t i = 0; i < std::min<size_t>(by_count.size(), 8); ++i) {
+            shown += fmt::format("{}{} + {} x{}", shown.empty() ? "" : "; ",
+                                 KeyName(tables, by_count[i].second.first),
+                                 KeyName(tables, by_count[i].second.second), by_count[i].first);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {}: played pairs' ids within 0x{:x} bytes, by the 8 "
+                 "bytes before the vertex and the fragment shader's id: {} kinds, {} of them "
+                 "with 2 or more pairs: {}",
+                 what, window, kinds_played.size(), kept_kinds.size(),
+                 shown.empty() ? std::string{"none"} : shown);
+        if (kept_kinds.empty()) {
+            return;
+        }
+        std::map<u64, std::vector<u64>> fragment_kinds_of;
+        for (const auto& [vertex_kind, fragment_kind] : kept_kinds) {
+            fragment_kinds_of[vertex_kind].push_back(fragment_kind);
+        }
+        std::unordered_map<u64, std::vector<u32>> fragments_by_kind;
+        std::vector<u32> vertex_hits;
+        for (u32 i = 0; i < hits.size(); ++i) {
+            if (hits[i].pos < 8) {
+                continue;
+            }
+            const Stage stage = code_stages[hits[i].code];
+            if (stage == Stage::Vertex) {
+                vertex_hits.push_back(i);
+            } else if (stage == Stage::Fragment) {
+                fragments_by_kind[Load64(data.data() + hits[i].pos - 8)].push_back(i);
+            }
+        }
+        for (const u32 v : vertex_hits) {
+            const Hit& first = hits[v];
+            const auto kinds_it = fragment_kinds_of.find(Load64(data.data() + first.pos - 8));
+            if (kinds_it == fragment_kinds_of.end()) {
+                continue;
+            }
+            for (const u64 fragment_kind : kinds_it->second) {
+                const auto list = fragments_by_kind.find(fragment_kind);
+                if (list == fragments_by_kind.end()) {
+                    continue;
+                }
+                const std::vector<u32>& at = list->second;
+                const auto after =
+                    std::lower_bound(at.begin(), at.end(), first.pos,
+                                     [&](u32 h, u64 pos) { return hits[h].pos < pos; });
+                std::array<std::optional<u32>, 2> sides;
+                if (after != at.end() && hits[*after].pos - first.pos <= window) {
+                    sides[0] = *after;
+                }
+                if (after != at.begin() && first.pos - hits[*std::prev(after)].pos <= window) {
+                    sides[1] = *std::prev(after);
+                }
+                for (const auto& side : sides) {
+                    if (!side || CrossesMaps(data, hits, v, *side)) {
+                        continue;
+                    }
+                    if (candidates.size() >= MAX_CANDIDATES) {
+                        capped = true;
+                        break;
+                    }
+                    candidates.emplace_back(code_hashes[first.code], code_hashes[hits[*side].code]);
+                }
+            }
+        }
+        ways.push_back(fmt::format("the closest fragment shader id before and after each "
+                                   "vertex shader id within 0x{:x} bytes, of the {} kinds of "
+                                   "pair the played ones show",
+                                   window, kept_kinds.size()));
     }
 };
 
@@ -2525,6 +3299,9 @@ void LinkSurvey::AddPackage(std::string_view name, std::span<const u8> file,
         const ObjectExport& object = tables.exports[i];
         const std::string class_name = tables.ClassName(object);
         const std::string lower = Lower(class_name);
+        if (lower.find("shadercache") != std::string::npos && object.serial_size > 0) {
+            s.cache_packages.emplace(name);
+        }
         if (object.serial_size > 0 && object.serial_offset >= data_offset &&
             (lower.find("shader") != std::string::npos ||
              lower.find("material") != std::string::npos)) {
@@ -2757,6 +3534,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     s.code_hashes = hash_of;
     s.code_stages = stage_of;
     s.played_copies = pair_copies;
+    s.study_controls = controls;
     // Played pairs and the controls, by the code headers of their copies, to tell how many
     // of each references in the packages list close together.
     s.study_mask = PairCodes(count, pair_copies, controls);
@@ -3506,7 +4284,7 @@ void LinkSurvey::SearchPiece(std::string_view name, std::span<const u8> piece, u
             for (const auto& [from, to] : rest) {
                 s.FindIds(piece, from, to, collect_id);
             }
-            s.KeepIdCandidates(id_hits, begin);
+            s.KeepIdCandidates(s.id_store, id_hits, begin);
             for (const Hit& hit : id_hits) {
                 const auto [class_name, holder] = s.AnyObjectAt(offset + hit.pos);
                 ++s.all_id_classes[class_name.empty() ? std::string{"none (between objects)"}
@@ -3659,7 +4437,7 @@ void LinkSurvey::Report() const {
                  s.id_only_skipped_bytes >> 20, ID_ONLY_SEARCH_TIME.count());
         size_t buckets = 0;
         size_t full = 0;
-        for (const auto& [key, at] : s.id_candidates) {
+        for (const auto& [key, at] : s.id_store.buckets) {
             buckets += at.pairs.empty() ? 0 : 1;
             full += at.full ? 1 : 0;
         }
@@ -3668,10 +4446,10 @@ void LinkSurvey::Report() const {
                  "fragment and {} of other shaders; {} vertex and fragment shader pairs of them "
                  "within 0x{:x} bytes kept, at {} kinds and distances ({} with more than kept){}; "
                  "by the class of the object holding them: {}",
-                 s.all_id_hits[static_cast<size_t>(Stage::Vertex)],
-                 s.all_id_hits[static_cast<size_t>(Stage::Fragment)],
-                 s.all_id_hits[static_cast<size_t>(Stage::Other)], s.id_candidate_count,
-                 PAIR_WINDOW, buckets, full, s.id_candidates_capped ? ", more not kept" : "",
+                 s.id_store.hits[static_cast<size_t>(Stage::Vertex)],
+                 s.id_store.hits[static_cast<size_t>(Stage::Fragment)],
+                 s.id_store.hits[static_cast<size_t>(Stage::Other)], s.id_store.count, PAIR_WINDOW,
+                 buckets, full, s.id_store.capped ? ", more not kept" : "",
                  Top(s.all_id_classes, 12,
                      [](const std::string& c, size_t n) { return fmt::format("{} x{}", c, n); }));
         for (const std::string& example : s.id_examples) {
@@ -3808,10 +4586,78 @@ void LinkSurvey::Report() const {
     };
     log_finds(s.finds, "");
     log_finds(s.id_finds, "outside shader and material objects of other packages, by ids alone: ");
+    log_finds(s.cache_finds, "in the shader cache, by ids: ");
 }
 
 const std::vector<std::pair<u64, u64>>& LinkSurvey::LearnedPairs() const {
     return impl->learned;
+}
+
+bool LinkSurvey::HoldsShaderCache(std::string_view name) const {
+    return impl->cache_packages.contains(std::string(name));
+}
+
+void LinkSurvey::StudyShaderCache(std::string_view name, std::span<const u8> file,
+                                  const std::function<bool()>& stopped) {
+    Impl& s = *impl;
+    const auto start = std::chrono::steady_clock::now();
+    if (!s.studied) {
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: shader cache {} not read: the code package was not "
+                 "read before it",
+                 name);
+        return;
+    }
+    std::optional<Summary> summary = ReadSummary(file);
+    std::vector<u8> image;
+    std::vector<ImageSpan> spans;
+    size_t failed_blocks = 0;
+    if (!summary) {
+        // A package compressed whole keeps its header inside the compressed data.
+        Stats stats;
+        Unpack(file, size_t{64} << 20, 0, stats, [&](std::span<const u8> piece, u64) {
+            image.insert(image.end(), piece.begin(), piece.end());
+            return true;
+        });
+        summary = ReadSummary(image);
+        if (!summary || !summary->chunks.empty()) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal links: could not read the header of {}: {}",
+                     name, Hex(file, 0, 128));
+            return;
+        }
+    } else if (!UnpackImage(file, *summary, image, failed_blocks, spans)) {
+        LOG_INFO(Frontend, "[ShaderScan] Unreal links: nothing in {} unpacked", name);
+        return;
+    }
+    const Tables tables = ReadTables(image, 0, *summary);
+    size_t read = 0;
+    for (size_t i = 0; i < tables.exports.size() && read < MAX_CACHE_OBJECTS && !stopped(); ++i) {
+        const ObjectExport& object = tables.exports[i];
+        const std::string class_name = tables.ClassName(object);
+        if (Lower(class_name).find("shadercache") == std::string::npos ||
+            object.serial_size < 0x40 ||
+            u64{object.serial_offset} + object.serial_size > image.size()) {
+            continue;
+        }
+        ++read;
+        s.StudyCacheObject(
+            std::span<const u8>(image).subspan(object.serial_offset, object.serial_size),
+            fmt::format("shader cache {} '{}' in {} (0x{:x} bytes)", class_name,
+                        tables.ObjectName(static_cast<s32>(i + 1)), name, object.serial_size),
+            tables, stopped);
+    }
+    LOG_INFO(Frontend,
+             "[ShaderScan] Unreal links: read {} shader cache objects of {} ({} MiB unpacked, {} "
+             "blocks did not unpack{}{}) in {} ms",
+             read, name, image.size() >> 20, failed_blocks,
+             tables.error.empty() ? "" : ", tables stopped at ", tables.error,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start)
+                 .count());
+}
+
+const std::vector<std::pair<u64, u64>>& LinkSurvey::LearnedFromShaderCache() const {
+    return impl->learned_cache;
 }
 
 const std::vector<std::pair<u64, u64>>& LinkSurvey::LearnFromOtherPackages() {

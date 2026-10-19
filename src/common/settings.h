@@ -681,9 +681,11 @@ struct Values {
     SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
                                                   Category::RendererHacks};
 
+    // Preforged: on by default on Android too. With it off, each cull mode, stencil or vertex
+    // stride a shader pair is drawn with becomes a pipeline of its own, compiled in play.
     SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,
 #if defined(__ANDROID__)
-                                           ExtendedDynamicState::Disabled,
+                                           ExtendedDynamicState::EDS3,
 #elif defined(__APPLE__)
                                            ExtendedDynamicState::Disabled,
 #else
@@ -702,7 +704,7 @@ struct Values {
 
     SwitchableSetting<bool> vertex_input_dynamic_state{linkage,
 #ifdef __ANDROID__
-                                                       false,
+                                                       true, // Preforged: as dyna_state above
 #else
                                                        true,
 #endif
