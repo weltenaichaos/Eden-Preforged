@@ -77,8 +77,9 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // Raised whenever the search learns to read more of the game files, so a game an older version
 // searched is searched once more. 10: Oodle blocks in Unreal packages. 11: zstd files packed
 // with a dictionary (dictionaries looked for in files named like them first), the Unreal shader
-// link log.
-constexpr u32 SEARCH_VERSION = 11;
+// link log. 12: Unreal shader pairs learned from the played ones, in the code package and in
+// the other packages.
+constexpr u32 SEARCH_VERSION = 12;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
@@ -1400,6 +1401,31 @@ public:
         }
     }
 
+    // Pairs that ids found in the other Unreal packages tie together, for compiling them ahead
+    // of time. Runs after all packages are searched.
+    void LearnUnrealLinksFromOtherPackages() {
+        if (!links || !links_studied) {
+            return;
+        }
+        const auto& learned = links->LearnFromOtherPackages();
+        if (learned.empty()) {
+            return;
+        }
+        if (!Common::Preforged::Options().unreal_learned_pairs) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: {} pairs learned from other packages not kept, "
+                     "the switch \"Pre-compile Unreal pairs learned from played ones\" is off",
+                     learned.size());
+            return;
+        }
+        const size_t before = program_pairs.size();
+        program_pairs.insert(learned.begin(), learned.end());
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: {} pairs learned from other packages kept for "
+                 "pre-compiling ({} new)",
+                 learned.size(), program_pairs.size() - before);
+    }
+
     // Keeps the shader pairs from the game's program tables, for compiling them ahead of time.
     void SavePrograms(const std::filesystem::path& path) const {
         VideoCommon::PreforgedPrograms programs;
@@ -2103,6 +2129,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.StudyUnrealLinks(graphics_keys);
     scanner.ReportUnreal();
     scanner.ReportUnrealLinks();
+    scanner.LearnUnrealLinksFromOtherPackages();
     scanner.ReportExtraction();
     scanner.ReportPairing(graphics_keys);
     scanner.ReportGuessAccuracy();

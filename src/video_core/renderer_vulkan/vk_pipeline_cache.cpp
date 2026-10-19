@@ -1782,6 +1782,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
+        if (Common::Preforged::Options().log_shader_compiles) {
+            LogStateVariant(graphics_key);
+        }
         pipeline = CreateGraphicsPipeline();
     }
     if (!pipeline) {
@@ -1792,6 +1795,54 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     }
     current_pipeline = pipeline.get();
     return BuiltPipeline(current_pipeline);
+}
+
+void PipelineCache::LogStateVariant(const GraphicsPipelineCacheKey& key) {
+    // How many variants are shown one by one, and how often the counts are logged.
+    static constexpr size_t STATE_EXAMPLES = 24;
+    static constexpr size_t SUMMARY_EVERY = 100;
+    static constexpr auto SUMMARY_INTERVAL = std::chrono::seconds{30};
+    const auto start{std::chrono::steady_clock::now()};
+    std::vector<const FixedPipelineState*> states;
+    for (const auto& [other, other_pipeline] : graphics_cache) {
+        if (other.unique_hashes == key.unique_hashes && other != key) {
+            states.push_back(&other.state);
+        }
+    }
+    if (states.empty()) {
+        ++state_tally.new_shaders;
+    } else {
+        const auto [closest, parts]{PreforgedState::Closest(key.state, states)};
+        state_tally.Add(parts);
+        if (state_examples < STATE_EXAMPLES) {
+            ++state_examples;
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] state variant: shaders {:016x} had {} pipelines; the closest "
+                     "differs in {}: {}; they would share one with {}",
+                     fmt::join(key.unique_hashes, ","), states.size(),
+                     PreforgedState::PartNames(parts),
+                     PreforgedState::DescribeDifference(key.state, *closest, parts),
+                     PreforgedState::WAY_NAMES[PreforgedState::WayFor(parts)]);
+        }
+    }
+    const auto now{std::chrono::steady_clock::now()};
+    state_search_time += now - start;
+    const size_t total{state_tally.new_shaders + state_tally.variants};
+    if (total % SUMMARY_EVERY != 0 && now - last_state_summary < SUMMARY_INTERVAL) {
+        return;
+    }
+    last_state_summary = now;
+    const auto yes = [](bool value) { return value ? "yes" : "no"; };
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] pipelines compiled in play: {}; {} (in use now: Extended Dynamic "
+             "State 1 {}, 2 {}, 3 blending {}, Vertex Input Dynamic State {}, from the setting "
+             "level {}; {} pipelines known, looked through in {} ms in all)",
+             total, state_tally.Summary(), yes(dynamic_features.has_extended_dynamic_state),
+             yes(dynamic_features.has_extended_dynamic_state_2),
+             yes(dynamic_features.has_extended_dynamic_state_3_blend),
+             yes(dynamic_features.has_dynamic_vertex_input),
+             static_cast<u32>(Settings::values.dyna_state.GetValue()), graphics_cache.size(),
+             std::chrono::duration_cast<std::chrono::milliseconds>(state_search_time).count());
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {

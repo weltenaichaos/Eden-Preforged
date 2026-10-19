@@ -51,6 +51,11 @@ constexpr size_t MAX_PIECE_HITS = size_t{4} << 20;
 constexpr auto SEARCH_TIME = std::chrono::seconds{60};
 /// Index references below this are too common in other data to search other packages for.
 constexpr u32 MIN_FOREIGN_INDEX = 64;
+/// How long the bytes of other packages outside shader and material objects are searched for
+/// the shaders' ids alone, and how many of the ids found there are shown.
+constexpr auto ID_ONLY_SEARCH_TIME = std::chrono::seconds{20};
+constexpr size_t ID_EXAMPLES = 12;
+constexpr size_t ID_EXAMPLES_PER_CLASS = 3;
 constexpr size_t NAMES_LOGGED = 4000;
 constexpr size_t EXAMPLES = 3;
 /// Bytes shown before and after the two references of a pair example.
@@ -77,6 +82,10 @@ constexpr size_t MAX_CANDIDATES = size_t{1} << 20;
 constexpr size_t MAX_CODE_ID_WINDOWS = 8;
 constexpr size_t MAX_HITS_PER_CODE = 16;
 constexpr size_t MAX_ID_HITS = size_t{1} << 21;
+/// Vertex and fragment shader pairs kept from the ids found close together in other packages,
+/// to learn a link's pairs from: in all, and per kind of id and distance.
+constexpr size_t MAX_ID_CANDIDATES = size_t{1} << 21;
+constexpr size_t MAX_ID_CANDIDATES_AT = size_t{1} << 16;
 
 u32 Load32(const u8* data) {
     u32 value;
@@ -101,6 +110,12 @@ std::string Hex(std::span<const u8> data, u64 begin, u64 length) {
 
 u64 MixId(u64 value) {
     return (value * 0x9E3779B97F4A7C15ULL) >> (64 - ID_FILTER_BITS);
+}
+
+/// A second bit per id, for the filter of all shaders' ids: with two bits set per id, about 15
+/// times fewer bytes of other data pass it, so the search for ids alone is about twice as fast.
+u64 MixId2(u64 value) {
+    return ((value ^ (value >> 31)) * 0xBF58476D1CE4E5B9ULL) >> (64 - ID_FILTER_BITS);
 }
 
 std::string Lower(std::string_view text) {
@@ -181,6 +196,25 @@ struct PairFinds {
     std::unordered_set<u64> distinct_seen;
     /// Per distance, where in 4 bytes the vertex shader references of played pairs are.
     std::unordered_map<s64, std::array<u32, 4>> residues;
+};
+
+/// How many different played and control pairs one kind of reference lists at one distance.
+struct LinkCount {
+    std::pair<u32, u32> kinds;
+    s64 distance;
+    u32 played;
+    u32 shuffled;
+    u32 moved;
+    s64 Score() const {
+        return static_cast<s64>(played) - static_cast<s64>(std::max(shuffled, moved));
+    }
+};
+
+/// The vertex and fragment shader pairs whose ids were found at one distance, by code header.
+struct IdCandidates {
+    std::vector<std::pair<u32, u32>> pairs;
+    /// More were found than are kept.
+    bool full = false;
 };
 
 /// A shader or material object of the package being searched, as offsets in what Unpack
@@ -898,8 +932,11 @@ struct IdEntry {
     u32 window;
 };
 
-/// Places in the window where most shaders hold a different 8-byte value: possible ids.
-std::vector<s32> ChooseIdWindows(std::span<const u8> image, const Window& window, size_t most) {
+/// Places in the window where most shaders hold a different 8-byte value: possible ids. With
+/// `overlap`, places 4 bytes apart are all kept, since an id can start at either half of a
+/// longer value.
+std::vector<s32> ChooseIdWindows(std::span<const u8> image, const Window& window, size_t most,
+                                 bool overlap) {
     struct Candidate {
         s32 at;
         double distinct;
@@ -945,7 +982,7 @@ std::vector<s32> ChooseIdWindows(std::span<const u8> image, const Window& window
     std::vector<s32> kept;
     for (const Candidate& candidate : candidates) {
         if (kept.size() < most && std::ranges::none_of(kept, [&](s32 other) {
-                return std::abs(other - candidate.at) < 8;
+                return std::abs(other - candidate.at) < (overlap ? 4 : 8);
             })) {
             kept.push_back(candidate.at);
         }
@@ -1612,6 +1649,15 @@ struct LinkSurvey::Impl {
     /// The played and control shaders' ids: the shader and the place, per value. The bytes
     /// of one entry can be the id of a shader at one place and of its neighbour at another.
     std::unordered_map<u64, std::vector<std::pair<u32, u32>>> ids;
+    /// The same for all shaders, which the other packages are searched for outside shader and
+    /// material objects, to learn pairs from.
+    std::vector<u64> all_id_filter;
+    std::unordered_map<u64, std::vector<std::pair<u32, u32>>> all_ids;
+    /// Per code header the shader's hash and stage (0 and Other when the search took no shader
+    /// from it), and the played pairs by code header.
+    std::vector<u64> code_hashes;
+    std::vector<Stage> code_stages;
+    std::vector<PairCopies> played_copies;
     /// Where the ids of all shaders are in the code package: an id found there is a shader's
     /// own, or another copy's, not a reference.
     std::vector<u64> own_id_places;
@@ -1642,7 +1688,30 @@ struct LinkSurvey::Impl {
     std::unordered_map<u32, std::unordered_map<std::string, size_t>> files_by_kind;
     /// Ids found in other packages, by the class of the object holding them.
     std::unordered_map<std::string, size_t> id_classes;
+    /// The same for the ids of all shaders found by the search for ids alone.
+    std::unordered_map<std::string, size_t> all_id_classes;
+    /// The tables of the package being searched, and all its objects as (start, end, export
+    /// index) sorted by start, to tell what holds an id found outside the shader objects.
+    Tables current_tables;
+    std::vector<std::tuple<u64, u64, u32>> all_spans;
+    /// The search for ids alone in the bytes outside shader and material objects.
+    u64 id_only_bytes = 0;
+    u64 id_only_skipped_bytes = 0;
+    std::chrono::nanoseconds id_only_time{};
+    std::vector<std::string> id_examples;
+    std::unordered_map<std::string, size_t> id_example_classes;
     std::map<std::pair<u32, u32>, PairFinds> finds;
+    /// What the search for ids alone found: the played and control pairs, and all vertex and
+    /// fragment shader pairs close together by (first kind << 48) | (second kind << 32) |
+    /// distance.
+    std::map<std::pair<u32, u32>, PairFinds> id_finds;
+    std::unordered_map<u64, IdCandidates> id_candidates;
+    size_t id_candidate_count = 0;
+    bool id_candidates_capped = false;
+    /// Ids of all shaders found there, by stage.
+    std::array<size_t, 3> all_id_hits{};
+    /// Pairs learned from them, for pre-compiling.
+    std::vector<std::pair<u64, u64>> learned_elsewhere;
 
     std::string KindName(u32 kind) const {
         if (kind < KIND_COUNT) {
@@ -1826,6 +1895,29 @@ struct LinkSurvey::Impl {
         }
     }
 
+    /// Reports every place in data[begin, end) that holds the id of any shader, and nothing
+    /// else.
+    template <typename Emit>
+    void FindIds(std::span<const u8> data, u64 begin, u64 end, Emit&& emit) const {
+        end = std::min<u64>(end, data.size());
+        for (u64 pos = begin; pos + 8 <= end; ++pos) {
+            const u64 id = Load64(data.data() + pos);
+            const u64 bit = MixId(id);
+            if (((all_id_filter[bit >> 6] >> (bit & 63)) & 1) == 0) {
+                continue;
+            }
+            const u64 bit2 = MixId2(id);
+            if (((all_id_filter[bit2 >> 6] >> (bit2 & 63)) & 1) == 0) {
+                continue;
+            }
+            if (const auto it = all_ids.find(id); it != all_ids.end()) {
+                for (const auto& [code, window] : it->second) {
+                    emit(pos, KIND_COUNT + window, code);
+                }
+            }
+        }
+    }
+
     /// The groups a pair of code headers is in, or null when it is neither played nor a
     /// control pair.
     const std::vector<std::pair<u8, u32>>* PairGroups(u64 key) const {
@@ -1841,8 +1933,10 @@ struct LinkSurvey::Impl {
     /// sorted by position. Pairs whose vertex reference is before `min_first` don't count, and
     /// with `own_entries` neither do hits at a shader's own table entry. Index references are
     /// many, since small numbers are everywhere, so two of them pair only when much closer.
-    void Pair(const std::vector<Hit>& hits, std::span<const u8> data, std::string_view name,
-              u64 offset, u64 min_first, bool own_entries) {
+    /// What is found goes into `into`.
+    void Pair(std::map<std::pair<u32, u32>, PairFinds>& into, const std::vector<Hit>& hits,
+              std::span<const u8> data, std::string_view name, u64 offset, u64 min_first,
+              bool own_entries) {
         std::vector<u32> sparse;
         std::vector<u32> dense;
         for (u32 i = 0; i < hits.size(); ++i) {
@@ -1871,7 +1965,7 @@ struct LinkSurvey::Impl {
                 (distance > INDEX_PAIR_WINDOW || distance < -INDEX_PAIR_WINDOW)) {
                 return;
             }
-            PairFinds& found = finds[{first.kind, second.kind}];
+            PairFinds& found = into[{first.kind, second.kind}];
             bool played = false;
             for (const auto& [group, number] : *groups) {
                 const u64 seen = (u64{group} << 62) ^ (u64{number} << 32) ^
@@ -1924,7 +2018,73 @@ struct LinkSurvey::Impl {
         pairs_of(sparse, dense, PAIR_WINDOW, true);
         pairs_of(dense, dense, INDEX_PAIR_WINDOW, false);
         for (const auto& [kinds, count] : found_here) {
-            finds[kinds].files[std::string(name)] += count;
+            into[kinds].files[std::string(name)] += count;
+        }
+    }
+
+    /// Keeps every vertex and fragment shader pair whose ids are close together in `hits`,
+    /// which are sorted by position, by the two kinds and the distance, to learn the pairs of
+    /// a link from once all packages are searched. Pairs whose vertex id is before `min_first`
+    /// were kept with the piece before.
+    void KeepIdCandidates(const std::vector<Hit>& hits, u64 min_first) {
+        std::vector<u32> vertex;
+        std::vector<u32> fragment;
+        for (u32 i = 0; i < hits.size(); ++i) {
+            const Stage stage = code_stages[hits[i].code];
+            if (hits[i].pos >= min_first) {
+                ++all_id_hits[static_cast<size_t>(stage)];
+            }
+            if (stage == Stage::Vertex) {
+                vertex.push_back(i);
+            } else if (stage == Stage::Fragment) {
+                fragment.push_back(i);
+            }
+        }
+        size_t low = 0;
+        for (const u32 v : vertex) {
+            const Hit& first = hits[v];
+            while (low < fragment.size() &&
+                   static_cast<s64>(hits[fragment[low]].pos) + PAIR_WINDOW <
+                       static_cast<s64>(first.pos)) {
+                ++low;
+            }
+            if (first.pos < min_first) {
+                continue;
+            }
+            for (size_t j = low;
+                 j < fragment.size() && static_cast<s64>(hits[fragment[j]].pos) <=
+                                            static_cast<s64>(first.pos) + PAIR_WINDOW;
+                 ++j) {
+                const Hit& second = hits[fragment[j]];
+                const s64 distance = static_cast<s64>(second.pos) - static_cast<s64>(first.pos);
+                // Two ids can't share bytes.
+                if (distance > -8 && distance < 8) {
+                    continue;
+                }
+                if (id_candidate_count >= MAX_ID_CANDIDATES) {
+                    id_candidates_capped = true;
+                    return;
+                }
+                const u64 key = (u64{first.kind} << 48) | (u64{second.kind} << 32) |
+                                static_cast<u32>(static_cast<s32>(distance));
+                IdCandidates& at = id_candidates[key];
+                if (at.full) {
+                    continue;
+                }
+                if (at.pairs.size() >= MAX_ID_CANDIDATES_AT) {
+                    // Lists repeat in many packages: keep each pair once.
+                    const size_t before = at.pairs.size();
+                    std::sort(at.pairs.begin(), at.pairs.end());
+                    at.pairs.erase(std::unique(at.pairs.begin(), at.pairs.end()), at.pairs.end());
+                    id_candidate_count -= before - at.pairs.size();
+                    if (at.pairs.size() >= MAX_ID_CANDIDATES_AT * 3 / 4) {
+                        at.full = true;
+                        continue;
+                    }
+                }
+                at.pairs.emplace_back(first.code, second.code);
+                ++id_candidate_count;
+            }
         }
     }
 
@@ -1942,6 +2102,30 @@ struct LinkSurvey::Impl {
             if (at < i->end) {
                 return fmt::format(", in {} at +0x{:x} of 0x{:x} bytes", i->what,
                                    at - i->begin, i->end - i->begin);
+            }
+            if (it - i > 8) {
+                break;
+            }
+        }
+        return {};
+    }
+
+    /// The class and the name of any object holding an offset of the package being searched,
+    /// as a class name and "Class 'Name'"; empty when the offset is in no object.
+    std::pair<std::string, std::string> AnyObjectAt(u64 at) const {
+        const auto it = std::upper_bound(all_spans.begin(), all_spans.end(), at,
+                                         [](u64 value, const std::tuple<u64, u64, u32>& span) {
+                                             return value < std::get<0>(span);
+                                         });
+        for (auto i = it; i != all_spans.begin();) {
+            --i;
+            const auto& [begin, end, index] = *i;
+            if (at < end) {
+                const ObjectExport& object = current_tables.exports[index];
+                const std::string class_name = current_tables.ClassName(object);
+                return {class_name,
+                        fmt::format("{} '{}'", class_name,
+                                    current_tables.ObjectName(static_cast<s32>(index + 1)))};
             }
             if (it - i > 8) {
                 break;
@@ -2142,6 +2326,54 @@ struct LinkSurvey::Impl {
         }
     }
 
+    /// Logs the kinds of reference in `all` that list the two shaders of the most played pairs
+    /// at one distance, and returns the first that lists enough of them and few control pairs.
+    std::optional<LinkCount> ChooseLink(const std::map<std::pair<u32, u32>, PairFinds>& all,
+                                        size_t played_count, std::string_view where) const {
+        std::vector<LinkCount> links;
+        for (const auto& [kinds, found] : all) {
+            for (const auto& [distance, n] : found.distinct_at[PlayedGroup]) {
+                const auto other = [&](u8 group) -> u32 {
+                    const auto it = found.distinct_at[group].find(distance);
+                    return it == found.distinct_at[group].end() ? 0 : it->second;
+                };
+                links.push_back({kinds, distance, n, other(ShuffledGroup), other(MovedGroup)});
+            }
+        }
+        std::sort(links.begin(), links.end(), [](const LinkCount& a, const LinkCount& b) {
+            return a.Score() != b.Score() ? a.Score() > b.Score()
+                                          : std::tie(a.kinds, a.distance) <
+                                                std::tie(b.kinds, b.distance);
+        });
+        std::string line;
+        for (size_t i = 0; i < std::min<size_t>(links.size(), 8); ++i) {
+            const LinkCount& link = links[i];
+            line += fmt::format("{}vertex by {}, fragment by {} {:+d} bytes on: {} played, {} "
+                                "shuffled, {} moved",
+                                line.empty() ? "" : "; ", KindName(link.kinds.first),
+                                KindName(link.kinds.second), link.distance, link.played,
+                                link.shuffled, link.moved);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: references {} that list the two shaders of a pair "
+                 "at one distance (different pairs; {} played, {} shuffled, {} moved {} headers "
+                 "on): {}",
+                 where, group_sizes[PlayedGroup], group_sizes[ShuffledGroup],
+                 group_sizes[MovedGroup], CONTROL_SHIFT, line.empty() ? std::string{"none"} : line);
+        const size_t need = std::max<size_t>(10, played_count / 10);
+        for (const LinkCount& link : links) {
+            if (link.played >= need &&
+                link.played >= 5 * std::max({link.shuffled, link.moved, 1U})) {
+                return link;
+            }
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: no kind of reference {} lists {} or more played "
+                 "pairs at one distance and few control pairs, so no pairs are learned from them",
+                 where, need);
+        return std::nullopt;
+    }
+
     /// When one kind of reference in the code package lists the two shaders of many played
     /// pairs at one distance, and few control pairs, returns the pairs it lists for all
     /// shaders. Call after the code package's references are paired.
@@ -2151,61 +2383,9 @@ struct LinkSurvey::Impl {
                                                    const std::vector<Stage>& stage_of,
                                                    const std::function<bool()>& stopped) const {
         const auto start = std::chrono::steady_clock::now();
-        struct Link {
-            std::pair<u32, u32> kinds;
-            s64 distance;
-            u32 played;
-            u32 shuffled;
-            u32 moved;
-            s64 Score() const {
-                return static_cast<s64>(played) - static_cast<s64>(std::max(shuffled, moved));
-            }
-        };
-        std::vector<Link> links;
-        for (const auto& [kinds, found] : finds) {
-            for (const auto& [distance, n] : found.distinct_at[PlayedGroup]) {
-                const auto other = [&](u8 group) -> u32 {
-                    const auto it = found.distinct_at[group].find(distance);
-                    return it == found.distinct_at[group].end() ? 0 : it->second;
-                };
-                links.push_back({kinds, distance, n, other(ShuffledGroup), other(MovedGroup)});
-            }
-        }
-        std::sort(links.begin(), links.end(), [](const Link& a, const Link& b) {
-            return a.Score() != b.Score() ? a.Score() > b.Score()
-                                          : std::tie(a.kinds, a.distance) <
-                                                std::tie(b.kinds, b.distance);
-        });
-        std::string line;
-        for (size_t i = 0; i < std::min<size_t>(links.size(), 8); ++i) {
-            const Link& link = links[i];
-            line += fmt::format("{}vertex by {}, fragment by {} {:+d} bytes on: {} played, {} "
-                                "shuffled, {} moved",
-                                line.empty() ? "" : "; ", KindName(link.kinds.first),
-                                KindName(link.kinds.second), link.distance, link.played,
-                                link.shuffled, link.moved);
-        }
-        LOG_INFO(Frontend,
-                 "[ShaderScan] Unreal links: references in the code package that list the two "
-                 "shaders of a pair at one distance (different pairs; {} played, {} shuffled, {} "
-                 "moved {} headers on): {}",
-                 group_sizes[PlayedGroup], group_sizes[ShuffledGroup], group_sizes[MovedGroup],
-                 CONTROL_SHIFT, line.empty() ? std::string{"none"} : line);
-        const size_t need = std::max<size_t>(10, played.size() / 10);
-        const Link* chosen = nullptr;
-        for (const Link& link : links) {
-            if (link.played >= need &&
-                link.played >= 5 * std::max({link.shuffled, link.moved, 1U})) {
-                chosen = &link;
-                break;
-            }
-        }
-        if (chosen == nullptr) {
-            LOG_INFO(Frontend,
-                     "[ShaderScan] Unreal links: no kind of reference in the code package lists "
-                     "{} or more played pairs at one distance and few control pairs, so no pairs "
-                     "are learned from them",
-                     need);
+        const std::optional<LinkCount> chosen =
+            ChooseLink(finds, played.size(), "in the code package");
+        if (!chosen) {
             return {};
         }
         // Where in 4 bytes the vertex shader references of the played pairs are.
@@ -2271,6 +2451,34 @@ struct LinkSurvey::Impl {
                                        KindName(chosen->kinds.second), chosen->distance),
                            capped, start);
     }
+
+    /// When one kind of id outside the code package lists the two shaders of many played
+    /// pairs at one distance, and few control pairs, returns the pairs it lists for all
+    /// shaders. Call after all packages are searched.
+    std::vector<std::pair<u64, u64>> LearnFromIds() const {
+        const auto start = std::chrono::steady_clock::now();
+        const std::optional<LinkCount> chosen =
+            ChooseLink(id_finds, played_copies.size(), "in other packages (by ids alone)");
+        if (!chosen) {
+            return {};
+        }
+        const u64 key = (u64{chosen->kinds.first} << 48) | (u64{chosen->kinds.second} << 32) |
+                        static_cast<u32>(static_cast<s32>(chosen->distance));
+        std::vector<std::pair<u64, u64>> candidates;
+        const auto it = id_candidates.find(key);
+        if (it != id_candidates.end()) {
+            for (const auto& [vertex, fragment] : it->second.pairs) {
+                candidates.emplace_back(code_hashes[vertex], code_hashes[fragment]);
+            }
+        }
+        return RankLearned(std::move(candidates), played_copies, code_hashes,
+                           fmt::format("learned link: vertex by {}, fragment by {} {:+d} bytes on "
+                                       "in other packages",
+                                       KindName(chosen->kinds.first),
+                                       KindName(chosen->kinds.second), chosen->distance),
+                           id_candidates_capped || (it != id_candidates.end() && it->second.full),
+                           start);
+    }
 };
 
 LinkSurvey::LinkSurvey(size_t overlap) : impl{std::make_unique<Impl>(overlap)} {}
@@ -2284,6 +2492,8 @@ void LinkSurvey::AddPackage(std::string_view name, std::span<const u8> file,
     s.ranges_known = false;
     s.ranges.clear();
     s.objects.clear();
+    s.all_spans.clear();
+    s.current_tables = {};
     const std::optional<Summary> summary = ReadSummary(file);
     if (!summary) {
         ++s.unreadable;
@@ -2296,7 +2506,7 @@ void LinkSurvey::AddPackage(std::string_view name, std::span<const u8> file,
     ++s.versions[fmt::format("{}/{}", summary->version, summary->licensee)];
     const u64 data_offset =
         summary->chunks.empty() ? 0 : summary->chunks.front().unpacked_offset;
-    const Tables tables = ReadTables(first_piece, data_offset, *summary);
+    Tables tables = ReadTables(first_piece, data_offset, *summary);
     if (!tables.error.empty()) {
         ++s.table_errors;
         if (s.table_error_examples.size() < EXAMPLES) {
@@ -2352,6 +2562,14 @@ void LinkSurvey::AddPackage(std::string_view name, std::span<const u8> file,
                 Hex(first_piece, object.serial_offset - data_offset,
                     std::min<u64>(object.serial_size, 0x100))));
         }
+        if (s.ranges_known && object.serial_size > 0 && object.serial_offset >= data_offset) {
+            const u64 begin = object.serial_offset - data_offset;
+            s.all_spans.emplace_back(begin, begin + object.serial_size, static_cast<u32>(i));
+        }
+    }
+    std::sort(s.all_spans.begin(), s.all_spans.end());
+    if (s.ranges_known) {
+        s.current_tables = std::move(tables);
     }
 }
 
@@ -2536,6 +2754,9 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
         pair_copies.push_back(std::move(pair));
     }
     const Controls controls = MakeControls(pair_copies, count);
+    s.code_hashes = hash_of;
+    s.code_stages = stage_of;
+    s.played_copies = pair_copies;
     // Played pairs and the controls, by the code headers of their copies, to tell how many
     // of each references in the packages list close together.
     s.study_mask = PairCodes(count, pair_copies, controls);
@@ -3000,6 +3221,16 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
             s.FindRefs(data, 0, s.first_code, 1, true, record_base);
             s.FindRefs(data, s.code_end, image.size(), 1, true, record_base);
             measure(OffsetFromBase);
+            // Without a table that counts from them, the parts only add chance matches, and
+            // with many parts those make the search of the other packages slow.
+            if (!is_table(OffsetFromBase)) {
+                s.have_base = false;
+                s.Prepare();
+                LOG_INFO(Frontend,
+                         "[ShaderScan] Unreal links: no table counts from the start of these "
+                         "parts ({} entries found), so references are not looked for by them",
+                         tables_found[OffsetFromBase].entries);
+            }
         }
     }
 
@@ -3122,19 +3353,19 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     // shaders by.
     std::vector<s32> by_code;
     if (!stopped()) {
-        by_code = ChooseIdWindows(data, s.code_window, MAX_CODE_ID_WINDOWS);
+        by_code = ChooseIdWindows(data, s.code_window, MAX_CODE_ID_WINDOWS, false);
         StudyCodeIds(data, s.code_window, s.first_code, s.code_end, by_code, pair_copies,
                      controls, s.played_mask, stopped);
     }
     std::vector<s32> in_records;
     if (s.record_window && !stopped()) {
-        in_records = ChooseIdWindows(data, *s.record_window, RECORD_ID_WINDOWS);
+        in_records = ChooseIdWindows(data, *s.record_window, RECORD_ID_WINDOWS, true);
         StudyCodeIds(data, *s.record_window, s.first_code, s.code_end, in_records, pair_copies,
                      controls, s.played_mask, stopped);
     }
-    // The ids searched for: near the table entries; else in the records; else by the code
-    // headers.
-    if (table_kind == KIND_COUNT) {
+    // The ids searched for: near the table entries; else (no table, or none near its entries)
+    // in the records; else by the code headers.
+    if (s.windows.empty()) {
         for (const s32 at : in_records) {
             s.windows.push_back({at, IdSource::Record});
         }
@@ -3147,6 +3378,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     // Only the played and control shaders' ids are searched for, to tell which places pair
     // them.
     s.id_filter.assign((size_t{1} << ID_FILTER_BITS) / 64, 0);
+    s.all_id_filter.assign((size_t{1} << ID_FILTER_BITS) / 64, 0);
     for (u32 w = 0; w < s.windows.size(); ++w) {
         // A value two different shaders have there is not an id; copies of one shader may
         // share it.
@@ -3165,9 +3397,6 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
             }
         }
         for (u32 code = 0; code < count; ++code) {
-            if (!s.study_mask[code]) {
-                continue;
-            }
             const std::optional<u64> value = s.IdOf(data, code, s.windows[w]);
             if (!value) {
                 continue;
@@ -3176,9 +3405,15 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
             if (it == in_window.end() || it->second == count) {
                 continue;
             }
-            s.ids[*value].emplace_back(code, w);
             const u64 bit = MixId(*value);
-            s.id_filter[bit >> 6] |= u64{1} << (bit & 63);
+            const u64 bit2 = MixId2(*value);
+            s.all_ids[*value].emplace_back(code, w);
+            s.all_id_filter[bit >> 6] |= u64{1} << (bit & 63);
+            s.all_id_filter[bit2 >> 6] |= u64{1} << (bit2 & 63);
+            if (s.study_mask[code]) {
+                s.ids[*value].emplace_back(code, w);
+                s.id_filter[bit >> 6] |= u64{1} << (bit & 63);
+            }
         }
     }
     std::sort(s.own_id_places.begin(), s.own_id_places.end());
@@ -3194,7 +3429,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     };
     s.FindRefs(data, 0, s.first_code, MIN_FOREIGN_INDEX, true, collect);
     s.FindRefs(data, s.code_end, image.size(), MIN_FOREIGN_INDEX, true, collect);
-    s.Pair(hits, data, fmt::format("{} (the code package)", name), 0, 0, true);
+    s.Pair(s.finds, hits, data, fmt::format("{} (the code package)", name), 0, 0, true);
     for (const Hit& hit : hits) {
         ++s.hits_by_kind[hit.kind];
         ++s.files_by_kind[hit.kind][fmt::format("{} (the code package)", name)];
@@ -3238,6 +3473,66 @@ void LinkSurvey::SearchPiece(std::string_view name, std::span<const u8> piece, u
         part_bytes += to - from;
     }
     s.other_class_bytes += piece.size() - begin - part_bytes;
+    // An id can be held by an object of any class, so the bytes outside the shader and
+    // material objects are searched for the shaders' ids alone, which is quick. The ids of
+    // all shaders are looked for, to learn the pairs of a link found there.
+    if (!s.all_ids.empty() && s.ranges_known && name.starts_with(s.current_package)) {
+        std::vector<std::pair<u64, u64>> rest;
+        u64 at = begin;
+        for (const auto& [from, to] : parts) {
+            if (from > at) {
+                rest.emplace_back(at, from);
+            }
+            at = std::max(at, to);
+        }
+        if (at < piece.size()) {
+            rest.emplace_back(at, piece.size());
+        }
+        u64 rest_bytes = 0;
+        for (const auto& [from, to] : rest) {
+            rest_bytes += to - from;
+        }
+        if (s.id_only_time >= ID_ONLY_SEARCH_TIME) {
+            s.id_only_skipped_bytes += rest_bytes;
+        } else {
+            const auto id_start = std::chrono::steady_clock::now();
+            s.id_only_bytes += rest_bytes;
+            std::vector<Hit> id_hits;
+            const auto collect_id = [&](u64 pos, u32 kind, u32 code) {
+                if (id_hits.size() < MAX_PIECE_HITS) {
+                    id_hits.push_back({pos, kind, code});
+                }
+            };
+            for (const auto& [from, to] : rest) {
+                s.FindIds(piece, from, to, collect_id);
+            }
+            s.KeepIdCandidates(id_hits, begin);
+            for (const Hit& hit : id_hits) {
+                const auto [class_name, holder] = s.AnyObjectAt(offset + hit.pos);
+                ++s.all_id_classes[class_name.empty() ? std::string{"none (between objects)"}
+                                                      : class_name];
+                // A few from each class, since one list holds many.
+                if (s.id_examples.size() < ID_EXAMPLES &&
+                    s.id_example_classes[class_name]++ < ID_EXAMPLES_PER_CLASS) {
+                    s.id_examples.push_back(fmt::format(
+                        "{} of shader #{} at 0x{:x} in {}, in {}: bytes from 0x{:x}: {}",
+                        s.KindName(hit.kind), hit.code, offset + hit.pos, name,
+                        holder.empty() ? std::string{"no object"} : holder,
+                        offset + (hit.pos >= 0x40 ? hit.pos - 0x40 : 0),
+                        Hex(piece, hit.pos >= 0x40 ? hit.pos - 0x40 : 0, 0x88)));
+                }
+            }
+            // The played and control shaders' ids, which tell a link from chance.
+            std::erase_if(id_hits, [&](const Hit& hit) { return !s.study_mask[hit.code]; });
+            const std::string file{name};
+            for (const Hit& hit : id_hits) {
+                ++s.hits_by_kind[hit.kind];
+                ++s.files_by_kind[hit.kind][file];
+            }
+            s.Pair(s.id_finds, id_hits, piece, name, offset, begin, false);
+            s.id_only_time += std::chrono::steady_clock::now() - id_start;
+        }
+    }
     if (parts.empty()) {
         return;
     }
@@ -3276,7 +3571,7 @@ void LinkSurvey::SearchPiece(std::string_view name, std::span<const u8> piece, u
             }
         }
     }
-    s.Pair(hits, piece, name, offset, begin, false);
+    s.Pair(s.finds, hits, piece, name, offset, begin, false);
     s.search_time += std::chrono::steady_clock::now() - start;
 }
 
@@ -3302,19 +3597,41 @@ void LinkSurvey::Report() const {
              Top(counts, 50, [&](const std::string& name, size_t n) {
                  return fmt::format("{} x{} ({} MiB)", name, n, s.classes.at(name).bytes >> 20);
              }));
+    // All classes that may hold shaders or lists of them, however few objects they have.
+    std::unordered_map<std::string, size_t> shader_like;
+    for (const auto& [name, stats] : s.classes) {
+        const std::string lower = Lower(name);
+        if (lower.find("shader") != std::string::npos || lower.find("cache") != std::string::npos ||
+            lower.find("pipeline") != std::string::npos) {
+            shader_like[name] = stats.count;
+        }
+    }
+    LOG_INFO(Frontend,
+             "[ShaderScan] Unreal links: classes named like shaders, caches or pipelines: {}",
+             Top(shader_like, 100, [&](const std::string& name, size_t n) {
+                 return fmt::format("{} x{} ({} KiB)", name, n, s.classes.at(name).bytes >> 10);
+             }));
     size_t shown = 0;
     std::vector<std::string> names;
     for (const auto& [name, stats] : s.classes) {
         names.push_back(name);
     }
-    std::sort(names.begin(), names.end());
-    for (const std::string& name : names) {
+    // Classes named like shaders or caches first, since materials are many.
+    const auto rank = [](const std::string& name) {
         const std::string lower = Lower(name);
-        if (lower.find("shader") == std::string::npos &&
-            lower.find("material") == std::string::npos) {
+        if (lower.find("shader") != std::string::npos || lower.find("cache") != std::string::npos) {
+            return 0;
+        }
+        return lower.find("material") != std::string::npos ? 1 : 2;
+    };
+    std::sort(names.begin(), names.end(), [&](const std::string& a, const std::string& b) {
+        return std::make_pair(rank(a), a) < std::make_pair(rank(b), b);
+    });
+    for (const std::string& name : names) {
+        if (rank(name) == 2) {
             continue;
         }
-        if (shown++ >= 16) {
+        if (shown++ >= 20) {
             break;
         }
         for (const std::string& example : s.classes.at(name).examples) {
@@ -3332,6 +3649,35 @@ void LinkSurvey::Report() const {
              std::chrono::duration_cast<std::chrono::milliseconds>(s.search_time).count(),
              s.capped_pieces, s.skipped_pieces, s.skipped_bytes >> 20, SEARCH_TIME.count(),
              s.other_class_bytes >> 20);
+    if (!s.all_ids.empty()) {
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: searched {} MiB of the other packages outside "
+                 "shader and material objects for the shaders' ids alone in {} ms; {} MiB left "
+                 "out after {} s",
+                 s.id_only_bytes >> 20,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(s.id_only_time).count(),
+                 s.id_only_skipped_bytes >> 20, ID_ONLY_SEARCH_TIME.count());
+        size_t buckets = 0;
+        size_t full = 0;
+        for (const auto& [key, at] : s.id_candidates) {
+            buckets += at.pairs.empty() ? 0 : 1;
+            full += at.full ? 1 : 0;
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: ids of any shader found there: {} of vertex, {} of "
+                 "fragment and {} of other shaders; {} vertex and fragment shader pairs of them "
+                 "within 0x{:x} bytes kept, at {} kinds and distances ({} with more than kept){}; "
+                 "by the class of the object holding them: {}",
+                 s.all_id_hits[static_cast<size_t>(Stage::Vertex)],
+                 s.all_id_hits[static_cast<size_t>(Stage::Fragment)],
+                 s.all_id_hits[static_cast<size_t>(Stage::Other)], s.id_candidate_count,
+                 PAIR_WINDOW, buckets, full, s.id_candidates_capped ? ", more not kept" : "",
+                 Top(s.all_id_classes, 12,
+                     [](const std::string& c, size_t n) { return fmt::format("{} x{}", c, n); }));
+        for (const std::string& example : s.id_examples) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal links: id found: {}", example);
+        }
+    }
     std::vector<u32> kinds;
     for (const auto& [kind, n] : s.hits_by_kind) {
         kinds.push_back(kind);
@@ -3359,105 +3705,121 @@ void LinkSurvey::Report() const {
                      return fmt::format("{} x{}", c, n);
                  }));
     }
-    // A link shows as many pairs at one distance; chance meetings spread over all distances.
-    std::vector<std::pair<size_t, std::pair<u32, u32>>> order;
-    for (const auto& [kinds_pair, found] : s.finds) {
-        size_t peak = 0;
-        for (const auto& [distance, n] : found.distances) {
-            peak = std::max(peak, n);
+    const auto log_finds = [&](const std::map<std::pair<u32, u32>, PairFinds>& all,
+                               std::string_view where) {
+        // A link shows as many pairs at one distance; chance meetings spread over all distances.
+        std::vector<std::pair<size_t, std::pair<u32, u32>>> order;
+        for (const auto& [kinds_pair, found] : all) {
+            size_t peak = 0;
+            for (const auto& [distance, n] : found.distances) {
+                peak = std::max(peak, n);
+            }
+            order.emplace_back(peak, kinds_pair);
         }
-        order.emplace_back(peak, kinds_pair);
-    }
-    std::sort(order.rbegin(), order.rend());
-    // Places that overlap the same id find the same pairs; those are shown once.
-    std::set<std::pair<size_t, size_t>> shown_counts;
-    size_t same = 0;
-    for (size_t i = 0; i < order.size() && shown_counts.size() < 12; ++i) {
-        const PairFinds& found = s.finds.at(order[i].second);
-        if (!shown_counts.emplace(order[i].first, found.pairs.size()).second) {
-            ++same;
-            continue;
-        }
-        size_t total = 0;
-        for (const auto& [distance, n] : found.distances) {
-            total += n;
-        }
-        // Different pairs at the distances most played pairs are at, against the controls.
-        std::vector<std::pair<u32, s64>> by_pairs;
-        for (const auto& [distance, n] : found.distinct_at[PlayedGroup]) {
-            by_pairs.emplace_back(n, -distance);
-        }
-        std::sort(by_pairs.rbegin(), by_pairs.rend());
-        std::string groups;
-        for (size_t d = 0; d < std::min<size_t>(by_pairs.size(), 4); ++d) {
-            const s64 distance = -by_pairs[d].second;
-            const auto other = [&](u8 group) -> u32 {
-                const auto it = found.distinct_at[group].find(distance);
-                return it == found.distinct_at[group].end() ? 0 : it->second;
-            };
-            groups += fmt::format("{}{:+d}: {} played, {} shuffled, {} moved",
-                                  groups.empty() ? "" : "; ", distance, by_pairs[d].first,
-                                  other(ShuffledGroup), other(MovedGroup));
-        }
-        LOG_INFO(Frontend,
-                 "[ShaderScan] Unreal links: vertex by {}, fragment by {}: {} times at the most "
-                 "common distance ({}% of {}); {} of {} played pairs close together, at {}; "
-                 "different pairs of {} played, {} shuffled and {} moved at {}; in {}",
-                 s.KindName(order[i].second.first), s.KindName(order[i].second.second),
-                 order[i].first, total == 0 ? 0 : order[i].first * 100 / total, total,
-                 found.pairs.size(), s.played_list.size(),
-                 Top(found.distances, 8,
-                     [](s64 d, size_t n) { return fmt::format("{:+d} x{}", d, n); }),
-                 s.group_sizes[PlayedGroup], s.group_sizes[ShuffledGroup],
-                 s.group_sizes[MovedGroup], groups.empty() ? std::string{"none"} : groups,
-                 Top(found.files, 4, [](const std::string& file, size_t n) {
-                     return fmt::format("{} x{}", file, n);
-                 }));
-        // Examples at the two most common distances.
-        std::vector<std::pair<size_t, s64>> distances;
-        for (const auto& [distance, n] : found.distances) {
-            distances.emplace_back(n, -distance);
-        }
-        std::sort(distances.rbegin(), distances.rend());
-        for (size_t d = 0; d < std::min<size_t>(distances.size(), 2); ++d) {
-            const auto it = found.examples.find(-distances[d].second);
-            if (it == found.examples.end()) {
+        std::sort(order.rbegin(), order.rend());
+        // Places that overlap the same id find the same pairs; those are shown once.
+        std::set<std::pair<size_t, size_t>> shown_counts;
+        size_t same = 0;
+        for (size_t i = 0; i < order.size() && shown_counts.size() < 12; ++i) {
+            const PairFinds& found = all.at(order[i].second);
+            if (!shown_counts.emplace(order[i].first, found.pairs.size()).second) {
+                ++same;
                 continue;
             }
-            const size_t shown_here = d == 0 ? EXAMPLES_PER_DISTANCE : 1;
-            for (size_t e = 0; e < std::min(it->second.size(), shown_here); ++e) {
-                const PairExample& example = it->second[e];
-                LOG_INFO(Frontend, "[ShaderScan] Unreal links:   {}", example.text);
-                // Ids next to a reference that the code package holds next to the code would
-                // tie the two together without the index.
-                static constexpr std::array<const char*, 4> SIDES{
-                    "before the vertex reference", "after the vertex reference",
-                    "before the fragment reference", "after the fragment reference"};
-                std::string places;
-                for (size_t side = 0; side < 4; ++side) {
-                    if (example.have[side]) {
-                        places += fmt::format("{}16 bytes {} ({}): {}", places.empty() ? "" : "; ",
-                                              SIDES[side], Hex(example.around[side], 0, 16),
-                                              s.FindInCodeWindows(example.around[side]));
-                    }
+            size_t total = 0;
+            for (const auto& [distance, n] : found.distances) {
+                total += n;
+            }
+            // Different pairs at the distances most played pairs are at, against the controls.
+            std::vector<std::pair<u32, s64>> by_pairs;
+            for (const auto& [distance, n] : found.distinct_at[PlayedGroup]) {
+                by_pairs.emplace_back(n, -distance);
+            }
+            std::sort(by_pairs.rbegin(), by_pairs.rend());
+            std::string groups;
+            for (size_t d = 0; d < std::min<size_t>(by_pairs.size(), 4); ++d) {
+                const s64 distance = -by_pairs[d].second;
+                const auto other = [&](u8 group) -> u32 {
+                    const auto it = found.distinct_at[group].find(distance);
+                    return it == found.distinct_at[group].end() ? 0 : it->second;
+                };
+                groups += fmt::format("{}{:+d}: {} played, {} shuffled, {} moved",
+                                      groups.empty() ? "" : "; ", distance, by_pairs[d].first,
+                                      other(ShuffledGroup), other(MovedGroup));
+            }
+            LOG_INFO(
+                Frontend,
+                "[ShaderScan] Unreal links: {}vertex by {}, fragment by {}: {} times at the most "
+                "common distance ({}% of {}); {} of {} played pairs close together, at {}; "
+                "different pairs of {} played, {} shuffled and {} moved at {}; in {}",
+                where, s.KindName(order[i].second.first), s.KindName(order[i].second.second),
+                order[i].first, total == 0 ? 0 : order[i].first * 100 / total, total,
+                found.pairs.size(), s.played_list.size(),
+                Top(found.distances, 8,
+                    [](s64 d, size_t n) { return fmt::format("{:+d} x{}", d, n); }),
+                s.group_sizes[PlayedGroup], s.group_sizes[ShuffledGroup], s.group_sizes[MovedGroup],
+                groups.empty() ? std::string{"none"} : groups,
+                Top(found.files, 4, [](const std::string& file, size_t n) {
+                    return fmt::format("{} x{}", file, n);
+                }));
+            // Examples at the two most common distances.
+            std::vector<std::pair<size_t, s64>> distances;
+            for (const auto& [distance, n] : found.distances) {
+                distances.emplace_back(n, -distance);
+            }
+            std::sort(distances.rbegin(), distances.rend());
+            for (size_t d = 0; d < std::min<size_t>(distances.size(), 2); ++d) {
+                const auto it = found.examples.find(-distances[d].second);
+                if (it == found.examples.end()) {
+                    continue;
                 }
-                if (!places.empty()) {
-                    LOG_INFO(Frontend, "[ShaderScan] Unreal links:     in the code package: {}",
-                             places);
+                const size_t shown_here = d == 0 ? EXAMPLES_PER_DISTANCE : 1;
+                for (size_t e = 0; e < std::min(it->second.size(), shown_here); ++e) {
+                    const PairExample& example = it->second[e];
+                    LOG_INFO(Frontend, "[ShaderScan] Unreal links:   {}", example.text);
+                    // Ids next to a reference that the code package holds next to the code would
+                    // tie the two together without the index.
+                    static constexpr std::array<const char*, 4> SIDES{
+                        "before the vertex reference", "after the vertex reference",
+                        "before the fragment reference", "after the fragment reference"};
+                    std::string places;
+                    for (size_t side = 0; side < 4; ++side) {
+                        if (example.have[side]) {
+                            places +=
+                                fmt::format("{}16 bytes {} ({}): {}", places.empty() ? "" : "; ",
+                                            SIDES[side], Hex(example.around[side], 0, 16),
+                                            s.FindInCodeWindows(example.around[side]));
+                        }
+                    }
+                    if (!places.empty()) {
+                        LOG_INFO(Frontend, "[ShaderScan] Unreal links:     in the code package: {}",
+                                 places);
+                    }
                 }
             }
         }
-    }
-    if (same > 0) {
-        LOG_INFO(Frontend,
-                 "[ShaderScan] Unreal links: {} more kinds of reference found the same numbers of "
-                 "pairs as one shown",
-                 same);
-    }
+        if (same > 0) {
+            LOG_INFO(
+                Frontend,
+                "[ShaderScan] Unreal links: {}{} more kinds of reference found the same numbers "
+                "of pairs as one shown",
+                where, same);
+        }
+    };
+    log_finds(s.finds, "");
+    log_finds(s.id_finds, "outside shader and material objects of other packages, by ids alone: ");
 }
 
 const std::vector<std::pair<u64, u64>>& LinkSurvey::LearnedPairs() const {
     return impl->learned;
+}
+
+const std::vector<std::pair<u64, u64>>& LinkSurvey::LearnFromOtherPackages() {
+    Impl& s = *impl;
+    if (s.studied && s.learned_elsewhere.empty() && !s.id_finds.empty()) {
+        s.learned_elsewhere = s.LearnFromIds();
+    }
+    return s.learned_elsewhere;
 }
 
 } // namespace Preforged::Unreal

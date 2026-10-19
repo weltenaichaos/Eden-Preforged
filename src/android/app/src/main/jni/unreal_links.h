@@ -55,6 +55,11 @@ public:
     /// most likely first. Empty when StudyCodePackage found no such field.
     [[nodiscard]] const std::vector<std::pair<u64, u64>>& LearnedPairs() const;
 
+    /// Vertex and fragment shader hashes that ids SearchPiece found outside shader and material
+    /// objects tie together, when one kind of id there lists the played pairs, most likely
+    /// first. Call once, after all packages are searched.
+    [[nodiscard]] const std::vector<std::pair<u64, u64>>& LearnFromOtherPackages();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

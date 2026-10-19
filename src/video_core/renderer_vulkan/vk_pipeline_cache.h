@@ -32,6 +32,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/preforged_state_variants.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -250,6 +251,10 @@ private:
 
     void QueueVulkanPipelineCacheFlush();
 
+    /// Logs, for a pipeline compiled during play, whether its shaders had a pipeline already
+    /// and which parts of the draw state set the two apart.
+    void LogStateVariant(const GraphicsPipelineCacheKey& key);
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
@@ -285,6 +290,11 @@ private:
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
+
+    PreforgedState::Tally state_tally;
+    size_t state_examples{};
+    std::chrono::steady_clock::time_point last_state_summary{};
+    std::chrono::steady_clock::duration state_search_time{};
 };
 
 } // namespace Vulkan
