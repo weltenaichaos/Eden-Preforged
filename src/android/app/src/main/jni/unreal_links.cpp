@@ -33,7 +33,7 @@ constexpr u32 NVN_CODE_MAGIC = 0x12345678;
 constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
 constexpr u64 SELF_BRANCH_B = 0xE2400FFFFF07000FULL;
 /// Hits kept per shader and kind of reference, to measure tables and pairs.
-constexpr size_t MAX_OFFSET_HITS = 16;
+constexpr size_t MAX_OFFSET_HITS = 64;
 constexpr size_t MAX_INDEX_HITS = 64;
 /// How far apart a vertex and a fragment shader's references may be to count as one record.
 constexpr s64 PAIR_WINDOW = 0x400;
@@ -66,7 +66,6 @@ constexpr size_t RUN_SHOWN = 32;
 /// of a pair, and searched for 8-byte ids.
 constexpr u64 FIELD_BEFORE = 0x200;
 constexpr u64 FIELD_AFTER = 0x40;
-constexpr size_t FIELD_SLOTS = (FIELD_BEFORE + FIELD_AFTER) / 4;
 /// Code headers looked at per shader that the package holds more than once.
 constexpr size_t MAX_COPIES = 4;
 /// How many headers on the moved control pairs are.
@@ -121,13 +120,13 @@ enum Kind : u32 {
     Index,           ///< Position among the code headers, from 0
     IndexFromOne,    ///< Position from 1
     Slot,            ///< Offset from the first code header in 256-byte steps
-    OffsetFromBase,  ///< Offset from a base the package's own tables point to
+    OffsetFromBase,  ///< Offset from the start of the part of the code holding it
     KIND_COUNT,
 };
 
 constexpr std::array<const char*, KIND_COUNT> KIND_NAMES{
     "package offset", "offset from the first code", "offset in its object", "index",
-    "index from 1",   "256-byte slot",              "offset from another base",
+    "index from 1",   "256-byte slot",              "offset from the start of its part of the code",
 };
 
 bool IsIndexKind(u32 kind) {
@@ -175,6 +174,13 @@ struct PairFinds {
     std::unordered_map<std::string, size_t> files;
     /// The first pairs found at each distance, for the first distances found.
     std::unordered_map<s64, std::vector<PairExample>> examples;
+    /// Per group of pairs (played, shuffled, moved on): at each distance, how many different
+    /// pairs of the group were found there.
+    std::array<std::unordered_map<s64, u32>, 3> distinct_at;
+    /// (group, pair, distance) counted already.
+    std::unordered_set<u64> distinct_seen;
+    /// Per distance, where in 4 bytes the vertex shader references of played pairs are.
+    std::unordered_map<s64, std::array<u32, 4>> residues;
 };
 
 /// A shader or material object of the package being searched, as offsets in what Unpack
@@ -301,10 +307,6 @@ Controls MakeControls(std::span<const PairCopies> played, u32 count) {
     return controls;
 }
 
-s64 SlotOffset(size_t slot) {
-    return static_cast<s64>(slot * 4) - static_cast<s64>(FIELD_BEFORE);
-}
-
 /// Where the bytes before each code header stop being the code before it: just past the end
 /// marker of the shader before. The fields and ids by a header are only read from there on.
 std::vector<u64> PrefixStarts(std::span<const u8> image, const std::vector<u64>& codes) {
@@ -327,95 +329,206 @@ std::vector<u64> PrefixStarts(std::span<const u8> image, const std::vector<u64>&
     return starts;
 }
 
-/// The 4-byte fields around every code header, and which of them hold a value few headers
-/// have there, which can tie two shaders together.
+/// The bytes at the same place relative to each shader: by its code header, or in its record
+/// in front of the code. Fields and ids are read from there.
+struct Window {
+    /// Where the bytes are, for the log.
+    std::string what;
+    /// The anchors are records apart from the code, which a field of another record may name.
+    bool records = false;
+    /// Per code header, what the places are counted from, 0 when it has none.
+    std::vector<u64> anchors;
+    /// Per code header, the bytes that belong to it: the bytes of other shaders are not read.
+    std::vector<u64> lows;
+    std::vector<u64> highs;
+    s64 before = 0;
+    s64 after = 0;
+    /// Ids are looked for before this place only.
+    s64 id_end = 0;
+    /// Most fields apart the places of a field two shaders share may be.
+    size_t max_shift = 0;
+
+    size_t Slots() const {
+        return static_cast<size_t>((after - before) / 4);
+    }
+    s64 Offset(size_t slot) const {
+        return before + static_cast<s64>(slot) * 4;
+    }
+    std::optional<u64> At(u32 code, s64 offset, u64 size) const {
+        const u64 anchor = anchors[code];
+        if (anchor == 0) {
+            return std::nullopt;
+        }
+        const s64 pos = static_cast<s64>(anchor) + offset;
+        if (pos < static_cast<s64>(lows[code]) || static_cast<u64>(pos) + size > highs[code]) {
+            return std::nullopt;
+        }
+        return static_cast<u64>(pos);
+    }
+    u32 Read32(std::span<const u8> image, u32 code, size_t slot) const {
+        const auto pos = At(code, Offset(slot), 4);
+        return pos ? Load32(image.data() + *pos) : 0;
+    }
+    std::optional<u64> Read64(std::span<const u8> image, u32 code, s64 offset) const {
+        const auto pos = At(code, offset, 8);
+        if (!pos) {
+            return std::nullopt;
+        }
+        return Load64(image.data() + *pos);
+    }
+    std::vector<u32> Anchored() const {
+        std::vector<u32> out;
+        for (u32 code = 0; code < anchors.size(); ++code) {
+            if (anchors[code] != 0) {
+                out.push_back(code);
+            }
+        }
+        return out;
+    }
+};
+
+Window CodeHeaderWindow(std::span<const u8> image, const std::vector<u64>& codes) {
+    Window window;
+    window.what = "by the code headers";
+    window.anchors = codes;
+    window.lows = PrefixStarts(image, codes);
+    window.highs.resize(codes.size());
+    for (size_t code = 0; code < codes.size(); ++code) {
+        window.highs[code] = std::min<u64>(image.size(), codes[code] + FIELD_AFTER);
+    }
+    window.before = -static_cast<s64>(FIELD_BEFORE);
+    window.after = static_cast<s64>(FIELD_AFTER);
+    window.id_end = 0;
+    window.max_shift = window.Slots() - 1;
+    return window;
+}
+
+/// The 4-byte fields of the shaders in played and control pairs, and which of them hold a
+/// value few shaders have there, which can tie two shaders together.
 struct Fields {
+    size_t slots = 0;
+    /// Per code header, its row of fields, or -1.
+    std::vector<s32> row_of;
     std::vector<u32> values;
     std::vector<u8> rare;
     size_t rare_max = 0;
 
     const u32* Of(u32 code) const {
-        return values.data() + size_t{code} * FIELD_SLOTS;
+        return values.data() + static_cast<size_t>(row_of[code]) * slots;
     }
     const u8* RareOf(u32 code) const {
-        return rare.data() + size_t{code} * FIELD_SLOTS;
+        return rare.data() + static_cast<size_t>(row_of[code]) * slots;
     }
 };
 
-Fields ReadFields(std::span<const u8> image, const std::vector<u64>& codes,
-                  const std::vector<u64>& starts) {
-    const u32 count = static_cast<u32>(codes.size());
+/// Reads the fields of the code headers `needed` marks, and logs per place how the fields of
+/// all shaders differ there.
+Fields ReadFields(std::span<const u8> image, const Window& window, const std::vector<u8>& needed) {
+    const u32 count = static_cast<u32>(window.anchors.size());
     Fields fields;
-    fields.values.assign(size_t{count} * FIELD_SLOTS, 0);
-    fields.rare.assign(size_t{count} * FIELD_SLOTS, 0);
-    fields.rare_max = std::max<size_t>(8, count / 100);
+    fields.slots = window.Slots();
+    fields.row_of.assign(count, -1);
+    const std::vector<u32> anchored = window.Anchored();
+    std::vector<u32> rows;
     for (u32 code = 0; code < count; ++code) {
-        for (size_t slot = 0; slot < FIELD_SLOTS; ++slot) {
-            const s64 at = static_cast<s64>(codes[code]) + SlotOffset(slot);
-            if (at >= static_cast<s64>(starts[code]) && static_cast<u64>(at) + 4 <= image.size()) {
-                fields.values[size_t{code} * FIELD_SLOTS + slot] =
-                    Load32(image.data() + static_cast<u64>(at));
-            }
+        if (needed[code]) {
+            fields.row_of[code] = static_cast<s32>(rows.size());
+            rows.push_back(code);
         }
     }
-    std::vector<std::pair<u32, u32>> column(count);
-    std::string profile;
-    for (size_t slot = 0; slot < FIELD_SLOTS; ++slot) {
-        for (u32 code = 0; code < count; ++code) {
-            column[code] = {fields.values[size_t{code} * FIELD_SLOTS + slot], code};
+    fields.values.assign(rows.size() * fields.slots, 0);
+    fields.rare.assign(rows.size() * fields.slots, 0);
+    fields.rare_max = std::max<size_t>(8, anchored.size() / 100);
+    for (size_t row = 0; row < rows.size(); ++row) {
+        for (size_t slot = 0; slot < fields.slots; ++slot) {
+            fields.values[row * fields.slots + slot] = window.Read32(image, rows[row], slot);
         }
-        std::sort(column.begin(), column.end());
-        size_t distinct = 0;
-        size_t zeros = 0;
-        size_t top = 0;
-        u32 top_value = 0;
-        for (size_t i = 0; i < column.size();) {
-            size_t j = i;
-            while (j < column.size() && column[j].first == column[i].first) {
-                ++j;
+    }
+    // A block of places at a time, so each shader's bytes are read in one go.
+    constexpr size_t BLOCK = 64;
+    const size_t n_codes = anchored.size();
+    std::vector<u32> block(n_codes * BLOCK);
+    std::vector<u32> column(n_codes);
+    std::string profile;
+    for (size_t first = 0; first < fields.slots; first += BLOCK) {
+        const size_t n = std::min(BLOCK, fields.slots - first);
+        for (size_t i = 0; i < n_codes; ++i) {
+            for (size_t k = 0; k < n; ++k) {
+                block[k * n_codes + i] = window.Read32(image, anchored[i], first + k);
             }
-            const u32 value = column[i].first;
-            ++distinct;
-            zeros += value == 0 ? j - i : 0;
-            if (j - i > top) {
-                top = j - i;
-                top_value = value;
+        }
+        for (size_t k = 0; k < n; ++k) {
+            const size_t slot = first + k;
+            std::copy_n(block.begin() + static_cast<std::ptrdiff_t>(k * n_codes), n_codes,
+                        column.begin());
+            std::sort(column.begin(), column.end());
+            size_t distinct = 0;
+            size_t zeros = 0;
+            size_t top = 0;
+            u32 top_value = 0;
+            for (size_t i = 0; i < column.size();) {
+                size_t j = i;
+                while (j < column.size() && column[j] == column[i]) {
+                    ++j;
+                }
+                ++distinct;
+                zeros += column[i] == 0 ? j - i : 0;
+                if (j - i > top) {
+                    top = j - i;
+                    top_value = column[i];
+                }
+                i = j;
             }
-            if (j - i <= fields.rare_max && value != 0 && value != 0xFFFFFFFF) {
-                for (size_t k = i; k < j; ++k) {
-                    fields.rare[size_t{column[k].second} * FIELD_SLOTS + slot] = 1;
+            for (size_t row = 0; row < rows.size(); ++row) {
+                const u32 value = fields.values[row * fields.slots + slot];
+                if (value == 0 || value == 0xFFFFFFFF) {
+                    continue;
+                }
+                const auto [low, high] = std::equal_range(column.begin(), column.end(), value);
+                if (static_cast<size_t>(high - low) <= fields.rare_max) {
+                    fields.rare[row * fields.slots + slot] = 1;
                 }
             }
-            i = j;
-        }
-        if (zeros == count) {
-            continue;
-        }
-        profile += fmt::format("{}{:+#x}: {}% zero, {} values, most {:#x} x{}",
-                               profile.empty() ? "" : "; ", SlotOffset(slot),
-                               zeros * 100 / std::max<u32>(count, 1), distinct, top_value, top);
-        if (profile.size() > 3000) {
-            LOG_INFO(Frontend, "[ShaderScan] Unreal links: fields by the code headers: {}",
-                     profile);
-            profile.clear();
+            if (zeros == n_codes) {
+                continue;
+            }
+            profile += fmt::format("{}{:+#x}: {}% zero, {} values, most {:#x} x{}",
+                                   profile.empty() ? "" : "; ", window.Offset(slot),
+                                   zeros * 100 / std::max<size_t>(n_codes, 1), distinct,
+                                   top_value, top);
+            if (profile.size() > 3000) {
+                LOG_INFO(Frontend, "[ShaderScan] Unreal links: fields {}: {}", window.what,
+                         profile);
+                profile.clear();
+            }
         }
     }
     if (!profile.empty()) {
-        LOG_INFO(Frontend, "[ShaderScan] Unreal links: fields by the code headers: {}", profile);
+        LOG_INFO(Frontend, "[ShaderScan] Unreal links: fields {}: {}", window.what, profile);
     }
     return fields;
 }
 
-/// Per pair of fields (vertex shader field, fragment shader field): how many pairs hold the
-/// same rare value in both. A pair counts once, whichever of its copies match.
+/// The two places of a cell of CountShared: the vertex shader's and the fragment shader's.
+std::pair<size_t, size_t> CellSlots(size_t cell, size_t max_shift) {
+    const size_t shifts = 2 * max_shift + 1;
+    const size_t a = cell / shifts;
+    return {a, a + cell % shifts - max_shift};
+}
+
+/// Per pair of fields (vertex shader field, fragment shader field at most `max_shift` fields
+/// away): how many pairs hold the same rare value in both. A pair counts once, whichever of
+/// its copies match.
 std::vector<u32> CountShared(const Fields& fields, std::span<const PairCopies> pairs,
-                             std::vector<u32>* examples) {
-    constexpr size_t CELLS = FIELD_SLOTS * FIELD_SLOTS;
-    std::vector<u32> counts(CELLS, 0);
+                             size_t max_shift, std::vector<u32>* examples) {
+    const size_t slots = fields.slots;
+    const size_t shifts = 2 * max_shift + 1;
+    const size_t cells = slots * shifts;
+    std::vector<u32> counts(cells, 0);
     if (examples) {
-        examples->assign(CELLS, 0);
+        examples->assign(cells, 0);
     }
-    std::vector<u64> seen((CELLS + 63) / 64);
+    std::vector<u64> seen((cells + 63) / 64);
     for (const PairCopies& pair : pairs) {
         std::fill(seen.begin(), seen.end(), 0);
         for (const u32 v : pair.vertex) {
@@ -424,13 +537,15 @@ std::vector<u32> CountShared(const Fields& fields, std::span<const PairCopies> p
             for (const u32 f : pair.fragment) {
                 const u32* fragment = fields.Of(f);
                 const u8* fragment_rare = fields.RareOf(f);
-                for (size_t a = 0; a < FIELD_SLOTS; ++a) {
+                for (size_t a = 0; a < slots; ++a) {
                     if (!vertex_rare[a]) {
                         continue;
                     }
-                    for (size_t b = 0; b < FIELD_SLOTS; ++b) {
+                    const size_t low = a > max_shift ? a - max_shift : 0;
+                    const size_t high = std::min(slots, a + max_shift + 1);
+                    for (size_t b = low; b < high; ++b) {
                         if (fragment_rare[b] && fragment[b] == vertex[a]) {
-                            const size_t cell = a * FIELD_SLOTS + b;
+                            const size_t cell = a * shifts + (b + max_shift - a);
                             seen[cell / 64] |= u64{1} << (cell % 64);
                             if (examples && (*examples)[cell] == 0) {
                                 (*examples)[cell] = vertex[a];
@@ -457,21 +572,33 @@ enum RefForm : u32 {
     RefOffsetFromFirst,
     RefIndexStep,
     RefOffsetStep,
+    RefRecordOffset,
+    RefRecordStep,
+    RefRecordFromFirst,
     REF_FORMS,
 };
 
 constexpr std::array<const char*, REF_FORMS> REF_FORM_NAMES{
-    "index", "index from 1", "package offset", "offset from the first code",
-    "headers between them", "bytes between them",
+    "index",
+    "index from 1",
+    "package offset",
+    "offset from the first code",
+    "headers between them",
+    "bytes between them",
+    "record's package offset",
+    "bytes between the records",
+    "record's offset from the first record",
 };
 
 /// Per direction (0: a vertex field names the fragment shader, 1: the other way), form and
 /// field: how many pairs have it.
 std::vector<u32> CountPartnerRefs(const Fields& fields, std::span<const PairCopies> pairs,
-                                  const std::vector<u64>& codes, u64 first_code) {
-    constexpr size_t CELLS = 2 * REF_FORMS * FIELD_SLOTS;
-    std::vector<u32> counts(CELLS, 0);
-    std::vector<u8> seen(CELLS);
+                                  const std::vector<u64>& codes, u64 first_code,
+                                  const Window& window, u64 first_record) {
+    const size_t slots = fields.slots;
+    const size_t cells = 2 * REF_FORMS * slots;
+    std::vector<u32> counts(cells, 0);
+    std::vector<u8> seen(cells);
     for (const PairCopies& pair : pairs) {
         std::fill(seen.begin(), seen.end(), 0);
         for (const u32 v : pair.vertex) {
@@ -479,6 +606,8 @@ std::vector<u32> CountPartnerRefs(const Fields& fields, std::span<const PairCopi
                 for (u32 direction = 0; direction < 2; ++direction) {
                     const u32 holder = direction == 0 ? v : f;
                     const u32 other = direction == 0 ? f : v;
+                    const bool records = window.records && window.anchors[holder] != 0 &&
+                                         window.anchors[other] != 0;
                     const std::array<u32, REF_FORMS> forms{
                         other,
                         other + 1,
@@ -486,151 +615,58 @@ std::vector<u32> CountPartnerRefs(const Fields& fields, std::span<const PairCopi
                         static_cast<u32>(codes[other] - first_code),
                         other - holder,
                         static_cast<u32>(codes[other] - codes[holder]),
+                        records ? static_cast<u32>(window.anchors[other]) : 0U,
+                        records ? static_cast<u32>(window.anchors[other] - window.anchors[holder])
+                                : 0U,
+                        records ? static_cast<u32>(window.anchors[other] - first_record) : 0U,
                     };
                     const u32* values = fields.Of(holder);
                     for (u32 form = 0; form < REF_FORMS; ++form) {
                         if (forms[form] == 0) {
                             continue;
                         }
-                        for (size_t slot = 0; slot < FIELD_SLOTS; ++slot) {
+                        for (size_t slot = 0; slot < slots; ++slot) {
                             if (values[slot] == forms[form]) {
-                                seen[(direction * REF_FORMS + form) * FIELD_SLOTS + slot] = 1;
+                                seen[(direction * REF_FORMS + form) * slots + slot] = 1;
                             }
                         }
                     }
                 }
             }
         }
-        for (size_t cell = 0; cell < CELLS; ++cell) {
+        for (size_t cell = 0; cell < cells; ++cell) {
             counts[cell] += seen[cell];
         }
     }
     return counts;
 }
 
-/// Logs which fields around the code headers the two shaders of a played pair share, or use
-/// to name each other, against the controls. When one field ties most played pairs together
-/// and few random ones, returns the pairs it ties for every shader in the package.
-std::vector<std::pair<u64, u64>> StudyFields(std::span<const u8> image,
-                                             const std::vector<u64>& codes,
-                                             const std::vector<u64>& starts, u64 first_code,
-                                             std::span<const PairCopies> played,
-                                             const Controls& controls,
-                                             const std::vector<u64>& hash_of,
-                                             const std::vector<LinkSurvey::Stage>& stage_of) {
-    const auto start = std::chrono::steady_clock::now();
-    const u32 count = static_cast<u32>(codes.size());
-    const Fields fields = ReadFields(image, codes, starts);
-    std::vector<u32> examples;
-    const std::vector<u32> shared = CountShared(fields, played, &examples);
-    const std::vector<u32> shared_shuffled = CountShared(fields, controls.shuffled, nullptr);
-    const std::vector<u32> shared_shifted = CountShared(fields, controls.shifted, nullptr);
-    std::vector<size_t> cells(shared.size());
-    std::iota(cells.begin(), cells.end(), size_t{0});
-    const auto score = [&](size_t cell) {
-        return static_cast<s64>(shared[cell]) -
-               static_cast<s64>(std::max(shared_shuffled[cell], shared_shifted[cell]));
-    };
-    std::sort(cells.begin(), cells.end(), [&](size_t a, size_t b) {
-        return score(a) != score(b) ? score(a) > score(b) : a < b;
-    });
-    std::string line;
-    for (size_t i = 0; i < std::min<size_t>(cells.size(), 10); ++i) {
-        const size_t cell = cells[i];
-        if (shared[cell] < 3) {
-            break;
-        }
-        line += fmt::format("{}vertex {:+#x} = fragment {:+#x}: {} played, {} shuffled, {} "
-                            "moved (e.g. {:#x})",
-                            line.empty() ? "" : "; ", SlotOffset(cell / FIELD_SLOTS),
-                            SlotOffset(cell % FIELD_SLOTS), shared[cell], shared_shuffled[cell],
-                            shared_shifted[cell], examples[cell]);
-    }
-    LOG_INFO(Frontend,
-             "[ShaderScan] Unreal links: fields the two shaders of a pair share (values at most "
-             "{} headers have there; {} played pairs, as many shuffled, {} moved {} headers on): "
-             "{}",
-             fields.rare_max, played.size(), controls.shifted.size(), CONTROL_SHIFT,
-             line.empty() ? std::string{"none"} : line);
-
-    const std::vector<u32> refs = CountPartnerRefs(fields, played, codes, first_code);
-    const std::vector<u32> refs_shuffled =
-        CountPartnerRefs(fields, controls.shuffled, codes, first_code);
-    const std::vector<u32> refs_shifted =
-        CountPartnerRefs(fields, controls.shifted, codes, first_code);
-    std::vector<size_t> ref_cells(refs.size());
-    std::iota(ref_cells.begin(), ref_cells.end(), size_t{0});
-    const auto ref_score = [&](size_t cell) {
-        return static_cast<s64>(refs[cell]) -
-               static_cast<s64>(std::max(refs_shuffled[cell], refs_shifted[cell]));
-    };
-    std::sort(ref_cells.begin(), ref_cells.end(), [&](size_t a, size_t b) {
-        return ref_score(a) != ref_score(b) ? ref_score(a) > ref_score(b) : a < b;
-    });
-    line.clear();
-    for (size_t i = 0; i < std::min<size_t>(ref_cells.size(), 6); ++i) {
-        const size_t cell = ref_cells[i];
-        if (refs[cell] < 3) {
-            break;
-        }
-        const size_t direction = cell / (REF_FORMS * FIELD_SLOTS);
-        const size_t form = cell / FIELD_SLOTS % REF_FORMS;
-        line += fmt::format("{}{} field {:+#x} holds the {}'s {}: {} played, {} shuffled, {} "
-                            "moved",
-                            line.empty() ? "" : "; ", direction == 0 ? "vertex" : "fragment",
-                            SlotOffset(cell % FIELD_SLOTS),
-                            direction == 0 ? "fragment shader" : "vertex shader",
-                            REF_FORM_NAMES[form], refs[cell], refs_shuffled[cell],
-                            refs_shifted[cell]);
-    }
-    LOG_INFO(Frontend,
-             "[ShaderScan] Unreal links: fields that name the other shader of a pair: {}",
-             line.empty() ? std::string{"none"} : line);
-
-    // A link ties most played pairs and few random ones.
-    const size_t best = cells.front();
-    const u32 strong = shared[best];
-    const bool link = strong >= std::max<size_t>(10, played.size() / 4) &&
-                      strong >= 5 * std::max<u32>(shared_shuffled[best], 1);
-    std::vector<std::pair<u64, u64>> learned;
-    if (!link) {
-        LOG_INFO(Frontend,
-                 "[ShaderScan] Unreal links: no field ties most played pairs and few shuffled "
-                 "ones, so no pairs are learned ({} ms)",
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - start)
-                     .count());
-        return learned;
-    }
-    const size_t a = best / FIELD_SLOTS;
-    const size_t b = best % FIELD_SLOTS;
-    std::unordered_map<u32, std::vector<u32>> vertex_by;
-    std::unordered_map<u32, std::vector<u32>> fragment_by;
-    for (u32 code = 0; code < count; ++code) {
-        if (stage_of[code] == LinkSurvey::Stage::Vertex && fields.RareOf(code)[a]) {
-            vertex_by[fields.Of(code)[a]].push_back(code);
-        }
-        if (stage_of[code] == LinkSurvey::Stage::Fragment && fields.RareOf(code)[b]) {
-            fragment_by[fields.Of(code)[b]].push_back(code);
-        }
-    }
-    std::vector<std::pair<u64, u64>> candidates;
-    bool capped = false;
-    for (const auto& [value, vertices] : vertex_by) {
-        const auto it = fragment_by.find(value);
-        if (it == fragment_by.end()) {
-            continue;
-        }
-        for (const u32 v : vertices) {
-            for (const u32 f : it->second) {
-                if (candidates.size() >= MAX_CANDIDATES) {
-                    capped = true;
-                    break;
-                }
-                candidates.emplace_back(hash_of[v], hash_of[f]);
+/// The code headers of the played pairs and the controls.
+std::vector<u8> PairCodes(u32 count, std::span<const PairCopies> played, const Controls& controls) {
+    std::vector<u8> mask(count, 0);
+    const auto mark = [&](std::span<const PairCopies> pairs) {
+        for (const PairCopies& pair : pairs) {
+            for (const u32 code : pair.vertex) {
+                mask[code] = 1;
+            }
+            for (const u32 code : pair.fragment) {
+                mask[code] = 1;
             }
         }
-    }
+    };
+    mark(played);
+    mark(controls.shuffled);
+    mark(controls.shifted);
+    return mask;
+}
+
+/// Orders learned pairs for pre-compiling, those of the played vertex shaders first, keeps the
+/// first MAX_LEARNED_PAIRS and logs how well they hold the played pairs.
+std::vector<std::pair<u64, u64>> RankLearned(std::vector<std::pair<u64, u64>> candidates,
+                                             std::span<const PairCopies> played,
+                                             const std::vector<u64>& hash_of,
+                                             const std::string& what, bool capped,
+                                             std::chrono::steady_clock::time_point start) {
     std::sort(candidates.begin(), candidates.end());
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
     // How well the link finds the played pairs, and how many fragment shaders it gives each
@@ -657,14 +693,15 @@ std::vector<std::pair<u64, u64>> StudyFields(std::span<const u8> image,
     for (const auto& [vertex, n] : per_played_vertex) {
         per_vertex_total += n;
     }
-    // Pairs whose vertex shader the game drew first: the game is more likely to draw those.
+    // Pairs whose vertex shader the game drew: the game is more likely to draw those.
     const auto rank = [&](const std::pair<u64, u64>& pair) {
-        return played_vertex.contains(pair.first) ? 0 : played_fragment.contains(pair.second) ? 1 : 2;
+        return played_vertex.contains(pair.first)       ? 0
+               : played_fragment.contains(pair.second) ? 1
+                                                       : 2;
     };
     std::stable_sort(candidates.begin(), candidates.end(),
                      [&](const auto& x, const auto& y) { return rank(x) < rank(y); });
     const size_t kept = std::min(candidates.size(), MAX_LEARNED_PAIRS);
-    learned.assign(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(kept));
     std::set<u64> vertex_shaders;
     std::set<u64> fragment_shaders;
     for (const auto& [vertex, fragment] : candidates) {
@@ -672,17 +709,185 @@ std::vector<std::pair<u64, u64>> StudyFields(std::span<const u8> image,
         fragment_shaders.insert(fragment);
     }
     LOG_INFO(Frontend,
-             "[ShaderScan] Unreal links: learned link vertex {:+#x} = fragment {:+#x} ties {}{} "
-             "pairs of {} vertex and {} fragment shaders; it holds {} of {} played pairs; {} "
-             "played vertex shaders get {} fragment shaders each on average; {} pairs kept for "
-             "pre-compiling, played vertex shaders first ({} ms)",
-             SlotOffset(a), SlotOffset(b), capped ? "more than " : "", candidates.size(),
-             vertex_shaders.size(), fragment_shaders.size(), found, played_hashes.size(),
-             per_played_vertex.size(),
+             "[ShaderScan] Unreal links: {} ties {}{} pairs of {} vertex and {} fragment "
+             "shaders; it holds {} of {} played pairs; {} played vertex shaders get {} fragment "
+             "shaders each on average; {} pairs kept for pre-compiling, played vertex shaders "
+             "first ({} ms)",
+             what, capped ? "more than " : "", candidates.size(), vertex_shaders.size(),
+             fragment_shaders.size(), found, played_hashes.size(), per_played_vertex.size(),
              per_played_vertex.empty() ? 0 : per_vertex_total / per_played_vertex.size(), kept,
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - start)
                  .count());
+    candidates.resize(kept);
+    return candidates;
+}
+
+/// Logs which fields of the window the two shaders of a played pair share, or use to name each
+/// other, against the controls. When one field ties most played pairs together and few random
+/// ones, returns the pairs it ties for every shader in the package.
+std::vector<std::pair<u64, u64>> StudyFields(std::span<const u8> image, const Window& window,
+                                             const std::vector<u64>& codes, u64 first_code,
+                                             std::span<const PairCopies> played,
+                                             const Controls& controls,
+                                             const std::vector<u64>& hash_of,
+                                             const std::vector<LinkSurvey::Stage>& stage_of) {
+    const auto start = std::chrono::steady_clock::now();
+    const u32 count = static_cast<u32>(codes.size());
+    const Fields fields = ReadFields(image, window, PairCodes(count, played, controls));
+    const size_t max_shift = window.max_shift;
+    std::vector<u32> examples;
+    const std::vector<u32> shared = CountShared(fields, played, max_shift, &examples);
+    const std::vector<u32> shared_shuffled =
+        CountShared(fields, controls.shuffled, max_shift, nullptr);
+    const std::vector<u32> shared_shifted =
+        CountShared(fields, controls.shifted, max_shift, nullptr);
+    std::vector<size_t> cells(shared.size());
+    std::iota(cells.begin(), cells.end(), size_t{0});
+    const auto score = [&](size_t cell) {
+        return static_cast<s64>(shared[cell]) -
+               static_cast<s64>(std::max(shared_shuffled[cell], shared_shifted[cell]));
+    };
+    std::sort(cells.begin(), cells.end(), [&](size_t a, size_t b) {
+        return score(a) != score(b) ? score(a) > score(b) : a < b;
+    });
+    std::string line;
+    for (size_t i = 0; i < std::min<size_t>(cells.size(), 10); ++i) {
+        const size_t cell = cells[i];
+        if (shared[cell] < 3) {
+            break;
+        }
+        const auto [a, b] = CellSlots(cell, max_shift);
+        line += fmt::format("{}vertex {:+#x} = fragment {:+#x}: {} played, {} shuffled, {} "
+                            "moved (e.g. {:#x})",
+                            line.empty() ? "" : "; ", window.Offset(a), window.Offset(b),
+                            shared[cell], shared_shuffled[cell], shared_shifted[cell],
+                            examples[cell]);
+    }
+    LOG_INFO(Frontend,
+             "[ShaderScan] Unreal links: fields {} the two shaders of a pair share (values at "
+             "most {} shaders have there; {} played pairs, as many shuffled, {} moved {} headers "
+             "on): {}",
+             window.what, fields.rare_max, played.size(), controls.shifted.size(), CONTROL_SHIFT,
+             line.empty() ? std::string{"none"} : line);
+
+    u64 first_record = ~u64{0};
+    for (const u64 anchor : window.anchors) {
+        if (anchor != 0) {
+            first_record = std::min(first_record, anchor);
+        }
+    }
+    const std::vector<u32> refs =
+        CountPartnerRefs(fields, played, codes, first_code, window, first_record);
+    const std::vector<u32> refs_shuffled =
+        CountPartnerRefs(fields, controls.shuffled, codes, first_code, window, first_record);
+    const std::vector<u32> refs_shifted =
+        CountPartnerRefs(fields, controls.shifted, codes, first_code, window, first_record);
+    std::vector<size_t> ref_cells(refs.size());
+    std::iota(ref_cells.begin(), ref_cells.end(), size_t{0});
+    const auto ref_score = [&](size_t cell) {
+        return static_cast<s64>(refs[cell]) -
+               static_cast<s64>(std::max(refs_shuffled[cell], refs_shifted[cell]));
+    };
+    std::sort(ref_cells.begin(), ref_cells.end(), [&](size_t a, size_t b) {
+        return ref_score(a) != ref_score(b) ? ref_score(a) > ref_score(b) : a < b;
+    });
+    line.clear();
+    for (size_t i = 0; i < std::min<size_t>(ref_cells.size(), 6); ++i) {
+        const size_t cell = ref_cells[i];
+        if (refs[cell] < 3) {
+            break;
+        }
+        const size_t direction = cell / (REF_FORMS * fields.slots);
+        const size_t form = cell / fields.slots % REF_FORMS;
+        line += fmt::format("{}{} field {:+#x} holds the {}'s {}: {} played, {} shuffled, {} "
+                            "moved",
+                            line.empty() ? "" : "; ", direction == 0 ? "vertex" : "fragment",
+                            window.Offset(cell % fields.slots),
+                            direction == 0 ? "fragment shader" : "vertex shader",
+                            REF_FORM_NAMES[form], refs[cell], refs_shuffled[cell],
+                            refs_shifted[cell]);
+    }
+    LOG_INFO(Frontend,
+             "[ShaderScan] Unreal links: fields {} that name the other shader of a pair: {}",
+             window.what, line.empty() ? std::string{"none"} : line);
+
+    // A link ties most played pairs and few random ones.
+    std::vector<std::pair<u64, u64>> learned;
+    const size_t best = cells.empty() ? 0 : cells.front();
+    const u32 strong = cells.empty() ? 0 : shared[best];
+    const bool link = strong >= std::max<size_t>(10, played.size() / 4) &&
+                      strong >= 5 * std::max<u32>(shared_shuffled[best], 1);
+    if (!link) {
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: no field {} ties most played pairs and few shuffled "
+                 "ones, so no pairs are learned from them ({} ms)",
+                 window.what,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count());
+        return learned;
+    }
+    const auto [a, b] = CellSlots(best, max_shift);
+    // Values few shaders have at the two places, over all shaders.
+    const auto column_counts = [&](size_t slot) {
+        std::unordered_map<u32, u32> counts;
+        for (u32 code = 0; code < count; ++code) {
+            if (window.anchors[code] != 0) {
+                ++counts[window.Read32(image, code, slot)];
+            }
+        }
+        return counts;
+    };
+    const std::unordered_map<u32, u32> counts_a = column_counts(a);
+    const std::unordered_map<u32, u32> counts_b = a == b ? counts_a : column_counts(b);
+    const auto rare_at = [&](const std::unordered_map<u32, u32>& counts, u32 value) {
+        if (value == 0 || value == 0xFFFFFFFF) {
+            return false;
+        }
+        const auto it = counts.find(value);
+        return it != counts.end() && it->second <= fields.rare_max;
+    };
+    std::unordered_map<u32, std::vector<u32>> vertex_by;
+    std::unordered_map<u32, std::vector<u32>> fragment_by;
+    for (u32 code = 0; code < count; ++code) {
+        if (window.anchors[code] == 0) {
+            continue;
+        }
+        if (stage_of[code] == LinkSurvey::Stage::Vertex) {
+            const u32 value = window.Read32(image, code, a);
+            if (rare_at(counts_a, value)) {
+                vertex_by[value].push_back(code);
+            }
+        }
+        if (stage_of[code] == LinkSurvey::Stage::Fragment) {
+            const u32 value = window.Read32(image, code, b);
+            if (rare_at(counts_b, value)) {
+                fragment_by[value].push_back(code);
+            }
+        }
+    }
+    std::vector<std::pair<u64, u64>> candidates;
+    bool capped = false;
+    for (const auto& [value, vertices] : vertex_by) {
+        const auto it = fragment_by.find(value);
+        if (it == fragment_by.end()) {
+            continue;
+        }
+        for (const u32 v : vertices) {
+            for (const u32 f : it->second) {
+                if (candidates.size() >= MAX_CANDIDATES) {
+                    capped = true;
+                    break;
+                }
+                candidates.emplace_back(hash_of[v], hash_of[f]);
+            }
+        }
+    }
+    learned = RankLearned(std::move(candidates), played, hash_of,
+                          fmt::format("learned link vertex {:+#x} = fragment {:+#x} {}",
+                                      window.Offset(a), window.Offset(b), window.what),
+                          capped, start);
     return learned;
 }
 
@@ -693,40 +898,43 @@ struct IdEntry {
     u32 window;
 };
 
-/// Places by the code headers where most headers hold a different 8-byte value: possible ids.
-std::vector<s32> ChooseIdWindows(std::span<const u8> image, const std::vector<u64>& codes,
-                                 const std::vector<u64>& starts) {
+/// Places in the window where most shaders hold a different 8-byte value: possible ids.
+std::vector<s32> ChooseIdWindows(std::span<const u8> image, const Window& window, size_t most) {
     struct Candidate {
         s32 at;
         double distinct;
     };
+    std::vector<u32> sample = window.Anchored();
+    if (sample.size() > 8192) {
+        std::vector<u32> fewer;
+        for (size_t i = 0; i < 8192; ++i) {
+            fewer.push_back(sample[i * sample.size() / 8192]);
+        }
+        sample = std::move(fewer);
+    }
     std::vector<Candidate> candidates;
     std::vector<u64> values;
-    for (s64 at = -static_cast<s64>(FIELD_BEFORE); at <= -8; at += 4) {
+    for (s64 at = window.before; at <= window.id_end - 8; at += 4) {
         values.clear();
         size_t zero_bytes = 0;
-        for (size_t code = 0; code < codes.size(); ++code) {
-            const s64 pos = static_cast<s64>(codes[code]) + at;
-            if (pos < static_cast<s64>(starts[code]) || static_cast<u64>(pos) + 8 > image.size()) {
+        for (const u32 code : sample) {
+            const std::optional<u64> value = window.Read64(image, code, at);
+            if (!value || *value == 0) {
                 continue;
             }
-            const u64 value = Load64(image.data() + static_cast<u64>(pos));
-            if (value == 0) {
-                continue;
-            }
-            values.push_back(value);
+            values.push_back(*value);
             for (u32 byte = 0; byte < 8; ++byte) {
-                zero_bytes += ((value >> (byte * 8)) & 0xFF) == 0 ? 1 : 0;
+                zero_bytes += ((*value >> (byte * 8)) & 0xFF) == 0 ? 1 : 0;
             }
         }
-        if (values.size() < std::max<size_t>(16, codes.size() / 2) ||
+        if (values.size() < std::max<size_t>(16, sample.size() / 2) ||
             zero_bytes > 3 * values.size()) {
             continue;
         }
         std::sort(values.begin(), values.end());
         const size_t distinct = static_cast<size_t>(
             std::unique(values.begin(), values.end()) - values.begin());
-        const double share = static_cast<double>(distinct) / static_cast<double>(codes.size());
+        const double share = static_cast<double>(distinct) / static_cast<double>(sample.size());
         if (share >= 0.5) {
             candidates.push_back({static_cast<s32>(at), share});
         }
@@ -736,8 +944,9 @@ std::vector<s32> ChooseIdWindows(std::span<const u8> image, const std::vector<u6
     });
     std::vector<s32> kept;
     for (const Candidate& candidate : candidates) {
-        if (kept.size() < MAX_CODE_ID_WINDOWS &&
-            std::ranges::none_of(kept, [&](s32 other) { return std::abs(other - candidate.at) < 8; })) {
+        if (kept.size() < most && std::ranges::none_of(kept, [&](s32 other) {
+                return std::abs(other - candidate.at) < 8;
+            })) {
             kept.push_back(candidate.at);
         }
     }
@@ -745,29 +954,33 @@ std::vector<s32> ChooseIdWindows(std::span<const u8> image, const std::vector<u6
     return kept;
 }
 
-/// Searches the code package outside the code for the ids by every code header, and logs
-/// whether the two shaders of a played pair are listed close together there, against the
-/// controls.
-void StudyCodeIds(std::span<const u8> image, const std::vector<u64>& codes,
-                  const std::vector<u64>& starts, u64 first_code, u64 code_end,
+/// Searches the code package outside the code for the ids in the window of every shader, and
+/// logs whether the two shaders of a played pair are listed close together there, against
+/// the controls.
+void StudyCodeIds(std::span<const u8> image, const Window& window, u64 first_code, u64 code_end,
                   std::span<const s32> windows, std::span<const PairCopies> played,
                   const Controls& controls, const std::vector<u8>& played_mask,
                   const std::function<bool()>& stopped) {
     const auto start = std::chrono::steady_clock::now();
-    const u32 count = static_cast<u32>(codes.size());
+    const u32 count = static_cast<u32>(window.anchors.size());
     std::vector<IdEntry> entries;
+    // Where the ids are in the window of each shader: another copy of a shader may have the
+    // same id there, which is not a reference.
+    std::vector<u64> own_places;
     for (u32 w = 0; w < windows.size(); ++w) {
         for (u32 code = 0; code < count; ++code) {
-            const s64 pos = static_cast<s64>(codes[code]) + windows[w];
-            if (pos < static_cast<s64>(starts[code]) || static_cast<u64>(pos) + 8 > image.size()) {
+            const std::optional<u64> pos = window.At(code, windows[w], 8);
+            if (!pos) {
                 continue;
             }
-            const u64 value = Load64(image.data() + static_cast<u64>(pos));
+            own_places.push_back(*pos);
+            const u64 value = Load64(image.data() + *pos);
             if (value != 0) {
                 entries.push_back({value, code, w});
             }
         }
     }
+    std::sort(own_places.begin(), own_places.end());
     std::sort(entries.begin(), entries.end(), [](const IdEntry& x, const IdEntry& y) {
         return x.value != y.value ? x.value < y.value : x.code < y.code;
     });
@@ -784,6 +997,7 @@ void StudyCodeIds(std::span<const u8> image, const std::vector<u64>& codes,
     std::vector<IdHit> hits;
     bool capped = false;
     u64 searched = 0;
+    size_t copies = 0;
     const auto search = [&](u64 begin, u64 end) {
         for (u64 pos = begin; pos + 8 <= end; ++pos) {
             if ((pos & 0xFFFFF) == 0 && stopped()) {
@@ -796,10 +1010,18 @@ void StudyCodeIds(std::span<const u8> image, const std::vector<u64>& codes,
             }
             auto it = std::lower_bound(entries.begin(), entries.end(), value,
                                        [](const IdEntry& e, u64 v) { return e.value < v; });
+            if (it == entries.end() || it->value != value) {
+                continue;
+            }
+            if (std::binary_search(own_places.begin(), own_places.end(), pos)) {
+                ++copies;
+                continue;
+            }
             for (; it != entries.end() && it->value == value; ++it) {
-                const u64 own = codes[it->code];
-                if (pos + FIELD_BEFORE >= own && pos < own + FIELD_AFTER) {
-                    continue; // The id by its own code header.
+                const s64 own = static_cast<s64>(window.anchors[it->code]);
+                const s64 at = static_cast<s64>(pos);
+                if (at >= own + window.before && at < own + window.after) {
+                    continue; // In the shader's own window.
                 }
                 if (hits.size() >= MAX_ID_HITS) {
                     capped = true;
@@ -852,9 +1074,11 @@ void StudyCodeIds(std::span<const u8> image, const std::vector<u64>& codes,
             Top(steps, 5, [](s64 d, size_t n) { return fmt::format("+{:#x} x{}", d, n); }));
     }
     LOG_INFO(Frontend,
-             "[ShaderScan] Unreal links: ids by the code headers, looked for in {} MiB of the "
-             "code package outside the code ({} code headers, {} hits{}, {} ms): {}",
-             searched >> 20, count, hits.size(), capped ? ", stopped at the limit" : "",
+             "[ShaderScan] Unreal links: ids {}, looked for in {} MiB of the code package "
+             "outside the code ({} code headers, {} hits{}, {} more at the same place of another "
+             "shader, {} ms): {}",
+             window.what, searched >> 20, count, hits.size(),
+             capped ? ", stopped at the limit" : "", copies,
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - start)
                  .count(),
@@ -923,9 +1147,9 @@ void StudyCodeIds(std::span<const u8> image, const std::vector<u64>& codes,
     const std::string shuffled_line = closeness(controls.shuffled, nullptr, nullptr);
     const std::string shifted_line = closeness(controls.shifted, nullptr, nullptr);
     LOG_INFO(Frontend,
-             "[ShaderScan] Unreal links: how far apart the ids of a pair's two shaders are, "
+             "[ShaderScan] Unreal links: how far apart the ids {} of a pair's two shaders are, "
              "played pairs: {}; shuffled: {}; moved {} headers on: {}; played pairs at {}",
-             played_line, shuffled_line, CONTROL_SHIFT, shifted_line,
+             window.what, played_line, shuffled_line, CONTROL_SHIFT, shifted_line,
              Top(distances, 8, [](s64 d, size_t n) { return fmt::format("{:+#x} x{}", d, n); }));
     if (example) {
         const u64 from = std::min(example->first, example->second);
@@ -938,6 +1162,394 @@ void StudyCodeIds(std::span<const u8> image, const std::vector<u64>& codes,
                  Hex(image, begin, std::min<u64>(to + 0x40 - begin, 0x600)));
     }
 }
+
+/// Ways a shader's record may give the size of its code.
+enum SizeKind : u32 {
+    ToNextHeader,
+    ToEnd,
+    ToEndPastHeader,
+    ToEndPastHeaders,
+    ToEndRounded,
+    ToEndPastHeaderRounded,
+    ToEndPastHeadersRounded,
+    SIZE_KINDS,
+};
+
+constexpr std::array<const char*, SIZE_KINDS> SIZE_KIND_NAMES{
+    "bytes to the next code header",
+    "bytes to the end of the code",
+    "bytes to the end of the code past its 0x30-byte header",
+    "bytes to the end of the code past its first 0x80 bytes",
+    "bytes to the end of the code rounded up to 0x100",
+    "bytes to the end of the code past its 0x30-byte header rounded up to 0x100",
+    "bytes to the end of the code past its first 0x80 bytes rounded up to 0x100",
+};
+
+/// Values counted in front of the code, and how many of them are tried as record starts.
+constexpr size_t MARKERS_COUNTED = 32;
+constexpr size_t MARKERS_LOGGED = 20;
+constexpr size_t MARKERS_TRIED = 6;
+/// Places of a marker looked at for the next shader's record, and after how many shaders in a
+/// row without one the next place with its size is looked for farther on.
+constexpr size_t RECORD_LOOKAHEAD = 8;
+constexpr size_t RECORD_RESYNC_AFTER = 20;
+constexpr size_t RECORD_RESYNC = 1024;
+/// Shaders matched before a way of tying records to them is given up when few match.
+constexpr size_t RECORD_TRIAL = 300;
+/// Bytes shown from the start of the package and before the code, per line.
+constexpr u64 DUMP_BYTES = 0x4000;
+constexpr u64 DUMP_LINE = 0x400;
+/// Most bytes of a record read.
+constexpr s64 MAX_RECORD = 0xA00;
+constexpr size_t RECORD_ID_WINDOWS = 12;
+
+std::array<std::vector<u32>, SIZE_KINDS> CodeSizes(std::span<const u8> image,
+                                                   const std::vector<u64>& codes, u64 code_end) {
+    const u32 count = static_cast<u32>(codes.size());
+    std::array<std::vector<u32>, SIZE_KINDS> sizes;
+    for (auto& list : sizes) {
+        list.assign(count, 0);
+    }
+    const auto round = [](u64 n) { return static_cast<u32>((n + 0xFF) & ~u64{0xFF}); };
+    for (u32 code = 0; code < count; ++code) {
+        const u64 limit = code + 1 < count ? codes[code + 1] : std::min<u64>(image.size(), code_end);
+        if (code + 1 < count) {
+            sizes[ToNextHeader][code] = static_cast<u32>(codes[code + 1] - codes[code]);
+        }
+        u64 end = 0;
+        for (u64 pos = codes[code] + 0x30; pos + 8 <= limit; pos += 8) {
+            const u64 value = Load64(image.data() + pos);
+            if (value == SELF_BRANCH_A || value == SELF_BRANCH_B) {
+                end = pos + 8;
+                break;
+            }
+        }
+        if (end == 0) {
+            continue;
+        }
+        const u64 length = end - codes[code];
+        sizes[ToEnd][code] = static_cast<u32>(length);
+        sizes[ToEndPastHeader][code] = static_cast<u32>(length - 0x30);
+        sizes[ToEndRounded][code] = round(length);
+        sizes[ToEndPastHeaderRounded][code] = round(length - 0x30);
+        if (length > 0x80) {
+            sizes[ToEndPastHeaders][code] = static_cast<u32>(length - 0x80);
+            sizes[ToEndPastHeadersRounded][code] = round(length - 0x80);
+        }
+    }
+    return sizes;
+}
+
+/// Walks the code headers and a marker's places in order, and ties each header to the next
+/// place whose field (`fields`, one per place) holds its size. After many headers in a row
+/// without one, looks farther on. Gives up after RECORD_TRIAL headers when `trial` and few
+/// matched. Returns how many headers got a place.
+size_t MatchRecords(const std::vector<u32>& fields, const std::vector<u32>& sizes, bool trial,
+                    std::vector<s64>* matched) {
+    size_t j = 0;
+    size_t matches = 0;
+    size_t misses = 0;
+    for (u32 code = 0; code < sizes.size(); ++code) {
+        const u32 want = sizes[code];
+        bool found = false;
+        if (want != 0) {
+            const size_t last = std::min(fields.size(), j + RECORD_LOOKAHEAD);
+            for (size_t k = j; k < last; ++k) {
+                if (fields[k] == want) {
+                    j = k;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && misses >= RECORD_RESYNC_AFTER) {
+                const size_t far = std::min(fields.size(), j + RECORD_RESYNC);
+                for (size_t k = last; k < far; ++k) {
+                    if (fields[k] == want) {
+                        j = k;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (found) {
+            if (matched) {
+                (*matched)[code] = static_cast<s64>(j);
+            }
+            ++j;
+            ++matches;
+            misses = 0;
+        } else {
+            ++misses;
+        }
+        if (trial && code + 1 == RECORD_TRIAL && matches * 10 < RECORD_TRIAL) {
+            break;
+        }
+    }
+    return matches;
+}
+
+/// Logs the most common 4-byte values in front of the code and dumps its start and end, then
+/// looks for a record per shader there: places of one of those values whose field holds the
+/// size of the shaders' code, in the order of the code. Returns the records found.
+std::optional<Window> FindRecords(std::span<const u8> image, const std::vector<u64>& codes,
+                                  u64 code_end, const std::function<bool()>& stopped) {
+    const auto start = std::chrono::steady_clock::now();
+    const u32 count = static_cast<u32>(codes.size());
+    const u64 region_end = std::min<u64>(codes.front(), image.size());
+    if (count < 16 || region_end < 0x10000) {
+        return std::nullopt;
+    }
+    const u64 alignment = region_end % 4;
+    // Values at every 7th place to find the common ones, then all places of those.
+    std::vector<u32> sample;
+    sample.reserve(static_cast<size_t>(region_end / 28) + 1);
+    for (u64 pos = alignment; pos + 4 <= region_end; pos += 28) {
+        const u32 value = Load32(image.data() + pos);
+        if (value > 0xFF && value != 0xFFFFFFFF) {
+            sample.push_back(value);
+        }
+    }
+    std::sort(sample.begin(), sample.end());
+    std::vector<std::pair<size_t, u32>> common;
+    for (size_t i = 0; i < sample.size();) {
+        size_t j = i;
+        while (j < sample.size() && sample[j] == sample[i]) {
+            ++j;
+        }
+        common.emplace_back(j - i, sample[i]);
+        i = j;
+    }
+    sample = {};
+    std::sort(common.rbegin(), common.rend());
+    common.resize(std::min(common.size(), MARKERS_COUNTED));
+    std::unordered_map<u32, size_t> index_of;
+    std::vector<u64> low_bits(65536 / 64, 0);
+    for (size_t i = 0; i < common.size(); ++i) {
+        index_of.emplace(common[i].second, i);
+        low_bits[(common[i].second & 0xFFFF) >> 6] |= u64{1} << (common[i].second & 63);
+    }
+    std::vector<size_t> exact(common.size(), 0);
+    std::vector<std::vector<u64>> positions(common.size());
+    const size_t keep = size_t{count} * 8 + 64;
+    for (u64 pos = alignment; pos + 4 <= region_end; pos += 4) {
+        if ((pos & 0xFFFFF) == alignment && stopped()) {
+            return std::nullopt;
+        }
+        const u32 value = Load32(image.data() + pos);
+        if (((low_bits[(value & 0xFFFF) >> 6] >> (value & 63)) & 1) == 0) {
+            continue;
+        }
+        const auto it = index_of.find(value);
+        if (it == index_of.end()) {
+            continue;
+        }
+        ++exact[it->second];
+        if (positions[it->second].size() < keep) {
+            positions[it->second].push_back(pos);
+        }
+    }
+    std::vector<size_t> order(common.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::sort(order.begin(), order.end(),
+              [&](size_t a, size_t b) { return exact[a] != exact[b] ? exact[a] > exact[b] : a < b; });
+    std::string census;
+    for (size_t rank = 0; rank < std::min(order.size(), MARKERS_LOGGED); ++rank) {
+        const size_t i = order[rank];
+        std::unordered_map<s64, size_t> gaps;
+        for (size_t k = 1; k < positions[i].size(); ++k) {
+            ++gaps[static_cast<s64>(positions[i][k] - positions[i][k - 1])];
+        }
+        std::string first;
+        for (size_t k = 0; k < std::min<size_t>(positions[i].size(), 3); ++k) {
+            first += fmt::format("{}0x{:x}", k == 0 ? "" : ", ", positions[i][k]);
+        }
+        census += fmt::format("{}{:#x} x{} (first at {}; gaps {})", census.empty() ? "" : "; ",
+                              common[i].second, exact[i], first,
+                              Top(gaps, 4, [](s64 d, size_t n) {
+                                  return fmt::format("+{:#x} x{}", d, n);
+                              }));
+    }
+    LOG_INFO(Frontend,
+             "[ShaderScan] Unreal links: 4-byte values most common in the 0x{:x} bytes in front "
+             "of the code, at places aligned like the code headers ({} code headers): {}",
+             region_end, count, census.empty() ? std::string{"none"} : census);
+    for (const auto& [what, from] : {std::pair<const char*, u64>{"from the start", 0},
+                                     std::pair<const char*, u64>{
+                                         "before the code",
+                                         region_end - std::min(region_end, DUMP_BYTES)}}) {
+        for (u64 at = from; at < std::min(from + DUMP_BYTES, region_end); at += DUMP_LINE) {
+            LOG_INFO(Frontend, "[ShaderScan] Unreal links: bytes in front of the code, {}, at "
+                               "0x{:x}: {}",
+                     what, at, Hex(image, at, std::min(DUMP_LINE, region_end - at)));
+        }
+    }
+
+    // Each marker, field and kind of size: how many shaders a record holds the size of.
+    const std::array<std::vector<u32>, SIZE_KINDS> sizes = CodeSizes(image, codes, code_end);
+    struct Way {
+        size_t marker;
+        u32 field;
+        u32 kind;
+        size_t matches;
+        size_t control = 0;
+    };
+    std::vector<Way> ways;
+    std::vector<u32> values;
+    for (size_t rank = 0; rank < std::min(order.size(), MARKERS_TRIED); ++rank) {
+        const size_t i = order[rank];
+        if (exact[i] < std::max<size_t>(16, count / 2)) {
+            continue;
+        }
+        for (u32 field = 4; field < 0x40; field += 4) {
+            values.resize(positions[i].size());
+            for (size_t k = 0; k < positions[i].size(); ++k) {
+                const u64 at = positions[i][k] + field;
+                values[k] = at + 4 <= region_end ? Load32(image.data() + at) : 0;
+            }
+            for (u32 kind = 0; kind < SIZE_KINDS; ++kind) {
+                // A trial that is not given up runs through all shaders.
+                const size_t matches = MatchRecords(values, sizes[kind], true, nullptr);
+                if (matches * 10 >= std::min<size_t>(count, RECORD_TRIAL)) {
+                    ways.push_back({i, field, kind, matches});
+                }
+            }
+        }
+    }
+    std::sort(ways.begin(), ways.end(), [](const Way& a, const Way& b) {
+        return a.matches != b.matches ? a.matches > b.matches
+                                      : std::tie(a.marker, a.field, a.kind) <
+                                            std::tie(b.marker, b.field, b.kind);
+    });
+    ways.resize(std::min<size_t>(ways.size(), 5));
+    // The same with the sizes in a random order, for how many match by chance.
+    std::vector<u32> order_of(count);
+    std::iota(order_of.begin(), order_of.end(), 0U);
+    std::mt19937 random{11};
+    std::shuffle(order_of.begin(), order_of.end(), random);
+    std::vector<u32> shuffled(count);
+    for (Way& way : ways) {
+        values.resize(positions[way.marker].size());
+        for (size_t k = 0; k < positions[way.marker].size(); ++k) {
+            const u64 at = positions[way.marker][k] + way.field;
+            values[k] = at + 4 <= region_end ? Load32(image.data() + at) : 0;
+        }
+        for (u32 code = 0; code < count; ++code) {
+            shuffled[code] = sizes[way.kind][order_of[code]];
+        }
+        way.control = MatchRecords(values, shuffled, false, nullptr);
+    }
+    std::string tried;
+    for (const Way& way : ways) {
+        tried += fmt::format("{}{:#x} with the {} at +{:#x}: {} shaders ({} with the sizes "
+                             "shuffled)",
+                             tried.empty() ? "" : "; ", common[way.marker].second,
+                             SIZE_KIND_NAMES[way.kind], way.field, way.matches, way.control);
+    }
+    const auto elapsed = [&] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - start)
+            .count();
+    };
+    if (ways.empty() || ways.front().matches < std::max<size_t>(16, count / 2) ||
+        ways.front().matches < 2 * ways.front().control) {
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: no records in front of the code that give the size "
+                 "of each shader's code in order, so none are read ({}; {} ms)",
+                 tried.empty() ? std::string{"no value found at enough places"} : tried, elapsed());
+        return std::nullopt;
+    }
+    const Way& way = ways.front();
+    values.resize(positions[way.marker].size());
+    for (size_t k = 0; k < positions[way.marker].size(); ++k) {
+        const u64 at = positions[way.marker][k] + way.field;
+        values[k] = at + 4 <= region_end ? Load32(image.data() + at) : 0;
+    }
+    std::vector<s64> matched(count, -1);
+    MatchRecords(values, sizes[way.kind], false, &matched);
+    Window window;
+    window.what = "in the shader records";
+    window.records = true;
+    window.anchors.assign(count, 0);
+    for (u32 code = 0; code < count; ++code) {
+        if (matched[code] >= 0) {
+            window.anchors[code] = positions[way.marker][static_cast<size_t>(matched[code])];
+        }
+    }
+    std::vector<u64> sorted;
+    for (const u64 anchor : window.anchors) {
+        if (anchor != 0) {
+            sorted.push_back(anchor);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+    std::unordered_map<s64, size_t> gaps;
+    for (size_t k = 1; k < sorted.size(); ++k) {
+        ++gaps[static_cast<s64>(sorted[k] - sorted[k - 1])];
+    }
+    s64 typical = 0;
+    size_t typical_count = 0;
+    for (const auto& [gap, n] : gaps) {
+        if (n > typical_count || (n == typical_count && gap < typical)) {
+            typical = gap;
+            typical_count = n;
+        }
+    }
+    window.before = 0;
+    window.after = std::clamp<s64>((typical + 3) & ~s64{3}, 0x100, MAX_RECORD);
+    window.id_end = window.after;
+    window.max_shift = 16;
+    window.lows.assign(count, 0);
+    window.highs.assign(count, 0);
+    size_t in_order = 0;
+    u64 previous = 0;
+    std::string missing;
+    size_t missing_count = 0;
+    for (u32 code = 0; code < count; ++code) {
+        const u64 anchor = window.anchors[code];
+        if (anchor == 0) {
+            if (missing_count++ < 8) {
+                missing += fmt::format("{}#{}", missing.empty() ? "" : ", ", code);
+            }
+            continue;
+        }
+        in_order += anchor > previous ? 1 : 0;
+        previous = anchor;
+        const auto next = std::upper_bound(sorted.begin(), sorted.end(), anchor);
+        window.lows[code] = anchor;
+        window.highs[code] = std::min<u64>(
+            {region_end, next == sorted.end() ? region_end : *next,
+             anchor + static_cast<u64>(window.after)});
+    }
+    LOG_INFO(Frontend,
+             "[ShaderScan] Unreal links: shader records in front of the code: they start with "
+             "{:#x}, and the field at +{:#x} holds the {}; {} of {} code headers have one ({} "
+             "when the sizes are shuffled), {} in the order of the code; records from 0x{:x} to "
+             "0x{:x}, apart {}; read {:#x} bytes of each; headers without one: {}{}; ways tried: "
+             "{} ({} ms)",
+             common[way.marker].second, way.field, SIZE_KIND_NAMES[way.kind], way.matches,
+             count, way.control, in_order, sorted.front(), sorted.back(),
+             Top(gaps, 6, [](s64 d, size_t n) { return fmt::format("+{:#x} x{}", d, n); }),
+             window.after, missing_count, missing.empty() ? "" : fmt::format(" ({})", missing),
+             tried, elapsed());
+    return window;
+}
+
+/// Where an id of a shader is: near its table entry, by its code header, or in its record.
+enum class IdSource : u8 { Entry, CodeHeader, Record };
+
+struct IdPlace {
+    s32 at;
+    IdSource source;
+};
+
+/// Groups of pairs: the played ones and the two controls.
+enum PairGroup : u8 { PlayedGroup, ShuffledGroup, MovedGroup, PAIR_GROUPS };
+
+/// Most parts of the code that offsets may count from.
+constexpr size_t MAX_PARTS = 16;
+constexpr u8 NO_PART = 0xFF;
 
 } // Anonymous namespace
 
@@ -965,12 +1577,21 @@ struct LinkSurvey::Impl {
     u64 code_end = 0;
     u64 object_start = 0;
     bool have_object = false;
-    /// What offsets from another base add to the code's offset in the package.
-    s64 base = 0;
+    /// Where the parts of the code start that offsets may count from, and the part of each
+    /// code header (NO_PART before the first).
+    std::vector<u64> part_starts;
+    std::vector<u8> part_of;
     bool have_base = false;
     /// Per 256-byte slot of the package: the index + 1 of the code header in it.
     std::vector<u32> slots;
     std::vector<u8> played_mask;
+    /// The code headers of the played pairs and of the control pairs, which index references
+    /// and ids are looked for of.
+    std::vector<u8> study_mask;
+    /// Played and control pairs as (vertex index << 32) | fragment index: the groups each is in,
+    /// with its number there.
+    std::unordered_map<u64, std::vector<std::pair<u8, u32>>> pair_groups;
+    std::array<size_t, PAIR_GROUPS> group_sizes{};
     /// Per code header: 1 when a played pair uses it as vertex shader, 2 as fragment shader.
     std::vector<u8> played_role;
     /// CODE_WINDOW bytes from before each code header, in order, zeros where the package
@@ -981,17 +1602,23 @@ struct LinkSurvey::Impl {
     std::vector<std::pair<u32, u32>> played_list;
     /// Where the table entry of each shader is in the code package, 0 when none was found.
     std::vector<u64> entries;
-    std::vector<s32> windows;
+    /// The bytes by each code header, and each shader's record in front of the code when
+    /// those were found.
+    Window code_window;
+    std::optional<Window> record_window;
+    /// The places of ids, near the table entries, by the code headers or in the records.
+    std::vector<IdPlace> windows;
     std::vector<u64> id_filter;
-    /// The played shaders' ids: the shader and the place near the entry, per value. The bytes
+    /// The played and control shaders' ids: the shader and the place, per value. The bytes
     /// of one entry can be the id of a shader at one place and of its neighbour at another.
     std::unordered_map<u64, std::vector<std::pair<u32, u32>>> ids;
-    /// The places of the ids are by the code headers, not by table entries.
-    bool ids_by_code = false;
-    /// Pairs a field around the code headers ties together, from StudyFields.
+    /// Where the ids of all shaders are in the code package: an id found there is a shader's
+    /// own, or another copy's, not a reference.
+    std::vector<u64> own_id_places;
+    /// Pairs learned from the played ones, for pre-compiling.
     std::vector<std::pair<u64, u64>> learned;
 
-    /// Bits set for the played pairs, to skip most pairs without a hash lookup.
+    /// Bits set for the played and control pairs, to skip most pairs without a hash lookup.
     std::vector<u64> pair_filter;
 
     // What SearchPiece found.
@@ -1021,10 +1648,59 @@ struct LinkSurvey::Impl {
         if (kind < KIND_COUNT) {
             return KIND_NAMES[kind];
         }
-        if (ids_by_code) {
-            return fmt::format("id at {:+#x} from the code header", windows[kind - KIND_COUNT]);
+        const IdPlace& place = windows[kind - KIND_COUNT];
+        switch (place.source) {
+        case IdSource::CodeHeader:
+            return fmt::format("id at {:+#x} from the code header", place.at);
+        case IdSource::Record:
+            return fmt::format("id at {:+#x} in the shader record", place.at);
+        default:
+            return fmt::format("id at {:+d} from the entry", place.at);
         }
-        return fmt::format("id at {:+d} from the entry", windows[kind - KIND_COUNT]);
+    }
+
+    /// A shader's id at a place, when it has one there.
+    std::optional<u64> IdOf(std::span<const u8> data, u32 code, const IdPlace& place) const {
+        switch (place.source) {
+        case IdSource::CodeHeader:
+            return code_window.Read64(data, code, place.at);
+        case IdSource::Record:
+            return record_window ? record_window->Read64(data, code, place.at) : std::nullopt;
+        default: {
+            const u64 entry = entries.empty() ? 0 : entries[code];
+            const s64 pos = static_cast<s64>(entry) + place.at;
+            if (entry == 0 || pos < 0 || static_cast<u64>(pos) + 8 > data.size()) {
+                return std::nullopt;
+            }
+            return Load64(data.data() + static_cast<u64>(pos));
+        }
+        }
+    }
+
+    /// Where a shader's id at a place is in the code package.
+    std::optional<u64> IdPosition(u32 code, const IdPlace& place) const {
+        switch (place.source) {
+        case IdSource::CodeHeader:
+            return code_window.At(code, place.at, 8);
+        case IdSource::Record:
+            return record_window ? record_window->At(code, place.at, 8) : std::nullopt;
+        default: {
+            const u64 entry = entries.empty() ? 0 : entries[code];
+            if (entry == 0 || static_cast<s64>(entry) + place.at < 0) {
+                return std::nullopt;
+            }
+            return static_cast<u64>(static_cast<s64>(entry) + place.at);
+        }
+        }
+    }
+
+    /// The part of the code a code header is in, as an offset from its start, when the code
+    /// is in parts.
+    std::optional<u32> OffsetInPart(u32 code) const {
+        if (part_of.empty() || part_of[code] == NO_PART) {
+            return std::nullopt;
+        }
+        return static_cast<u32>(codes[code] - part_starts[part_of[code]]);
     }
 
     std::optional<u32> CodeAt(u64 offset) const {
@@ -1051,7 +1727,8 @@ struct LinkSurvey::Impl {
         case IndexFromOne:
             return code + 1;
         case OffsetFromBase:
-            return static_cast<u32>(static_cast<s64>(codes[code]) + base);
+            // Code headers in no part get a number no field holds by chance.
+            return OffsetInPart(code).value_or(0xFFFFFFFE);
         default:
             return static_cast<u32>((codes[code] - first_code) >> 8);
         }
@@ -1073,13 +1750,15 @@ struct LinkSurvey::Impl {
             low_bytes[(residue - object_start) & 0xFF] = 1;
         }
         if (have_base) {
-            low_bytes[static_cast<u64>(residue + base) & 0xFF] = 1;
+            for (const u64 part : part_starts) {
+                low_bytes[(residue - part) & 0xFF] = 1;
+            }
         }
         const size_t count = codes.size();
         index_bits.assign(count + 1, 0);
         for (size_t value = 1; value <= count; ++value) {
-            index_bits[value] = static_cast<u8>((value < count && played_mask[value] ? 1 : 0) |
-                                                (played_mask[value - 1] ? 2 : 0));
+            index_bits[value] = static_cast<u8>((value < count && study_mask[value] ? 1 : 0) |
+                                                (study_mask[value - 1] ? 2 : 0));
         }
     }
 
@@ -1108,9 +1787,12 @@ struct LinkSurvey::Impl {
                         }
                     }
                 }
-                if (have_base && static_cast<s64>(value) >= base) {
-                    if (const auto code = CodeAt(static_cast<u64>(static_cast<s64>(value) - base))) {
-                        emit(pos, OffsetFromBase, *code);
+                if (have_base) {
+                    for (size_t part = 0; part < part_starts.size(); ++part) {
+                        if (const auto code = CodeAt(u64{value} + part_starts[part]);
+                            code && part_of[*code] == part) {
+                            emit(pos, OffsetFromBase, *code);
+                        }
                     }
                 }
             }
@@ -1126,7 +1808,7 @@ struct LinkSurvey::Impl {
             }
             if (all_kinds && value != 0 && value >= min_index && value < slots.size()) {
                 if (const auto code = CodeAt(first_code + u64{value} * 256);
-                    code && played_mask[*code]) {
+                    code && study_mask[*code]) {
                     emit(pos, Slot, *code);
                 }
             }
@@ -1144,9 +1826,15 @@ struct LinkSurvey::Impl {
         }
     }
 
-    bool MayBePlayed(u64 key) const {
+    /// The groups a pair of code headers is in, or null when it is neither played nor a
+    /// control pair.
+    const std::vector<std::pair<u8, u32>>* PairGroups(u64 key) const {
         const u64 bit = MixId(key ^ 0x5851F42D4C957F2DULL) >> (ID_FILTER_BITS - PAIR_FILTER_BITS);
-        return ((pair_filter[bit >> 6] >> (bit & 63)) & 1) != 0 && played_pairs.contains(key);
+        if (((pair_filter[bit >> 6] >> (bit & 63)) & 1) == 0) {
+            return nullptr;
+        }
+        const auto it = pair_groups.find(key);
+        return it == pair_groups.end() ? nullptr : &it->second;
     }
 
     /// Finds played pairs whose vertex and fragment references are close in `hits`, which are
@@ -1165,8 +1853,11 @@ struct LinkSurvey::Impl {
         }
         std::map<std::pair<u32, u32>, size_t> found_here;
         const auto consider = [&](const Hit& first, const Hit& second) {
-            if (first.pos < min_first || first.code == second.code || !played_mask[first.code] ||
-                !MayBePlayed((u64{first.code} << 32) | second.code)) {
+            if (first.pos < min_first || first.code == second.code || !study_mask[first.code]) {
+                return;
+            }
+            const auto* groups = PairGroups((u64{first.code} << 32) | second.code);
+            if (groups == nullptr) {
                 return;
             }
             const s64 distance = static_cast<s64>(second.pos) - static_cast<s64>(first.pos);
@@ -1181,6 +1872,19 @@ struct LinkSurvey::Impl {
                 return;
             }
             PairFinds& found = finds[{first.kind, second.kind}];
+            bool played = false;
+            for (const auto& [group, number] : *groups) {
+                const u64 seen = (u64{group} << 62) ^ (u64{number} << 32) ^
+                                 static_cast<u32>(static_cast<s32>(distance));
+                if (found.distinct_seen.insert(seen).second) {
+                    ++found.distinct_at[group][distance];
+                }
+                played = played || group == PlayedGroup;
+            }
+            if (!played) {
+                return;
+            }
+            ++found.residues[distance][(offset + first.pos) & 3];
             found.pairs.insert((u64{first.code} << 32) | second.code);
             ++found.distances[distance];
             ++found_here[{first.kind, second.kind}];
@@ -1374,9 +2078,198 @@ struct LinkSurvey::Impl {
         return found == 0 ? "not before any code header" : out;
     }
 
+    /// A reference in the code package by a shader's own table entry, or an id at the place a
+    /// shader keeps its own: not a reference from elsewhere.
     bool OwnEntry(const Hit& hit) const {
         const u64 entry = entries.empty() ? 0 : entries[hit.code];
-        return entry != 0 && hit.pos + ID_RANGE >= entry && hit.pos <= entry + ID_RANGE;
+        if (entry != 0 && hit.pos + ID_RANGE >= entry && hit.pos <= entry + ID_RANGE) {
+            return true;
+        }
+        return hit.kind >= KIND_COUNT &&
+               std::binary_search(own_id_places.begin(), own_id_places.end(), hit.pos);
+    }
+
+    /// The code header a reference of a kind at `pos` of the code package names, for any
+    /// shader, not only the played ones. `id_codes` has the shaders by their ids, for ids.
+    std::optional<u32> DecodeAny(std::span<const u8> data, u64 pos, u32 kind,
+                                 const std::unordered_map<u64, u32>& id_codes) const {
+        if (kind >= KIND_COUNT) {
+            if (pos + 8 > data.size()) {
+                return std::nullopt;
+            }
+            const auto it = id_codes.find(Load64(data.data() + pos));
+            if (it == id_codes.end()) {
+                return std::nullopt;
+            }
+            return it->second;
+        }
+        if (pos + 4 > data.size()) {
+            return std::nullopt;
+        }
+        const u32 value = Load32(data.data() + pos);
+        const u64 count = codes.size();
+        if (value == 0) {
+            return std::nullopt;
+        }
+        switch (kind) {
+        case PackageOffset:
+            return CodeAt(value);
+        case OffsetFromFirst:
+            return value >= 0x100 ? CodeAt(u64{value} + first_code) : std::nullopt;
+        case OffsetInObject:
+            return have_object && value >= 0x100 ? CodeAt(u64{value} + object_start)
+                                                 : std::nullopt;
+        case Index:
+            return value >= MIN_FOREIGN_INDEX && value < count ? std::optional<u32>{value}
+                                                               : std::nullopt;
+        case IndexFromOne:
+            return value >= MIN_FOREIGN_INDEX && value <= count ? std::optional<u32>{value - 1}
+                                                                : std::nullopt;
+        case Slot:
+            return value >= MIN_FOREIGN_INDEX && value < slots.size()
+                       ? CodeAt(first_code + u64{value} * 256)
+                       : std::nullopt;
+        case OffsetFromBase:
+            for (size_t part = 0; part < part_starts.size(); ++part) {
+                if (const auto code = CodeAt(u64{value} + part_starts[part]);
+                    code && part_of[*code] == part) {
+                    return code;
+                }
+            }
+            return std::nullopt;
+        default:
+            return std::nullopt;
+        }
+    }
+
+    /// When one kind of reference in the code package lists the two shaders of many played
+    /// pairs at one distance, and few control pairs, returns the pairs it lists for all
+    /// shaders. Call after the code package's references are paired.
+    std::vector<std::pair<u64, u64>> LearnFromRefs(std::span<const u8> data,
+                                                   std::span<const PairCopies> played,
+                                                   const std::vector<u64>& hash_of,
+                                                   const std::vector<Stage>& stage_of,
+                                                   const std::function<bool()>& stopped) const {
+        const auto start = std::chrono::steady_clock::now();
+        struct Link {
+            std::pair<u32, u32> kinds;
+            s64 distance;
+            u32 played;
+            u32 shuffled;
+            u32 moved;
+            s64 Score() const {
+                return static_cast<s64>(played) - static_cast<s64>(std::max(shuffled, moved));
+            }
+        };
+        std::vector<Link> links;
+        for (const auto& [kinds, found] : finds) {
+            for (const auto& [distance, n] : found.distinct_at[PlayedGroup]) {
+                const auto other = [&](u8 group) -> u32 {
+                    const auto it = found.distinct_at[group].find(distance);
+                    return it == found.distinct_at[group].end() ? 0 : it->second;
+                };
+                links.push_back({kinds, distance, n, other(ShuffledGroup), other(MovedGroup)});
+            }
+        }
+        std::sort(links.begin(), links.end(), [](const Link& a, const Link& b) {
+            return a.Score() != b.Score() ? a.Score() > b.Score()
+                                          : std::tie(a.kinds, a.distance) <
+                                                std::tie(b.kinds, b.distance);
+        });
+        std::string line;
+        for (size_t i = 0; i < std::min<size_t>(links.size(), 8); ++i) {
+            const Link& link = links[i];
+            line += fmt::format("{}vertex by {}, fragment by {} {:+d} bytes on: {} played, {} "
+                                "shuffled, {} moved",
+                                line.empty() ? "" : "; ", KindName(link.kinds.first),
+                                KindName(link.kinds.second), link.distance, link.played,
+                                link.shuffled, link.moved);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: references in the code package that list the two "
+                 "shaders of a pair at one distance (different pairs; {} played, {} shuffled, {} "
+                 "moved {} headers on): {}",
+                 group_sizes[PlayedGroup], group_sizes[ShuffledGroup], group_sizes[MovedGroup],
+                 CONTROL_SHIFT, line.empty() ? std::string{"none"} : line);
+        const size_t need = std::max<size_t>(10, played.size() / 10);
+        const Link* chosen = nullptr;
+        for (const Link& link : links) {
+            if (link.played >= need &&
+                link.played >= 5 * std::max({link.shuffled, link.moved, 1U})) {
+                chosen = &link;
+                break;
+            }
+        }
+        if (chosen == nullptr) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: no kind of reference in the code package lists "
+                     "{} or more played pairs at one distance and few control pairs, so no pairs "
+                     "are learned from them",
+                     need);
+            return {};
+        }
+        // Where in 4 bytes the vertex shader references of the played pairs are.
+        const std::array<u32, 4>& residues = finds.at(chosen->kinds).residues.at(chosen->distance);
+        const u64 lane =
+            static_cast<u64>(std::max_element(residues.begin(), residues.end()) - residues.begin());
+        // The ids of all shaders, for references by id.
+        std::array<std::unordered_map<u64, u32>, 2> id_codes;
+        for (size_t side = 0; side < 2; ++side) {
+            const u32 kind = side == 0 ? chosen->kinds.first : chosen->kinds.second;
+            if (kind < KIND_COUNT) {
+                continue;
+            }
+            const u32 none = static_cast<u32>(codes.size());
+            for (u32 code = 0; code < codes.size(); ++code) {
+                const std::optional<u64> value = IdOf(data, code, windows[kind - KIND_COUNT]);
+                if (!value || *value == 0) {
+                    continue;
+                }
+                const auto [it, inserted] = id_codes[side].try_emplace(*value, code);
+                if (!inserted && it->second != none && hash_of[it->second] != hash_of[code]) {
+                    it->second = none;
+                }
+            }
+            std::erase_if(id_codes[side], [&](const auto& entry) { return entry.second == none; });
+        }
+        std::vector<std::pair<u64, u64>> candidates;
+        bool capped = false;
+        const auto scan = [&](u64 begin, u64 end) {
+            for (u64 pos = begin + ((lane - begin) & 3); pos < end; pos += 4) {
+                if ((pos & 0xFFFFF) < 4 && stopped()) {
+                    return;
+                }
+                const auto vertex = DecodeAny(data, pos, chosen->kinds.first, id_codes[0]);
+                if (!vertex || stage_of[*vertex] != Stage::Vertex ||
+                    OwnEntry({pos, chosen->kinds.first, *vertex})) {
+                    continue;
+                }
+                const s64 other = static_cast<s64>(pos) + chosen->distance;
+                if (other < 0 || static_cast<u64>(other) >= data.size() ||
+                    (static_cast<u64>(other) >= first_code && static_cast<u64>(other) < code_end)) {
+                    continue;
+                }
+                const auto fragment =
+                    DecodeAny(data, static_cast<u64>(other), chosen->kinds.second, id_codes[1]);
+                if (!fragment || *fragment == *vertex || stage_of[*fragment] != Stage::Fragment ||
+                    OwnEntry({static_cast<u64>(other), chosen->kinds.second, *fragment})) {
+                    continue;
+                }
+                if (candidates.size() >= MAX_CANDIDATES) {
+                    capped = true;
+                    return;
+                }
+                candidates.emplace_back(hash_of[*vertex], hash_of[*fragment]);
+            }
+        };
+        scan(0, std::min<u64>(first_code, data.size()));
+        scan(std::min<u64>(code_end, data.size()), data.size());
+        return RankLearned(std::move(candidates), played, hash_of,
+                           fmt::format("learned link: vertex by {}, fragment by {} {:+d} bytes on "
+                                       "in the code package",
+                                       KindName(chosen->kinds.first),
+                                       KindName(chosen->kinds.second), chosen->distance),
+                           capped, start);
     }
 };
 
@@ -1592,12 +2485,6 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
             }
         }
     }
-    s.pair_filter.assign((size_t{1} << PAIR_FILTER_BITS) / 64, 0);
-    for (const u64 key : s.played_pairs) {
-        const u64 bit =
-            MixId(key ^ 0x5851F42D4C957F2DULL) >> (ID_FILTER_BITS - PAIR_FILTER_BITS);
-        s.pair_filter[bit >> 6] |= u64{1} << (bit & 63);
-    }
     size_t played_codes = 0;
     for (u32 code = 0; code < count; ++code) {
         played_codes += s.played_mask[code];
@@ -1649,6 +2536,31 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
         pair_copies.push_back(std::move(pair));
     }
     const Controls controls = MakeControls(pair_copies, count);
+    // Played pairs and the controls, by the code headers of their copies, to tell how many
+    // of each references in the packages list close together.
+    s.study_mask = PairCodes(count, pair_copies, controls);
+    s.pair_filter.assign((size_t{1} << PAIR_FILTER_BITS) / 64, 0);
+    for (const auto& [group, pairs] :
+         {std::pair<u8, std::span<const PairCopies>>{PlayedGroup, pair_copies},
+          std::pair<u8, std::span<const PairCopies>>{ShuffledGroup, controls.shuffled},
+          std::pair<u8, std::span<const PairCopies>>{MovedGroup, controls.shifted}}) {
+        s.group_sizes[group] = pairs.size();
+        for (u32 number = 0; number < pairs.size(); ++number) {
+            for (const u32 v : pairs[number].vertex) {
+                for (const u32 f : pairs[number].fragment) {
+                    const u64 key = (u64{v} << 32) | f;
+                    s.pair_groups[key].emplace_back(group, number);
+                    const u64 bit = MixId(key ^ 0x5851F42D4C957F2DULL) >>
+                                    (ID_FILTER_BITS - PAIR_FILTER_BITS);
+                    s.pair_filter[bit >> 6] |= u64{1} << (bit & 63);
+                }
+            }
+        }
+    }
+    size_t study_codes = 0;
+    for (u32 code = 0; code < count; ++code) {
+        study_codes += s.study_mask[code];
+    }
     std::vector<size_t> shown_pairs;
     if (!pair_copies.empty()) {
         shown_pairs.push_back(0);
@@ -1669,10 +2581,48 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
                      Hex(data, from, s.codes[code] + FIELD_AFTER - from));
         }
     }
-    const std::vector<u64> prefix_starts = PrefixStarts(data, s.codes);
+    s.code_window = CodeHeaderWindow(data, s.codes);
+    // Pairs learned in each way, best first.
+    std::vector<std::vector<std::pair<u64, u64>>> learned_sets;
     if (!pair_copies.empty() && !stopped()) {
-        s.learned = StudyFields(data, s.codes, prefix_starts, s.first_code, pair_copies, controls,
-                                hash_of, stage_of);
+        learned_sets.push_back(StudyFields(data, s.code_window, s.codes, s.first_code, pair_copies,
+                                           controls, hash_of, stage_of));
+    }
+    // A record per shader in front of the code may say more about it than its code header.
+    if (!stopped()) {
+        s.record_window = FindRecords(data, s.codes, s.code_end, stopped);
+    }
+    if (s.record_window) {
+        std::vector<std::pair<std::string, u32>> shown;
+        for (u32 code = 0; code < count && shown.size() < 2; ++code) {
+            if (s.record_window->anchors[code] != 0) {
+                shown.emplace_back("the first shader with one", code);
+                shown.emplace_back("the next shader", code + 1 < count ? code + 1 : code);
+            }
+        }
+        for (const size_t i : shown_pairs) {
+            shown.emplace_back(fmt::format("played pair {}'s vertex shader", i),
+                               pair_copies[i].vertex.front());
+            shown.emplace_back(fmt::format("played pair {}'s fragment shader", i),
+                               pair_copies[i].fragment.front());
+        }
+        for (const auto& [what, code] : shown) {
+            const u64 anchor = s.record_window->anchors[code];
+            if (anchor == 0) {
+                LOG_INFO(Frontend, "[ShaderScan] Unreal links: record of {} #{}: none", what,
+                         code);
+                continue;
+            }
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: record of {} #{} (hash {:016x}, code at 0x{:x}) "
+                     "at 0x{:x}: {}",
+                     what, code, hash_of[code], s.codes[code], anchor,
+                     Hex(data, anchor, s.record_window->highs[code] - anchor));
+        }
+        if (!pair_copies.empty() && !stopped()) {
+            learned_sets.push_back(StudyFields(data, *s.record_window, s.codes, s.first_code,
+                                               pair_copies, controls, hash_of, stage_of));
+        }
     }
 
     // Objects, and which hold the code.
@@ -1847,8 +2797,8 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
         LOG_INFO(Frontend,
                  "[ShaderScan] Unreal links: by {} in the package: {} of {} shaders{} found, {} "
                  "times; next shader's entry at {}; played pairs within 1 KiB: {} of {}, at {}",
-                 s.KindName(kind), found, IsIndexKind(kind) ? played_codes : count,
-                 IsIndexKind(kind) ? " (played ones)" : "", total,
+                 s.KindName(kind), found, IsIndexKind(kind) ? study_codes : count,
+                 IsIndexKind(kind) ? " (played and control ones)" : "", total,
                  Top(strides, 6,
                      [](size_t d, size_t n) { return fmt::format("+0x{:x} x{}", d, n); }),
                  pairs_close, s.played_list.size(),
@@ -1877,18 +2827,21 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
         }
     };
     const auto is_table = [&](u32 kind) {
-        const size_t base = IsIndexKind(kind) ? played_codes : count;
+        const size_t base = IsIndexKind(kind) ? study_codes : count;
         return tables_found[kind].entries >= std::max<size_t>(16, base / 10);
     };
     for (u32 kind = 0; kind < OffsetFromBase; ++kind) {
         measure(kind);
     }
 
-    if (!is_table(PackageOffset) && !is_table(OffsetFromFirst) && !is_table(OffsetInObject) &&
-        !stopped()) {
-        // No table by the offsets above. Look for offsets from another base: steps between the
-        // entries of three shaders in a row, or between a played pair's entries, that equal the
-        // steps between their code.
+    // A table by the offsets above may list only the first part of the code.
+    const size_t offset_entries = std::max({tables_found[PackageOffset].entries,
+                                            tables_found[OffsetFromFirst].entries,
+                                            tables_found[OffsetInObject].entries});
+    if (offset_entries < count / 2 && !stopped()) {
+        // No table of most shaders by the offsets above. Look for offsets from another base:
+        // steps between the entries of three shaders in a row, or between a played pair's
+        // entries, that equal the steps between their code.
         std::unordered_map<u64, std::vector<u32>> runs;
         u32 max_gap = 0;
         for (u32 code = 0; code + 3 < count; ++code) {
@@ -1964,14 +2917,33 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
                  "[ShaderScan] Unreal links: offsets from another base: three shaders in a row "
                  "{}; played pairs {}",
                  Top(run_bases, 6, format), Top(pair_bases, 6, format));
-        // Search the package once more by the base most steps agree on.
-        // A base counts when far more steps agree on it than on any other.
-        std::optional<s64> base;
-        for (const auto* bases : {&run_bases, &pair_bases}) {
+        // Offsets may count from the start of one of several parts of the code: the bases
+        // the steps of three shaders in a row agree on, summed over the steps between entries.
+        std::unordered_map<s64, size_t> by_base;
+        for (const auto& [k, n] : run_bases) {
+            by_base[base_of(k)] += n;
+        }
+        // A part starts at a code header, or before the first.
+        std::vector<std::pair<size_t, s64>> bases;
+        for (const auto& [b, n] : by_base) {
+            if (b <= 0 && (static_cast<u64>(-b) <= s.first_code || s.CodeAt(static_cast<u64>(-b)))) {
+                bases.emplace_back(n, b);
+            }
+        }
+        std::sort(bases.rbegin(), bases.rend());
+        std::vector<std::pair<u64, size_t>> parts;
+        const size_t most = bases.empty() ? 0 : bases.front().first;
+        for (const auto& [n, b] : bases) {
+            if (parts.size() < MAX_PARTS && n >= 16 && n >= most / 32) {
+                parts.emplace_back(static_cast<u64>(-b), n);
+            }
+        }
+        if (parts.empty()) {
+            // The base of played pairs, when far more steps agree on it than on any other.
             size_t best = 0;
             size_t second = 0;
             u64 best_key = 0;
-            for (const auto& [k, n] : *bases) {
+            for (const auto& [k, n] : pair_bases) {
                 if (n > best) {
                     second = best;
                     best = n;
@@ -1980,12 +2952,44 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
                     second = std::max(second, n);
                 }
             }
-            if (!base && best >= 16 && best >= second * 5) {
-                base = base_of(best_key);
+            if (best >= 16 && best >= second * 5 && base_of(best_key) <= 0) {
+                parts.emplace_back(static_cast<u64>(-base_of(best_key)), best);
             }
         }
-        if (base) {
-            s.base = *base;
+        if (!parts.empty()) {
+            std::sort(parts.begin(), parts.end());
+            // The first part may count from the first code header, which the offsets from the
+            // first code look for already.
+            if (parts.front().first > s.first_code) {
+                parts.insert(parts.begin(), {s.first_code, 0});
+            }
+            for (const auto& [part_start, n] : parts) {
+                s.part_starts.push_back(part_start);
+            }
+            s.part_of.assign(count, NO_PART);
+            std::vector<size_t> in_part(parts.size(), 0);
+            for (u32 code = 0; code < count; ++code) {
+                const auto it =
+                    std::upper_bound(s.part_starts.begin(), s.part_starts.end(), s.codes[code]);
+                if (it != s.part_starts.begin()) {
+                    const size_t part = static_cast<size_t>(it - s.part_starts.begin()) - 1;
+                    s.part_of[code] = static_cast<u8>(part);
+                    ++in_part[part];
+                }
+            }
+            std::string listed;
+            for (size_t part = 0; part < parts.size(); ++part) {
+                const auto at = s.CodeAt(parts[part].first);
+                listed += fmt::format("{}0x{:x} ({}, {} code headers, {} steps agree)",
+                                      listed.empty() ? "" : ", ", parts[part].first,
+                                      at ? fmt::format("code header #{}", *at)
+                                         : std::string{"not a code header"},
+                                      in_part[part], parts[part].second);
+            }
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal links: offsets may count from the start of {} parts of "
+                     "the code: {}",
+                     parts.size(), listed);
             s.have_base = true;
             s.Prepare();
             const auto record_base = [&](u64 pos, u32 kind, u32 code) {
@@ -2019,18 +3023,25 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     if (table_kind != KIND_COUNT) {
         const size_t stride = tables_found[table_kind].stride;
         size_t entries = 0;
-        for (u32 code = 0; code < count; ++code) {
-            for (const u64 pos : where[table_kind][code]) {
-                const bool before =
-                    code + 1 < count && pos + stride + 4 <= image.size() &&
-                    Load32(image.data() + pos + stride) == s.Expected(table_kind, code + 1);
-                const bool after =
-                    code > 0 && pos >= stride &&
-                    Load32(image.data() + pos - stride) == s.Expected(table_kind, code - 1);
-                if (before || after) {
-                    s.entries[code] = pos;
-                    ++entries;
-                    break;
+        // An entry whose neighbours both hold the next and the one before comes first: offsets
+        // in different parts of the code can be the same number for two shaders.
+        for (const bool both : {true, false}) {
+            for (u32 code = 0; code < count; ++code) {
+                if (s.entries[code] != 0) {
+                    continue;
+                }
+                for (const u64 pos : where[table_kind][code]) {
+                    const bool before =
+                        code + 1 < count && pos + stride + 4 <= image.size() &&
+                        Load32(image.data() + pos + stride) == s.Expected(table_kind, code + 1);
+                    const bool after =
+                        code > 0 && pos >= stride &&
+                        Load32(image.data() + pos - stride) == s.Expected(table_kind, code - 1);
+                    if (both ? before && after : before || after) {
+                        s.entries[code] = pos;
+                        ++entries;
+                        break;
+                    }
                 }
             }
         }
@@ -2038,12 +3049,12 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
         // id. Those of the entries around it are too, so the other packages tell which places
         // pair played shaders.
         const s32 range = static_cast<s32>(std::min<size_t>(stride + 8, ID_RANGE));
-        struct Window {
+        struct EntryPlace {
             s32 at;
             double distinct;
             double zeros;
         };
-        std::vector<Window> candidates;
+        std::vector<EntryPlace> candidates;
         for (s32 at = -range; at <= range; ++at) {
             if (at > -8 && at < 4) {
                 continue; // Overlaps the offset or index itself.
@@ -2069,112 +3080,108 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
             }
             const double distinct = static_cast<double>(values.size()) / total;
             const double mean_zeros = static_cast<double>(zeros) / total;
-            if (distinct >= 0.98 && mean_zeros <= 3.0) {
+            // Copies of one shader may share an id, as for the places by the code headers.
+            if (distinct >= 0.5 && mean_zeros <= 3.0) {
                 candidates.push_back({at, distinct, mean_zeros});
             }
         }
-        std::sort(candidates.begin(), candidates.end(), [](const Window& a, const Window& b) {
-            return std::abs(a.at) != std::abs(b.at) ? std::abs(a.at) < std::abs(b.at)
-                                                    : a.at < b.at;
-        });
+        // The game's data is 4-byte aligned, so ids at a multiple of 4 from the entry come
+        // first, nearest to the entry first.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const EntryPlace& a, const EntryPlace& b) {
+                      return std::make_tuple(a.at % 4 != 0, std::abs(a.at), a.at) <
+                             std::make_tuple(b.at % 4 != 0, std::abs(b.at), b.at);
+                  });
         // Places that overlap read the same id shifted, which finds the same links again, so
-        // keep only places at least 8 bytes apart, nearest to the entry first.
-        std::vector<Window> kept;
-        for (const Window& window : candidates) {
+        // keep only places at least 8 bytes apart.
+        std::vector<EntryPlace> kept;
+        for (const EntryPlace& place : candidates) {
             if (kept.size() < MAX_ID_WINDOWS &&
-                std::ranges::none_of(kept, [&](const Window& other) {
-                    return std::abs(other.at - window.at) < 8;
+                std::ranges::none_of(kept, [&](const EntryPlace& other) {
+                    return std::abs(other.at - place.at) < 8;
                 })) {
-                kept.push_back(window);
+                kept.push_back(place);
             }
         }
         candidates = std::move(kept);
         std::sort(candidates.begin(), candidates.end(),
-                  [](const Window& a, const Window& b) { return a.at < b.at; });
+                  [](const EntryPlace& a, const EntryPlace& b) { return a.at < b.at; });
         std::string chosen;
-        for (const Window& window : candidates) {
-            s.windows.push_back(window.at);
-            chosen += fmt::format("{}{:+d}", chosen.empty() ? "" : ",", window.at);
+        for (const EntryPlace& place : candidates) {
+            s.windows.push_back({place.at, IdSource::Entry});
+            chosen += fmt::format("{}{:+d}", chosen.empty() ? "" : ",", place.at);
         }
         LOG_INFO(Frontend,
                  "[ShaderScan] Unreal links: table by {} every 0x{:x} bytes, {} entries; 8-byte "
                  "values that differ per shader at {}",
                  s.KindName(table_kind), stride, entries, chosen.empty() ? "none" : chosen);
-        // Only the played shaders' ids are searched for, to tell which places pair them.
-        s.id_filter.assign((size_t{1} << ID_FILTER_BITS) / 64, 0);
-        for (u32 w = 0; w < s.windows.size(); ++w) {
-            std::unordered_map<u64, u32> in_window;
-            for (u32 code = 0; code < count; ++code) {
-                const u64 entry = s.entries[code];
-                if (entry == 0 || static_cast<s64>(entry) + s.windows[w] < 0 ||
-                    entry + s.windows[w] + 8 > image.size()) {
-                    continue;
-                }
-                const u64 value = Load64(image.data() + entry + s.windows[w]);
-                const auto [it, inserted] = in_window.try_emplace(value, code);
-                if (!inserted && it->second != code) {
-                    it->second = count; // The same value for two shaders: not an id.
-                }
-            }
-            for (const auto& [value, code] : in_window) {
-                if (code < count && s.played_mask[code]) {
-                    s.ids[value].emplace_back(code, w);
-                    const u64 bit = MixId(value);
-                    s.id_filter[bit >> 6] |= u64{1} << (bit & 63);
-                }
-            }
-        }
     }
 
-    // The places by the code headers where each holds a different 8-byte value may be ids
-    // that the package's other data and the other packages list shaders by. Without a table,
-    // the other packages are searched for those.
+    // The places by the code headers, and in the shader records, where each holds a different
+    // 8-byte value may be ids that the package's other data and the other packages list
+    // shaders by.
     std::vector<s32> by_code;
     if (!stopped()) {
-        by_code = ChooseIdWindows(data, s.codes, prefix_starts);
-        StudyCodeIds(data, s.codes, prefix_starts, s.first_code, s.code_end, by_code,
-                     pair_copies, controls, s.played_mask, stopped);
+        by_code = ChooseIdWindows(data, s.code_window, MAX_CODE_ID_WINDOWS);
+        StudyCodeIds(data, s.code_window, s.first_code, s.code_end, by_code, pair_copies,
+                     controls, s.played_mask, stopped);
     }
-    if (table_kind == KIND_COUNT && !by_code.empty()) {
-        s.ids_by_code = true;
-        s.windows = by_code;
-        s.id_filter.assign((size_t{1} << ID_FILTER_BITS) / 64, 0);
-        for (u32 w = 0; w < s.windows.size(); ++w) {
-            // A value two different shaders have there is not an id; copies of one shader
-            // may share it.
-            std::unordered_map<u64, u32> in_window;
-            for (u32 code = 0; code < count; ++code) {
-                const s64 pos = static_cast<s64>(s.codes[code]) + s.windows[w];
-                if (pos < static_cast<s64>(prefix_starts[code]) ||
-                    static_cast<u64>(pos) + 8 > image.size()) {
-                    continue;
-                }
-                const u64 value = Load64(image.data() + static_cast<u64>(pos));
-                if (value == 0) {
-                    continue;
-                }
-                const auto [it, inserted] = in_window.try_emplace(value, code);
-                if (!inserted && it->second != count && hash_of[it->second] != hash_of[code]) {
-                    it->second = count;
-                }
-            }
-            for (u32 code = 0; code < count; ++code) {
-                const s64 pos = static_cast<s64>(s.codes[code]) + s.windows[w];
-                if (!s.played_mask[code] || pos < static_cast<s64>(prefix_starts[code]) ||
-                    static_cast<u64>(pos) + 8 > image.size()) {
-                    continue;
-                }
-                const u64 value = Load64(image.data() + static_cast<u64>(pos));
-                const auto it = in_window.find(value);
-                if (it == in_window.end() || it->second == count) {
-                    continue;
-                }
-                s.ids[value].emplace_back(code, w);
-                const u64 bit = MixId(value);
-                s.id_filter[bit >> 6] |= u64{1} << (bit & 63);
+    std::vector<s32> in_records;
+    if (s.record_window && !stopped()) {
+        in_records = ChooseIdWindows(data, *s.record_window, RECORD_ID_WINDOWS);
+        StudyCodeIds(data, *s.record_window, s.first_code, s.code_end, in_records, pair_copies,
+                     controls, s.played_mask, stopped);
+    }
+    // The ids searched for: near the table entries; else in the records; else by the code
+    // headers.
+    if (table_kind == KIND_COUNT) {
+        for (const s32 at : in_records) {
+            s.windows.push_back({at, IdSource::Record});
+        }
+        if (in_records.empty()) {
+            for (const s32 at : by_code) {
+                s.windows.push_back({at, IdSource::CodeHeader});
             }
         }
     }
+    // Only the played and control shaders' ids are searched for, to tell which places pair
+    // them.
+    s.id_filter.assign((size_t{1} << ID_FILTER_BITS) / 64, 0);
+    for (u32 w = 0; w < s.windows.size(); ++w) {
+        // A value two different shaders have there is not an id; copies of one shader may
+        // share it.
+        std::unordered_map<u64, u32> in_window;
+        for (u32 code = 0; code < count; ++code) {
+            if (const auto pos = s.IdPosition(code, s.windows[w])) {
+                s.own_id_places.push_back(*pos);
+            }
+            const std::optional<u64> value = s.IdOf(data, code, s.windows[w]);
+            if (!value || *value == 0) {
+                continue;
+            }
+            const auto [it, inserted] = in_window.try_emplace(*value, code);
+            if (!inserted && it->second != count && hash_of[it->second] != hash_of[code]) {
+                it->second = count;
+            }
+        }
+        for (u32 code = 0; code < count; ++code) {
+            if (!s.study_mask[code]) {
+                continue;
+            }
+            const std::optional<u64> value = s.IdOf(data, code, s.windows[w]);
+            if (!value) {
+                continue;
+            }
+            const auto it = in_window.find(*value);
+            if (it == in_window.end() || it->second == count) {
+                continue;
+            }
+            s.ids[*value].emplace_back(code, w);
+            const u64 bit = MixId(*value);
+            s.id_filter[bit >> 6] |= u64{1} << (bit & 63);
+        }
+    }
+    std::sort(s.own_id_places.begin(), s.own_id_places.end());
 
     // Played pairs whose references sit close together elsewhere in this package.
     s.code_package = std::string(name);
@@ -2191,6 +3198,19 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     for (const Hit& hit : hits) {
         ++s.hits_by_kind[hit.kind];
         ++s.files_by_kind[hit.kind][fmt::format("{} (the code package)", name)];
+    }
+    hits = {};
+    if (!pair_copies.empty() && !stopped()) {
+        learned_sets.push_back(s.LearnFromRefs(data, pair_copies, hash_of, stage_of, stopped));
+    }
+    // All pairs learned, in the order of the ways, each once.
+    std::set<std::pair<u64, u64>> kept;
+    for (const auto& set : learned_sets) {
+        for (const auto& pair : set) {
+            if (s.learned.size() < MAX_LEARNED_PAIRS && kept.insert(pair).second) {
+                s.learned.push_back(pair);
+            }
+        }
     }
 }
 
@@ -2320,8 +3340,8 @@ void LinkSurvey::Report() const {
     std::string by_id;
     for (const u32 kind : kinds) {
         if (kind >= KIND_COUNT) {
-            by_id += fmt::format("{}{:+d} x{}", by_id.empty() ? "" : ", ",
-                                 s.windows[kind - KIND_COUNT], s.hits_by_kind.at(kind));
+            by_id += fmt::format("{}{} x{}", by_id.empty() ? "" : ", ", s.KindName(kind),
+                                 s.hits_by_kind.at(kind));
             continue;
         }
         LOG_INFO(Frontend, "[ShaderScan] Unreal links: references by {}: {}, most in {}",
@@ -2362,14 +3382,34 @@ void LinkSurvey::Report() const {
         for (const auto& [distance, n] : found.distances) {
             total += n;
         }
+        // Different pairs at the distances most played pairs are at, against the controls.
+        std::vector<std::pair<u32, s64>> by_pairs;
+        for (const auto& [distance, n] : found.distinct_at[PlayedGroup]) {
+            by_pairs.emplace_back(n, -distance);
+        }
+        std::sort(by_pairs.rbegin(), by_pairs.rend());
+        std::string groups;
+        for (size_t d = 0; d < std::min<size_t>(by_pairs.size(), 4); ++d) {
+            const s64 distance = -by_pairs[d].second;
+            const auto other = [&](u8 group) -> u32 {
+                const auto it = found.distinct_at[group].find(distance);
+                return it == found.distinct_at[group].end() ? 0 : it->second;
+            };
+            groups += fmt::format("{}{:+d}: {} played, {} shuffled, {} moved",
+                                  groups.empty() ? "" : "; ", distance, by_pairs[d].first,
+                                  other(ShuffledGroup), other(MovedGroup));
+        }
         LOG_INFO(Frontend,
                  "[ShaderScan] Unreal links: vertex by {}, fragment by {}: {} times at the most "
-                 "common distance ({}% of {}); {} of {} played pairs close together, at {}; in {}",
+                 "common distance ({}% of {}); {} of {} played pairs close together, at {}; "
+                 "different pairs of {} played, {} shuffled and {} moved at {}; in {}",
                  s.KindName(order[i].second.first), s.KindName(order[i].second.second),
                  order[i].first, total == 0 ? 0 : order[i].first * 100 / total, total,
                  found.pairs.size(), s.played_list.size(),
                  Top(found.distances, 8,
                      [](s64 d, size_t n) { return fmt::format("{:+d} x{}", d, n); }),
+                 s.group_sizes[PlayedGroup], s.group_sizes[ShuffledGroup],
+                 s.group_sizes[MovedGroup], groups.empty() ? std::string{"none"} : groups,
                  Top(found.files, 4, [](const std::string& file, size_t n) {
                      return fmt::format("{} x{}", file, n);
                  }));
