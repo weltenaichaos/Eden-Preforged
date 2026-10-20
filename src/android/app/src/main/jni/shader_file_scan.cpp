@@ -53,6 +53,7 @@
 #include "jni/unreal_pak.h"
 #include "jni/embedded_streams.h"
 #include "jni/gf_pak.h"
+#include "jni/trpfs.h"
 #include "jni/re_pak.h"
 #include "jni/unity_assets.h"
 #include "shader_recompiler/exception.h"
@@ -1886,7 +1887,8 @@ private:
         const std::vector<u8> start = file->ReadBytes(UNITY_START, 0);
         if (Common::Preforged::Options().find_packed_data &&
             ((Preforged::RePak::IsPak(start) && ScanRePak(file, name)) ||
-             (Preforged::GfPak::IsPak(start) && ScanGfPak(file, name)))) {
+             (Preforged::GfPak::IsPak(start) && ScanGfPak(file, name)) ||
+             (Preforged::Trpfs::IsTrpfs(start) && ScanTrpfs(file, name)))) {
             LogProgress();
             return;
         }
@@ -2251,6 +2253,99 @@ private:
                                      "point past the file):",
                                      pak->version, pak->declared, pak->invalid),
                          std::move(entries));
+        return true;
+    }
+
+    /// Reads the packs of a Pokémon Scarlet and Violet data.trpfs one by one, unpacks the files
+    /// in each and searches them. Returns false when its table can't be read.
+    bool ScanTrpfs(const FileSys::VirtualFile& file, const std::string& name) {
+        using namespace Preforged::Trpfs;
+        const ReadFn read = [&file](u64 offset, u64 size) { return file->ReadBytes(size, offset); };
+        std::string error;
+        const auto fs = ReadFileSystem(read, file->GetSize(), error);
+        if (!fs) {
+            LOG_INFO(Frontend, "[ShaderScan] Game Freak trpfs {} not read ({}), so it is searched "
+                               "as it is",
+                     name, error);
+            return false;
+        }
+        const size_t headers_before = code_headers;
+        const size_t taken_before = extracted.size();
+        size_t packs_read = 0;
+        size_t packs_failed = 0;
+        size_t packs_too_large = 0;
+        std::string first_pack_error;
+        size_t stored = 0;
+        size_t oodle = 0;
+        size_t failed = 0;
+        size_t too_large = 0;
+        std::string first_failure;
+        u64 unpacked = 0;
+        std::vector<PackedFile> files;
+        std::vector<u8> out;
+        Preforged::Unreal::Method last = Preforged::Unreal::Method::Unknown;
+        for (const Pack& pack : fs->packs) {
+            if (Stopped()) {
+                break;
+            }
+            if (pack.size > MAX_DECOMPRESSED * 2) {
+                ++packs_too_large;
+                continue;
+            }
+            const std::vector<u8> bytes = file->ReadBytes(pack.size, pack.offset);
+            if (!ReadPack(bytes, files, error)) {
+                ++packs_failed;
+                if (first_pack_error.empty()) {
+                    first_pack_error = fmt::format("pack at {:#x}: {}", pack.offset, error);
+                }
+                continue;
+            }
+            ++packs_read;
+            for (const PackedFile& packed : files) {
+                if (Stopped()) {
+                    break;
+                }
+                std::span<const u8> data = packed.data;
+                if (packed.size > MAX_DECOMPRESSED) {
+                    ++too_large;
+                    continue;
+                }
+                if (packed.compression != -1 || packed.data.size() != packed.size) {
+                    out.resize(packed.size + Preforged::Unreal::UNPACK_SLACK);
+                    const auto used = Preforged::Unreal::UnpackBlock(
+                        packed.data, std::span<u8>{out.data(), packed.size}, "oodle", last,
+                        Common::Preforged::Options().unpack_oodle);
+                    if (used == Preforged::Unreal::Method::Unknown ||
+                        used == Preforged::Unreal::Method::OodleFailed) {
+                        ++failed;
+                        if (first_failure.empty()) {
+                            first_failure = fmt::format(
+                                "type {}, {} -> {} bytes, starts {}", packed.compression,
+                                packed.data.size(), packed.size, Hex(packed.data, 0, 8));
+                        }
+                        continue;
+                    }
+                    data = std::span<const u8>{out.data(), packed.size};
+                    ++oodle;
+                } else {
+                    ++stored;
+                }
+                unpacked += data.size();
+                bytes_scanned += data.size();
+                ScanBuffer(data, fmt::format("{}#{:016x}/{:016x}", name, pack.hash, packed.hash),
+                           1);
+            }
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Game Freak trpfs {} ({} MiB): {} packs listed, {} read, {} not "
+                 "read{}, {} too large; files: {} stored, {} unpacked with Oodle ({} MiB in "
+                 "all), {} did not unpack{}, {} too large; {} NVN code headers, {} new shaders "
+                 "taken",
+                 name, file->GetSize() >> 20, fs->packs.size(), packs_read, packs_failed,
+                 first_pack_error.empty() ? "" : fmt::format(" (first: {})", first_pack_error),
+                 packs_too_large, stored, oodle, unpacked >> 20, failed,
+                 first_failure.empty() ? "" : fmt::format(" (first: {})", first_failure),
+                 too_large, code_headers - headers_before, extracted.size() - taken_before);
         return true;
     }
 
@@ -3246,7 +3341,7 @@ private:
     } unity_totals;
     Preforged::Unity::BlobStats unity_stats;
     Preforged::Embedded::Stats packed_stats;
-    struct PackedFile {
+    struct PackedStreamFile {
         size_t streams = 0;
         size_t code_headers = 0;
         size_t taken = 0;
@@ -3255,7 +3350,7 @@ private:
         size_t zstd_failed = 0;
         size_t code_headers = 0;
         size_t taken = 0;
-        std::map<std::string, PackedFile> files;
+        std::map<std::string, PackedStreamFile> files;
     } packed_totals;
     int packed_nesting = 0;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
@@ -3450,7 +3545,7 @@ constexpr std::array ENGINE_RULES{
                EngineSupport::Read,
                {".gfpak ", "", "", ""}},
     EngineRule{"Game Freak engine (Pokemon Scarlet and Violet, .trpfs)",
-               EngineSupport::Packed,
+               EngineSupport::Read,
                {"/data.trpfs ", ".trpak ", "", ""}},
     EngineRule{"Smash Ultimate archive", EngineSupport::Streams, {"/data.arc ", "", "", ""}},
     EngineRule{"CRI CPK archives", EngineSupport::Streams, {".cpk ", "", "", ""}},

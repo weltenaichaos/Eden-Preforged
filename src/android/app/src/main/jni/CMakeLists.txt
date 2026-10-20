@@ -38,6 +38,8 @@ add_library(yuzu-android SHARED
     re_pak.h
     gf_pak.cpp
     gf_pak.h
+    trpfs.cpp
+    trpfs.h
     ooz/kraken.cpp
     ooz/ooz.h
     ooz/ooz_platform.h
