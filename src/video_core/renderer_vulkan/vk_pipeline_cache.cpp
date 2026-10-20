@@ -582,6 +582,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       full_worker(1, "VkPipelineFull", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background) {
     GraphicsPipeline::ResetPlayTally();
+    ComputePipeline::ResetPlayTally();
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -2725,7 +2726,24 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     env.SetCachedSize(shader->size_bytes);
 
     main_pools.ReleaseContents();
+    const auto translate_start{std::chrono::steady_clock::now()};
     auto pipeline{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    if (Common::Preforged::Options().log_shader_compiles) {
+        // Compute shaders from the game files aren't compiled ahead yet: their workgroup size
+        // and shared memory come from the dispatch, not the code. This shows how many the game
+        // needs in play and whether the search has them.
+        const std::chrono::duration<double, std::milli> translate_time{
+            std::chrono::steady_clock::now() - translate_start};
+        const bool listed{!preforged_shaders.empty() || !preforged_other_shaders.empty()};
+        const bool found{preforged_shaders.contains(key.unique_hash) ||
+                         preforged_other_shaders.contains(key.unique_hash)};
+        LOG_INFO(Render_Vulkan,
+                 "[ShaderTiming] compute {:016x} translate {:.2f} ms, in the game files: {}, "
+                 "workgroup {}x{}x{}, shared memory {} bytes",
+                 key.unique_hash, translate_time.count(),
+                 !listed ? "no list" : found ? "yes" : "no", key.workgroup_size[0],
+                 key.workgroup_size[1], key.workgroup_size[2], key.shared_memory_size);
+    }
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }

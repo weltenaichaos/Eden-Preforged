@@ -56,6 +56,9 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    /// Starts the counts of compute pipelines built in play again, for a new game.
+    static void ResetPlayTally();
+
 private:
     const Device& device;
     vk::PipelineCache& pipeline_cache;

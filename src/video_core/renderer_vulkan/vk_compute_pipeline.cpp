@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <mutex>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -23,6 +25,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
+#include "common/preforged_debug.h"
 #include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 
@@ -31,6 +34,35 @@ namespace Vulkan {
 using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
 using Tegra::Texture::TexturePair;
+
+namespace {
+/// A compute pipeline the driver builds in play faster than this was ready ahead: its code was in
+/// the driver's cache. The driver compiles one in 5 ms or more on the Adreno 740.
+constexpr double READY_AHEAD_MS = 3.0;
+
+/// The compute pipelines the game needed in play since it started.
+struct PlayTally {
+    std::mutex mutex;
+    size_t pipelines = 0;
+    size_t ready = 0;
+    double longest_ms = 0.0;
+    double compiled_ms = 0.0;
+};
+
+PlayTally& Tally() {
+    static PlayTally tally;
+    return tally;
+}
+} // Anonymous namespace
+
+void ComputePipeline::ResetPlayTally() {
+    PlayTally& tally{Tally()};
+    std::scoped_lock lock{tally.mutex};
+    tally.pipelines = 0;
+    tally.ready = 0;
+    tally.longest_ms = 0.0;
+    tally.compiled_ms = 0.0;
+}
 
 ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
                                  DescriptorPool& descriptor_pool,
@@ -80,7 +112,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics, count_compile = thread_worker != nullptr] {
+    auto func{[this, shader_notify, pipeline_statistics, count_compile = thread_worker != nullptr,
+               in_game =
+                   thread_worker != nullptr && Common::Preforged::Options().log_shader_compiles] {
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -111,6 +145,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineHandle = 0,
             .basePipelineIndex = 0,
         };
+        const auto driver_start{std::chrono::steady_clock::now()};
         try {
             const Common::Preforged::FrameStats::Timer timer{
                 count_compile ? Common::Preforged::FrameStats::Item::ShaderDriver
@@ -135,6 +170,28 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             );
         }
 
+        if (in_game) {
+            // Compute pipelines aren't compiled ahead from the game files yet, so their share
+            // ready ahead shows how much they still compile in play.
+            const std::chrono::duration<double, std::milli> driver_time{
+                std::chrono::steady_clock::now() - driver_start};
+            PlayTally& tally{Tally()};
+            std::scoped_lock tally_lock{tally.mutex};
+            ++tally.pipelines;
+            if (driver_time.count() < READY_AHEAD_MS) {
+                ++tally.ready;
+            } else {
+                tally.compiled_ms += driver_time.count();
+                tally.longest_ms = std::max(tally.longest_ms, driver_time.count());
+            }
+            LOG_INFO(Render_Vulkan,
+                     "[ShaderTiming] compute {:016x} driver {:.2f} ms; compute in play so far: {} "
+                     "new pipelines, {} ready ahead ({}%), {} compiled in play ({:.1f} ms in all, "
+                     "longest {:.1f} ms)",
+                     shader_hash, driver_time.count(), tally.pipelines, tally.ready,
+                     tally.ready * 100 / tally.pipelines, tally.pipelines - tally.ready,
+                     tally.compiled_ms, tally.longest_ms);
+        }
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
