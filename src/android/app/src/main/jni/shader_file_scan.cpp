@@ -1016,6 +1016,19 @@ public:
         return found;
     }
 
+    /// Says the game's shader files are encrypted and can't be read, or is empty when they aren't.
+    std::string EncryptionNote() const {
+        if (pak_totals.encrypted_unread != 0) {
+            return "; this game's shader files are encrypted and can't be read, so it keeps "
+                   "compiling its shaders while it runs";
+        }
+        if (std::ranges::find(engines, "Unreal Engine 4 or 5 IoStore containers") != engines.end()) {
+            return "; this game keeps its shaders in IoStore containers the search doesn't read, "
+                   "so it keeps compiling its shaders while it runs";
+        }
+        return "";
+    }
+
     /// One line on what the search found, kept in the done marker for later starts.
     /// `cut_short` says whether the search stopped before it read all files.
     std::string ResultSummary(bool cut_short) const {
@@ -1024,12 +1037,12 @@ public:
                                                                : ", stopped early at the time limit";
         if (shaders.empty()) {
             return fmt::format("searched without a shader cache (first start), took {} shaders "
-                               "from the files{}",
-                               extracted.size(), early);
+                               "from the files{}{}",
+                               extracted.size(), early, EncryptionNote());
         }
         return fmt::format("found {} of the {} shaders the game had drawn, took {} shaders from "
-                           "the files{}",
-                           FoundCount(), shaders.size(), extracted.size(), early);
+                           "the files{}{}",
+                           FoundCount(), shaders.size(), extracted.size(), early, EncryptionNote());
     }
 
     size_t TakenCount() const {
@@ -1859,6 +1872,35 @@ public:
                  pak_totals.archives, pak_totals.archive_shaders, pak_totals.archive_headers,
                  pak_totals.archive_taken, methods.empty() ? "none" : methods,
                  types.empty() ? "none" : types);
+    }
+
+    /// A plain-language line, when the game's files are encrypted in a way that stops the search
+    /// from reading the shaders out of them. The game is the player's own copy; the files are
+    /// encrypted by the game, and the search does not get around that, so those shaders are
+    /// compiled while the game runs, the first time each one is drawn.
+    void ReportEncryption() const {
+        const bool has_iostore =
+            std::ranges::find(engines, "Unreal Engine 4 or 5 IoStore containers") != engines.end();
+        if (pak_totals.encrypted_unread == 0 && !has_iostore) {
+            return;
+        }
+        std::string reasons;
+        if (pak_totals.encrypted_unread != 0) {
+            reasons = fmt::format("{} of its Unreal Engine pak files are encrypted",
+                                  pak_totals.encrypted_unread);
+        }
+        if (has_iostore) {
+            reasons += fmt::format("{}its shaders are kept in Unreal Engine IoStore containers "
+                                   "(.utoc/.ucas), which the search does not read",
+                                   reasons.empty() ? "" : ", and ");
+        }
+        LOG_WARNING(Frontend,
+                    "[ShaderScan] this game's shader files can't be read: {}. The search can't "
+                    "take the shaders out of them, so this game keeps compiling its shaders while "
+                    "it runs (each one stutters the first time it is drawn, then is stored and is "
+                    "quick afterwards). This is not about owning the game: the files are encrypted "
+                    "by the game itself, and the search does not get around that.",
+                    reasons);
     }
 
 private:
@@ -3016,6 +3058,7 @@ private:
             ++pak_totals.encrypted_index;
             const auto key = PakKey(pak, primary, index_note);
             if (!key) {
+                ++pak_totals.encrypted_unread;
                 log_pak("not read, so the file is searched as stored");
                 return &pak;
             }
@@ -3351,6 +3394,9 @@ private:
         size_t paks = 0;
         size_t readable = 0;
         size_t encrypted_index = 0;
+        /// Paks whose index is encrypted and whose key the search could not find, so nothing in
+        /// them is read.
+        size_t encrypted_unread = 0;
         size_t listed = 0;
         size_t read = 0;
         size_t failed = 0;
@@ -3996,6 +4042,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     }
     scanner.SavePrograms(shader_dir / "preforged_programs.bin");
     scanner.ReportResult();
+    scanner.ReportEncryption();
     marker.result = scanner.ResultSummary(cut_short);
     marker.taken = scanner.TakenCount();
     WriteSearchMarker(shader_dir, marker);
