@@ -99,9 +99,11 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // and fragment shaders in no pair kept too, for pipeline libraries. 17: Unreal Engine 4 pak
 // files unpacked (with the AES key from the game's executable when encrypted), and the shaders
 // in their shader archives; the Switch shaders of Unity games' Shader objects, in their asset
-// files and bundles; the read-only data and data of the game's program modules; zstd frames,
-// zlib streams, ZIP entries and CRILAYLA files found inside any file.
-constexpr u32 SEARCH_VERSION = 17;
+// files and bundles; the read-only data and data of the game's program modules. 18: zstd frames,
+// zlib streams, ZIP entries and CRILAYLA files found inside any file; RE Engine paks, Game
+// Freak .gfpak archives and Pokémon Scarlet and Violet's data.trpfs (build 75 had 17 without
+// them).
+constexpr u32 SEARCH_VERSION = 18;
 /// Packed streams found inside files that unpack to fewer bytes are left out: too small to hold
 /// a shader worth the search.
 constexpr size_t MIN_PACKED_STREAM = 256;
