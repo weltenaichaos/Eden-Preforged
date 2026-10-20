@@ -429,7 +429,7 @@ bool DecompressLzo1x(std::span<const u8> in, std::span<u8> out) {
 
 bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& stats,
             const std::function<bool(std::span<const u8> piece, u64 offset)>& consume,
-            bool unpack_oodle) {
+            bool unpack_oodle, std::vector<FailedBlock>* failures) {
     if (!IsPackage(data)) {
         return false;
     }
@@ -499,6 +499,16 @@ bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& 
             }
             if (method == Method::OodleFailed || method == Method::Unknown) {
                 buffer.resize(old_size);
+                if (failures && failures->size() < MAX_FAILED_BLOCKS_KEPT) {
+                    failures->push_back(FailedBlock{
+                        .file_offset = block_pos - block.packed,
+                        .unpacked_offset = buffer_offset + old_size,
+                        .packed = static_cast<u32>(block.packed),
+                        .unpacked = static_cast<u32>(block.unpacked),
+                        .decoder =
+                            IsOodleHeader(in) ? static_cast<u8>(in[1] & 0x7F) : FAILED_NOT_OODLE,
+                    });
+                }
                 if (method == Method::OodleFailed && unpack_oodle &&
                     stats.oodle_examples.size() < EXAMPLES) {
                     stats.oodle_examples.push_back(fmt::format(
@@ -733,7 +743,8 @@ std::optional<Summary> ReadSummary(std::span<const u8> file) {
 }
 
 bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u8>& image,
-                 size_t& failed_blocks, std::vector<ImageSpan>& spans) {
+                 size_t& failed_blocks, std::vector<ImageSpan>& spans,
+                 std::vector<FailedBlock>* failures) {
     failed_blocks = 0;
     spans.clear();
     if (summary.chunks.empty()) {
@@ -768,6 +779,15 @@ bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u
             // A chunk list that disagrees with its parts must not write past the image.
             if (out_pos + block.unpacked > image.size() - Ooz::OUTPUT_SLACK) {
                 ++failed_blocks;
+                if (failures && failures->size() < MAX_FAILED_BLOCKS_KEPT) {
+                    failures->push_back(FailedBlock{
+                        .file_offset = block_pos,
+                        .unpacked_offset = out_pos,
+                        .packed = static_cast<u32>(block.packed),
+                        .unpacked = static_cast<u32>(block.unpacked),
+                        .decoder = FAILED_PAST_END,
+                    });
+                }
                 break;
             }
             const std::span<u8> out{image.data() + out_pos, block.unpacked};
@@ -775,6 +795,16 @@ bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u
             if (method == Method::OodleFailed || method == Method::Unknown) {
                 std::memset(out.data(), 0, out.size());
                 ++failed_blocks;
+                if (failures && failures->size() < MAX_FAILED_BLOCKS_KEPT) {
+                    failures->push_back(FailedBlock{
+                        .file_offset = block_pos,
+                        .unpacked_offset = out_pos,
+                        .packed = static_cast<u32>(block.packed),
+                        .unpacked = static_cast<u32>(block.unpacked),
+                        .decoder =
+                            IsOodleHeader(in) ? static_cast<u8>(in[1] & 0x7F) : FAILED_NOT_OODLE,
+                    });
+                }
             } else {
                 any = true;
                 if (!spans.empty() &&

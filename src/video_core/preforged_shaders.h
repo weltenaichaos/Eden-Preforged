@@ -54,6 +54,9 @@ struct PreforgedPrograms {
     u32 texture_bound = 2;
     std::unordered_map<u64, PreforgedShader> shaders;
     std::vector<std::pair<u64, u64>> pairs;
+    /// The other shaders taken from the game files, which are in no pair, by hash only. They let
+    /// the play log tell a game file shader no pair has from a shader the game files don't have.
+    std::vector<u64> other_shaders;
 };
 
 [[nodiscard]] bool WritePreforgedPrograms(const std::filesystem::path& path,

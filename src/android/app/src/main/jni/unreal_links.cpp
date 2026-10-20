@@ -3363,6 +3363,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
     std::vector<u8> image;
     std::vector<ImageSpan> spans;
     size_t failed_blocks = 0;
+    std::vector<FailedBlock> failures;
     bool whole = false;
     if (!summary) {
         // A package compressed whole keeps its header inside the compressed data.
@@ -3378,7 +3379,7 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
                      name, Hex(file, 0, 128));
             return;
         }
-    } else if (!UnpackImage(file, *summary, image, failed_blocks, spans)) {
+    } else if (!UnpackImage(file, *summary, image, failed_blocks, spans, &failures)) {
         LOG_INFO(Frontend, "[ShaderScan] Unreal links: nothing in {} unpacked", name);
         return;
     }
@@ -3507,6 +3508,39 @@ void LinkSurvey::StudyCodePackage(std::string_view name, std::span<const u8> fil
              count, hash_at.size(), misses, s.first_code, s.code_end,
              Top(residues, 4, [](u32 r, size_t n) { return fmt::format("0x{:02x}x{}", r, n); }),
              s.played_list.size(), played_codes);
+    // Code in a block that did not unpack is missing from the search, and so are its shaders.
+    for (const FailedBlock& block : failures) {
+        const u64 begin = block.unpacked_offset;
+        const u64 end = begin + block.unpacked;
+        std::string where;
+        if (end <= s.first_code) {
+            where = "before the code";
+        } else if (begin >= s.code_end) {
+            where = "after the code";
+        } else {
+            // The code headers right before and after it.
+            const auto next = std::ranges::lower_bound(s.codes, end);
+            const auto previous = std::ranges::lower_bound(s.codes, begin);
+            where = fmt::format("in the code{}{}",
+                                previous != s.codes.begin()
+                                    ? fmt::format(", after code header #{} at 0x{:x}",
+                                                  previous - s.codes.begin() - 1, *(previous - 1))
+                                    : std::string{},
+                                next != s.codes.end() ? fmt::format(", before #{} at 0x{:x}",
+                                                                    next - s.codes.begin(), *next)
+                                                      : std::string{});
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal links: block of {} that did not unpack: 0x{:x} to 0x{:x} "
+                 "({} -> {} bytes at file 0x{:x}, {}), {}",
+                 name, begin, end, block.packed, block.unpacked, block.file_offset,
+                 block.decoder == FAILED_PAST_END ? std::string{"past the end of the layout"}
+                 : block.decoder == FAILED_NOT_OODLE
+                     ? std::string{"not Oodle"}
+                     : fmt::format("Oodle decoder {} ({})", block.decoder,
+                                   OodleCompressorName(block.decoder)),
+                 where);
+    }
 
     // The played pairs by the code headers of their shaders, for the fields and ids by them.
     std::vector<u64> hash_of(count, 0);

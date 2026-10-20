@@ -148,7 +148,9 @@ private:
     /// driver keeps their compiled code. Pipelines with other states reuse that code.
     /// Shader pairs from the game files, with the shader state they were compiled with.
     std::unordered_map<u64, u64> preforged_pairs;
+    /// Shaders from the game files in a pair, and the others from the game files.
     std::unordered_set<u64> preforged_shaders;
+    std::unordered_set<u64> preforged_other_shaders;
     /// Shader pairs from the game files left out by the pre-compile share.
     std::unordered_set<u64> preforged_skipped_pairs;
 

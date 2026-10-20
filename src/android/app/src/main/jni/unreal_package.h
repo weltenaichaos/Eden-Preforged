@@ -62,6 +62,24 @@ struct Stats {
     std::vector<std::string> oodle_examples;
 };
 
+/// A block that did not unpack, and where it is.
+struct FailedBlock {
+    u64 file_offset;     ///< Where its packed bytes start in the file
+    u64 unpacked_offset; ///< Where its bytes would start: in what Unpack hands out, or in the
+                         ///< uncompressed layout for UnpackImage
+    u32 packed;
+    u32 unpacked;
+    u8 decoder; ///< The Oodle decoder named in its second byte, or one of the values below
+};
+
+/// FailedBlock::decoder of a block that does not start like Oodle.
+constexpr u8 FAILED_NOT_OODLE = 0xFF;
+/// FailedBlock::decoder of a block the chunk list puts past the end of the layout.
+constexpr u8 FAILED_PAST_END = 0xFE;
+
+/// Blocks that did not unpack that one package keeps a record of.
+constexpr size_t MAX_FAILED_BLOCKS_KEPT = 256;
+
 /// Returns true when the data starts with the Unreal package tag.
 [[nodiscard]] bool IsPackage(std::span<const u8> data);
 
@@ -69,10 +87,11 @@ struct Stats {
 /// unpacked data to `consume` in pieces of about `piece_size` bytes, each starting with the last
 /// `overlap` bytes of the piece before it, with the unpacked offset of the piece's first byte.
 /// Returns false when the package has no compressed part. With `unpack_oodle` false, Oodle
-/// blocks are counted but left packed.
+/// blocks are counted but left packed. `failures`, when given, gets the blocks that did not
+/// unpack (up to MAX_FAILED_BLOCKS_KEPT).
 bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& stats,
             const std::function<bool(std::span<const u8> piece, u64 offset)>& consume,
-            bool unpack_oodle = true);
+            bool unpack_oodle = true, std::vector<FailedBlock>* failures = nullptr);
 
 /// Unpacks LZO1X data into exactly `out.size()` bytes. Returns false when the data is not
 /// LZO1X data of that size. Exposed for tests.
@@ -149,8 +168,10 @@ struct ImageSpan {
 /// not unpack stay zero and are counted in `failed_blocks`. Returns false when nothing unpacked.
 /// `spans` gets where each block Unpack hands out lies in the layout. Unpack leaves out the
 /// blocks that do not unpack, so its offsets move back by their size after each one.
+/// `failures`, when given, gets the blocks that did not unpack (up to MAX_FAILED_BLOCKS_KEPT).
 bool UnpackImage(std::span<const u8> file, const Summary& summary, std::vector<u8>& image,
-                 size_t& failed_blocks, std::vector<ImageSpan>& spans);
+                 size_t& failed_blocks, std::vector<ImageSpan>& spans,
+                 std::vector<FailedBlock>* failures = nullptr);
 
 /// Maps an offset in the data Unpack hands out to the offset in the uncompressed layout, with
 /// the spans UnpackImage gave. Returns nothing for offsets past the last span.

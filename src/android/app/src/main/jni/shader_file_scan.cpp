@@ -79,13 +79,17 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // with a dictionary (dictionaries looked for in files named like them first), the Unreal shader
 // link log. 12: Unreal shader pairs learned from the played ones, in the code package and in
 // the other packages. 13: Unreal shader caches read for the pairs. 14: up to 30,000 pairs
-// kept from a shader cache.
-constexpr u32 SEARCH_VERSION = 14;
+// kept from a shader cache. 15: every shader taken from the game files kept by hash, so the
+// play log tells a missed pair from a shader the game files don't have.
+constexpr u32 SEARCH_VERSION = 15;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
 /// Drawn shaders not among the game files' shaders that the log names one by one.
 constexpr size_t MAX_UNMATCHED_LOGGED = 160;
+/// Unreal packages with blocks that did not unpack that the log names, and blocks per package.
+constexpr size_t FAILED_PACKAGES_LOGGED = 30;
+constexpr size_t FAILED_BLOCKS_LOGGED_PER_FILE = 4;
 constexpr u32 NVN_CODE_MAGIC = 0x12345678;
 constexpr size_t NVN_CODE_HEADER_SIZE = 0x30;
 constexpr size_t MAX_SHADER_SIZE = 0x100000;
@@ -838,6 +842,10 @@ public:
     /// Logs each drawn shader that is not among the shaders taken from the game files, so its
     /// pairs can't be compiled ahead: how much of its code was found, and where it differs.
     void ReportUnmatched() const {
+        std::unordered_set<u64> drawn;
+        for (const auto& shader : shaders) {
+            drawn.insert(shader.unique_hash);
+        }
         std::array<size_t, 4> by_kind{};
         size_t logged = 0;
         for (size_t index = 0; index < shaders.size(); ++index) {
@@ -864,8 +872,10 @@ public:
                         it != file_headers.end()) {
                         const auto taken = extracted.find(it->second.hash);
                         header = fmt::format(
-                            "its code header's shader {:016x} has {} bytes", it->second.hash,
-                            taken != extracted.end() ? taken->second.code.size() * sizeof(u64) : 0);
+                            "its code header's shader {:016x} has {} bytes and was {}drawn",
+                            it->second.hash,
+                            taken != extracted.end() ? taken->second.code.size() * sizeof(u64) : 0,
+                            drawn.contains(it->second.hash) ? "" : "not ");
                     }
                 }
                 found = fmt::format("{} of its bytes from +0x{:x} found in {} at 0x{:x}, {}; {}",
@@ -1000,12 +1010,62 @@ public:
         for (const std::string& example : stats.oodle_examples) {
             LOG_INFO(Frontend, "[ShaderScan] Unreal Oodle block that did not unpack: {}", example);
         }
+        ReportFailedPackages();
         for (const std::string& example : stats.header_examples) {
             LOG_INFO(Frontend, "[ShaderScan] Unreal package header: {}", example);
         }
         for (const std::string& example : stats.unknown_examples) {
             LOG_INFO(Frontend, "[ShaderScan] Unreal block packed with an unknown method: {}",
                      example);
+        }
+    }
+
+    /// Logs the Unreal packages with blocks that did not unpack, most bytes lost first, so a
+    /// shader the search does not find can be told to be in one of them.
+    void ReportFailedPackages() const {
+        if (failed_packages.empty()) {
+            return;
+        }
+        std::vector<std::pair<std::string, const FailedPackage*>> order;
+        size_t blocks = 0;
+        u64 lost = 0;
+        for (const auto& [name, failed] : failed_packages) {
+            order.emplace_back(name, &failed);
+            blocks += failed.blocks;
+            lost += failed.lost;
+        }
+        std::ranges::sort(
+            order, [](const auto& a, const auto& b) { return a.second->lost > b.second->lost; });
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal packages with blocks that did not unpack: {} packages, {} "
+                 "blocks, {} KiB not searched; most first{}:",
+                 order.size(), blocks, lost >> 10,
+                 order.size() > FAILED_PACKAGES_LOGGED
+                     ? fmt::format(" (the first {})", FAILED_PACKAGES_LOGGED)
+                     : std::string{});
+        for (size_t i = 0; i < std::min(order.size(), FAILED_PACKAGES_LOGGED); ++i) {
+            const auto& [name, failed] = order[i];
+            std::string decoders;
+            for (const auto& [decoder, count] : failed->decoders) {
+                decoders +=
+                    fmt::format("{}{} x{}", decoders.empty() ? "" : ", ",
+                                decoder == Preforged::Unreal::FAILED_NOT_OODLE
+                                    ? std::string{"not Oodle"}
+                                    : fmt::format("Oodle decoder {} ({})", decoder,
+                                                  Preforged::Unreal::OodleCompressorName(decoder)),
+                                count);
+            }
+            std::string where;
+            for (const auto& block : failed->first) {
+                where += fmt::format("{}0x{:x} (file 0x{:x}, {} -> {} bytes)",
+                                     where.empty() ? "" : ", ", block.unpacked_offset,
+                                     block.file_offset, block.packed, block.unpacked);
+            }
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal package {}: {} blocks did not unpack ({}), {} KiB not "
+                     "searched, at {}{}",
+                     name, failed->blocks, decoders, failed->lost >> 10, where,
+                     failed->blocks > failed->first.size() ? ", ..." : "");
         }
     }
 
@@ -1540,9 +1600,17 @@ public:
             }
             programs.pairs.emplace_back(vertex, fragment);
         }
+        for (const auto& [hash, shader] : extracted) {
+            if (!programs.shaders.contains(hash)) {
+                programs.other_shaders.push_back(hash);
+            }
+        }
         const bool written = VideoCommon::WritePreforgedPrograms(path, programs);
-        LOG_INFO(Frontend, "[ShaderScan] saved {} shader pairs with {} shaders: {}",
-                 programs.pairs.size(), programs.shaders.size(), written ? "ok" : "failed");
+        LOG_INFO(Frontend,
+                 "[ShaderScan] saved {} shader pairs with {} shaders, and the hashes of the {} "
+                 "other shaders taken from the game files: {}",
+                 programs.pairs.size(), programs.shaders.size(), programs.other_shaders.size(),
+                 written ? "ok" : "failed");
     }
 
     bool Stopped() const {
@@ -1569,6 +1637,14 @@ private:
     struct FileStats {
         size_t hits = 0;
         size_t terminators = 0;
+    };
+
+    /// Blocks of one Unreal package that did not unpack.
+    struct FailedPackage {
+        size_t blocks = 0;
+        u64 lost = 0; ///< Bytes they would have unpacked to
+        std::map<u8, size_t> decoders;
+        std::vector<Preforged::Unreal::FailedBlock> first;
     };
 
     static size_t NeedleOffset(const CachedShaderCode& shader) {
@@ -1670,6 +1746,7 @@ private:
         if (Common::Preforged::Options().unpack_unreal_packages &&
             Preforged::Unreal::IsPackage(data)) {
             const std::string unpacked_name = name + UNPACKED_SUFFIX;
+            std::vector<Preforged::Unreal::FailedBlock> failures;
             const bool unpacked = Preforged::Unreal::Unpack(
                 data, CHUNK_SIZE, CHUNK_OVERLAP, unreal_stats,
                 [&](std::span<const u8> piece, u64 offset) {
@@ -1682,7 +1759,18 @@ private:
                     SearchShaders(piece, unpacked_name, offset);
                     return !Stopped();
                 },
-                Common::Preforged::Options().unpack_oodle);
+                Common::Preforged::Options().unpack_oodle, &failures);
+            if (!failures.empty()) {
+                auto& failed = failed_packages[unpacked_name];
+                for (const auto& block : failures) {
+                    ++failed.blocks;
+                    failed.lost += block.unpacked;
+                    ++failed.decoders[block.decoder];
+                    if (failed.first.size() < FAILED_BLOCKS_LOGGED_PER_FILE) {
+                        failed.first.push_back(block);
+                    }
+                }
+            }
             if (unpacked) {
                 return;
             }
@@ -2029,6 +2117,7 @@ private:
     std::unordered_map<u64, std::vector<size_t>> needles;
     std::vector<Result> results;
     std::map<std::string, FileStats> hits_per_file;
+    std::map<std::string, FailedPackage> failed_packages;
     size_t files_scanned = 0;
     size_t bytes_scanned = 0;
     std::map<u32, size_t> logged_per_stage;

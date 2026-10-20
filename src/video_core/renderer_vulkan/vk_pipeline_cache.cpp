@@ -1432,6 +1432,7 @@ void PipelineCache::PrecompilePreforgedPairs(
     for (const auto& [hash, shader] : programs.shaders) {
         preforged_shaders.insert(hash);
     }
+    preforged_other_shaders = {programs.other_shaders.begin(), programs.other_shaders.end()};
     std::unordered_set<u64> played_fragments;
     for (const GraphicsPipelineCacheKey& key : played_keys) {
         played_fragments.insert(key.unique_hashes[5]);
@@ -1997,9 +1998,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             const u64 vertex{key.unique_hashes[1]};
             const u64 fragment{key.unique_hashes[5]};
             const auto pair{preforged_pairs.find((vertex * 0x9E3779B97F4A7C15ULL) ^ fragment)};
+            // Files from searches before the list of other shaders can't tell the last two apart.
+            const auto where{[this](u64 shader) {
+                return preforged_shaders.contains(shader)         ? "in a pair"
+                       : preforged_other_shaders.contains(shader) ? "in no pair"
+                       : preforged_other_shaders.empty()          ? "not in a pair"
+                                                                  : "not among them";
+            }};
             game_files = fmt::format(
-                "vertex {} fragment {} pair {}", preforged_shaders.contains(vertex) ? "yes" : "no",
-                preforged_shaders.contains(fragment) ? "yes" : "no",
+                "vertex {}, fragment {}, pair {}", where(vertex), where(fragment),
                 pair != preforged_pairs.end() ? fmt::format("yes, {}", store_match)
                 : preforged_skipped_pairs.contains((vertex * 0x9E3779B97F4A7C15ULL) ^ fragment)
                     ? std::string{"skipped by the pre-compile share"}

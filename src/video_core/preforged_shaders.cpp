@@ -13,6 +13,7 @@ namespace {
 constexpr u32 FILE_MAGIC = 0x52504650; // "PFPR"
 constexpr u32 FILE_VERSION = 1;
 constexpr u32 MAX_SHADER_WORDS = 0x100000 / sizeof(u64);
+constexpr u32 MAX_OTHER_SHADERS = 1u << 22;
 
 template <typename T>
 void Write(std::ofstream& file, const T& value) {
@@ -113,6 +114,10 @@ bool WritePreforgedPrograms(const std::filesystem::path& path,
         Write(file, vertex);
         Write(file, fragment);
     }
+    // After the pairs, so builds that don't read them still read the rest.
+    Write(file, static_cast<u32>(programs.other_shaders.size()));
+    file.write(reinterpret_cast<const char*>(programs.other_shaders.data()),
+               programs.other_shaders.size() * sizeof(u64));
     return static_cast<bool>(file);
 }
 
@@ -152,6 +157,15 @@ std::optional<PreforgedPrograms> ReadPreforgedPrograms(const std::filesystem::pa
     for (auto& [vertex, fragment] : programs.pairs) {
         if (!Read(file, vertex) || !Read(file, fragment)) {
             return std::nullopt;
+        }
+    }
+    // Files from builds before the list end here.
+    u32 other_count{};
+    if (Read(file, other_count) && other_count <= MAX_OTHER_SHADERS) {
+        programs.other_shaders.resize(other_count);
+        if (!file.read(reinterpret_cast<char*>(programs.other_shaders.data()),
+                       other_count * sizeof(u64))) {
+            programs.other_shaders.clear();
         }
     }
     return programs;
