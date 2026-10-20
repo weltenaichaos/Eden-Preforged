@@ -78,8 +78,9 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // searched is searched once more. 10: Oodle blocks in Unreal packages. 11: zstd files packed
 // with a dictionary (dictionaries looked for in files named like them first), the Unreal shader
 // link log. 12: Unreal shader pairs learned from the played ones, in the code package and in
-// the other packages. 13: Unreal shader caches read for the pairs.
-constexpr u32 SEARCH_VERSION = 13;
+// the other packages. 13: Unreal shader caches read for the pairs. 14: up to 30,000 pairs
+// kept from a shader cache.
+constexpr u32 SEARCH_VERSION = 14;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"

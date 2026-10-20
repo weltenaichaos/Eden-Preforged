@@ -95,6 +95,9 @@ constexpr u32 CONTROL_SHIFT = 5;
 /// Most pairs a learned link hands over for pre-compiling (the Thor compiles about 70 a
 /// second), and most it may tie in all.
 constexpr size_t MAX_LEARNED_PAIRS = 10000;
+/// The shader cache names the pairs the game's materials draw with, so more of them are kept:
+/// XCOM 2's gives about 17,000, which compile in about 90 s once on the Thor.
+constexpr size_t MAX_CACHE_PAIRS = 30000;
 constexpr size_t MAX_CANDIDATES = size_t{1} << 20;
 constexpr size_t MAX_CODE_ID_WINDOWS = 8;
 constexpr size_t MAX_HITS_PER_CODE = 16;
@@ -744,12 +747,13 @@ std::vector<u8> PairCodes(u32 count, std::span<const PairCopies> played, const C
 }
 
 /// Orders learned pairs for pre-compiling, those of the played vertex shaders first, keeps the
-/// first MAX_LEARNED_PAIRS and logs how well they hold the played pairs.
+/// first `max_kept` and logs how well they hold the played pairs.
 std::vector<std::pair<u64, u64>> RankLearned(std::vector<std::pair<u64, u64>> candidates,
                                              std::span<const PairCopies> played,
                                              const std::vector<u64>& hash_of,
                                              const std::string& what, bool capped,
-                                             std::chrono::steady_clock::time_point start) {
+                                             std::chrono::steady_clock::time_point start,
+                                             size_t max_kept = MAX_LEARNED_PAIRS) {
     std::sort(candidates.begin(), candidates.end());
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
     // How well the link finds the played pairs, and how many fragment shaders it gives each
@@ -784,7 +788,7 @@ std::vector<std::pair<u64, u64>> RankLearned(std::vector<std::pair<u64, u64>> ca
     };
     std::stable_sort(candidates.begin(), candidates.end(),
                      [&](const auto& x, const auto& y) { return rank(x) < rank(y); });
-    const size_t kept = std::min(candidates.size(), MAX_LEARNED_PAIRS);
+    const size_t kept = std::min(candidates.size(), max_kept);
     std::set<u64> vertex_shaders;
     std::set<u64> fragment_shaders;
     for (const auto& [vertex, fragment] : candidates) {
@@ -3106,9 +3110,9 @@ struct LinkSurvey::Impl {
         for (const std::string& way : ways) {
             joined += fmt::format("{}{}", joined.empty() ? "" : " and ", way);
         }
-        learned_cache =
-            RankLearned(std::move(candidates), played_copies, code_hashes,
-                        fmt::format("learned link in the shader cache: {}", joined), capped, start);
+        learned_cache = RankLearned(std::move(candidates), played_copies, code_hashes,
+                                    fmt::format("learned link in the shader cache: {}", joined),
+                                    capped, start, MAX_CACHE_PAIRS);
     }
 
     /// Whether the ids between two hits, both included, name one kind of shader twice: a
