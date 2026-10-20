@@ -84,6 +84,8 @@ constexpr u32 SEARCH_VERSION = 14;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
+/// Drawn shaders not among the game files' shaders that the log names one by one.
+constexpr size_t MAX_UNMATCHED_LOGGED = 160;
 constexpr u32 NVN_CODE_MAGIC = 0x12345678;
 constexpr size_t NVN_CODE_HEADER_SIZE = 0x30;
 constexpr size_t MAX_SHADER_SIZE = 0x100000;
@@ -833,6 +835,67 @@ public:
         return out.empty() ? std::string{"none"} : out;
     }
 
+    /// Logs each drawn shader that is not among the shaders taken from the game files, so its
+    /// pairs can't be compiled ahead: how much of its code was found, and where it differs.
+    void ReportUnmatched() const {
+        std::array<size_t, 4> by_kind{};
+        size_t logged = 0;
+        for (size_t index = 0; index < shaders.size(); ++index) {
+            const auto& shader = shaders[index];
+            if (extracted.contains(shader.unique_hash)) {
+                continue;
+            }
+            const Result& result = results[index];
+            ++by_kind[static_cast<size_t>(result.kind)];
+            if (logged >= MAX_UNMATCHED_LOGGED) {
+                continue;
+            }
+            ++logged;
+            const size_t needle_offset = NeedleOffset(shader);
+            const size_t code_bytes = shader.code.size() * sizeof(u64);
+            std::string found;
+            if (result.best_length > 0) {
+                // The code header in front of the code, when the file has one there.
+                std::string header = "no code header in front of it";
+                const u64 code_start = result.best_offset - needle_offset;
+                if (code_start >= NVN_CODE_HEADER_SIZE) {
+                    const auto& file_headers = headers[result.best_file];
+                    if (const auto it = file_headers.find(code_start - NVN_CODE_HEADER_SIZE);
+                        it != file_headers.end()) {
+                        const auto taken = extracted.find(it->second.hash);
+                        header = fmt::format(
+                            "its code header's shader {:016x} has {} bytes", it->second.hash,
+                            taken != extracted.end() ? taken->second.code.size() * sizeof(u64) : 0);
+                    }
+                }
+                found = fmt::format("{} of its bytes from +0x{:x} found in {} at 0x{:x}, {}; {}",
+                                    result.best_length, needle_offset, file_names[result.best_file],
+                                    code_start, result.best_difference, header);
+            } else {
+                std::string start;
+                const auto* const code = reinterpret_cast<const u8*>(shader.code.data());
+                for (size_t i = needle_offset; i < std::min(code_bytes, needle_offset + 32); ++i) {
+                    start += fmt::format("{:02x}", code[i]);
+                }
+                found = fmt::format("its first instructions are {}", start);
+            }
+            LOG_INFO(Frontend,
+                     "[ShaderScan] drawn shader {:016x} (stage {}, {} bytes of code) is not among "
+                     "the game files' shaders ({}): {}",
+                     shader.unique_hash, static_cast<u32>(shader.stage), code_bytes,
+                     KindName(result.kind), found);
+        }
+        const size_t total = by_kind[0] + by_kind[1] + by_kind[2] + by_kind[3];
+        const auto count = [&](MatchKind kind) { return by_kind[static_cast<size_t>(kind)]; };
+        LOG_INFO(Frontend,
+                 "[ShaderScan] drawn shaders not among the game files' shaders, so their new "
+                 "pairs can't be compiled ahead: {} of {} ({} found whole, {} found with another "
+                 "program header, {} only their start, {} not found){}",
+                 total, shaders.size(), count(MatchKind::Exact), count(MatchKind::CodeOnly),
+                 count(MatchKind::Needle), count(MatchKind::None),
+                 logged < total ? fmt::format(", the first {} shown", logged) : std::string{});
+    }
+
     // Logs what the search unpacked and what it could not, so a game whose shaders it does not
     // find shows which of its formats the search does not read.
     void ReportFormats() const {
@@ -1495,6 +1558,12 @@ public:
 private:
     struct Result {
         MatchKind kind = MatchKind::None;
+        /// For a shader only its start was found of: the longest run of its code found from the
+        /// start on, where, and the bytes where that run ends.
+        size_t best_length = 0;
+        u32 best_file = 0;
+        u64 best_offset = 0;
+        std::string best_difference;
     };
 
     struct FileStats {
@@ -1702,6 +1771,7 @@ private:
             for (const size_t index : it->second) {
                 const MatchKind kind = Verify(index, data, pos);
                 auto& result = results[index];
+                NotePartialMatch(index, data, pos, file_id, base_offset);
                 if (kind > result.kind) {
                     if (result.kind < MatchKind::CodeOnly && kind >= MatchKind::CodeOnly) {
                         ++hits;
@@ -1867,6 +1937,45 @@ private:
             extracted.emplace(hash, ExtractedShader{stage, start_address, std::move(code)});
             return;
         }
+    }
+
+    /// Keeps the longest run of a shader's code found from its start on, and where, to tell
+    /// in the log why a drawn shader is not among the shaders taken from the game files.
+    void NotePartialMatch(size_t index, std::span<const u8> data, size_t pos, u32 file_id,
+                          u64 base_offset) {
+        const auto& shader = shaders[index];
+        const size_t needle_offset = NeedleOffset(shader);
+        const size_t code_bytes = shader.code.size() * sizeof(u64);
+        if (code_bytes <= needle_offset || pos < needle_offset) {
+            return;
+        }
+        const auto* const code = reinterpret_cast<const u8*>(shader.code.data());
+        const size_t tail = std::min(code_bytes - needle_offset, data.size() - pos);
+        size_t length = 0;
+        while (length < tail && data[pos + length] == code[needle_offset + length]) {
+            ++length;
+        }
+        auto& result = results[index];
+        if (length <= result.best_length) {
+            return;
+        }
+        result.best_length = length;
+        result.best_file = file_id;
+        result.best_offset = base_offset + pos;
+        const size_t at = (needle_offset + length) & ~size_t{7};
+        std::string runtime;
+        std::string file;
+        for (size_t i = at; i < std::min(code_bytes, at + 16); ++i) {
+            runtime += fmt::format("{:02x}", code[i]);
+        }
+        const size_t file_at = pos + at - needle_offset;
+        for (size_t i = file_at; i < std::min(data.size(), file_at + 16); ++i) {
+            file += fmt::format("{:02x}", data[i]);
+        }
+        result.best_difference =
+            length == code_bytes - needle_offset
+                ? fmt::format("all of it (file goes on with {})", file)
+                : fmt::format("up to code +0x{:x}: drawn {} vs file {}", at, runtime, file);
     }
 
     MatchKind Verify(size_t index, std::span<const u8> data, size_t pos) const {
@@ -2165,6 +2274,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         scanner.Report("all files");
     }
     const bool cut_short = scanner.Stopped();
+    scanner.ReportUnmatched();
     scanner.ReportFormats();
     // When the code is in a package the first pass didn't read, the other packages were
     // searched before it was known.
