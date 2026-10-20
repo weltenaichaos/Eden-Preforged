@@ -66,6 +66,7 @@ void LoadOptions() {
     options.unpack_unreal_packages = Settings::values.preforged_unpack_unreal_packages.GetValue();
     options.unpack_oodle = Settings::values.preforged_unpack_oodle.GetValue();
     options.read_unity_files = Settings::values.preforged_read_unity_files.GetValue();
+    options.read_iostore = Settings::values.preforged_read_iostore.GetValue();
     options.search_program = Settings::values.preforged_search_program.GetValue();
     options.find_packed_data = Settings::values.preforged_find_packed_data.GetValue();
     options.zstd_dictionaries = Settings::values.preforged_zstd_dictionaries.GetValue();
@@ -102,11 +103,12 @@ void LoadOptions() {
              options.log_unreal_links, options.unreal_learned_pairs);
     LOG_INFO(Common,
              "[Preforged] join pipelines from shader libraries {}, compile joined pipelines in "
-             "full afterwards {}, test: join every pipeline {}, read Unity files {}, search "
-             "the game's program {}, find packed data inside files {}, search and compile on "
-             "a game's first start {}",
+             "full afterwards {}, test: join every pipeline {}, read Unity files {}, read "
+             "IoStore containers {}, search the game's program {}, find packed data inside files "
+             "{}, search and compile on a game's first start {}",
              options.pipeline_libraries, options.optimize_joined, options.join_every_pipeline,
-             options.read_unity_files, options.search_program, options.find_packed_data,
+             options.read_unity_files, options.read_iostore, options.search_program,
+             options.find_packed_data,
              options.first_start_compile);
     if (options.track_allocations) {
         HeapProfile::Start();

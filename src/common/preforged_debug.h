@@ -25,6 +25,9 @@ struct DebugOptions {
     bool unpack_oodle = true;
     /// Reads the bundles and Shader objects of Unity games during the game file search.
     bool read_unity_files = true;
+    /// Reads the IoStore containers (.utoc/.ucas) of Unreal Engine 4.25+ and 5 games that aren't
+    /// encrypted, during the game file search.
+    bool read_iostore = true;
     /// Searches the read-only data and data of the game's program modules for shaders too.
     bool search_program = true;
     /// Finds zstd frames, zlib streams, ZIP entries and CRILAYLA files inside any file and

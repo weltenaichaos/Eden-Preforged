@@ -29,6 +29,8 @@ add_library(yuzu-android SHARED
     unreal_package.cpp
     unreal_package.h
     unreal_pak.cpp
+    unreal_iostore.cpp
+    unreal_iostore.h
     unreal_pak.h
     unity_assets.cpp
     unity_assets.h

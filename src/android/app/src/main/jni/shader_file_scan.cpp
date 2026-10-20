@@ -51,6 +51,7 @@
 #include "jni/unreal_links.h"
 #include "jni/unreal_package.h"
 #include "jni/unreal_pak.h"
+#include "jni/unreal_iostore.h"
 #include "jni/embedded_streams.h"
 #include "jni/gf_pak.h"
 #include "jni/trpfs.h"
@@ -102,8 +103,8 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // files and bundles; the read-only data and data of the game's program modules. 18: zstd frames,
 // zlib streams, ZIP entries and CRILAYLA files found inside any file; RE Engine paks, Game
 // Freak .gfpak archives and Pokémon Scarlet and Violet's data.trpfs (build 75 had 17 without
-// them).
-constexpr u32 SEARCH_VERSION = 18;
+// them). 19: Unreal Engine IoStore containers (.utoc/.ucas) that aren't encrypted.
+constexpr u32 SEARCH_VERSION = 19;
 /// The constant buffer for bindless textures of the official NVN driver, which games are built with.
 constexpr u32 OFFICIAL_TEXTURE_BOUND = 2;
 /// Packed streams found inside files that unpack to fewer bytes are left out: too small to hold
@@ -537,6 +538,21 @@ public:
                     ReportProgress(false);
                 }
                 continue;
+            }
+            // Unreal Engine IoStore containers: the whole container is read once through its
+            // .utoc in the first pass. The .ucas data files are read through it, so they aren't
+            // searched as stored on their own.
+            if (Common::Preforged::Options().read_iostore) {
+                const std::string lower = Lower(name);
+                if (EndsWith(lower, ".utoc")) {
+                    if (shader_files) {
+                        ScanIoStore(dir, file, name);
+                    }
+                    continue;
+                }
+                if (EndsWith(lower, ".ucas") && dir->GetFile(UtocForUcas(file->GetName()))) {
+                    continue;
+                }
             }
             if (LooksLikeShaderFile(name) != shader_files) {
                 continue;
@@ -1018,13 +1034,15 @@ public:
 
     /// Says the game's shader files are encrypted and can't be read, or is empty when they aren't.
     std::string EncryptionNote() const {
-        if (pak_totals.encrypted_unread != 0) {
+        if (pak_totals.encrypted_unread != 0 || iostore_totals.encrypted != 0) {
             return "; this game's shader files are encrypted and can't be read, so it keeps "
                    "compiling its shaders while it runs";
         }
-        if (std::ranges::find(engines, "Unreal Engine 4 or 5 IoStore containers") != engines.end()) {
-            return "; this game keeps its shaders in IoStore containers the search doesn't read, "
-                   "so it keeps compiling its shaders while it runs";
+        // The switch to read IoStore containers is off, but the game has them.
+        if (!Common::Preforged::Options().read_iostore &&
+            std::ranges::find(engines, "Unreal Engine 4 or 5 IoStore containers") != engines.end()) {
+            return "; this game keeps its shaders in IoStore containers the search is set not to "
+                   "read, so it keeps compiling its shaders while it runs";
         }
         return "";
     }
@@ -1879,9 +1897,10 @@ public:
     /// encrypted by the game, and the search does not get around that, so those shaders are
     /// compiled while the game runs, the first time each one is drawn.
     void ReportEncryption() const {
-        const bool has_iostore =
+        const bool iostore_off =
+            !Common::Preforged::Options().read_iostore &&
             std::ranges::find(engines, "Unreal Engine 4 or 5 IoStore containers") != engines.end();
-        if (pak_totals.encrypted_unread == 0 && !has_iostore) {
+        if (pak_totals.encrypted_unread == 0 && iostore_totals.encrypted == 0 && !iostore_off) {
             return;
         }
         std::string reasons;
@@ -1889,9 +1908,14 @@ public:
             reasons = fmt::format("{} of its Unreal Engine pak files are encrypted",
                                   pak_totals.encrypted_unread);
         }
-        if (has_iostore) {
+        if (iostore_totals.encrypted != 0) {
+            reasons += fmt::format("{}{} of its Unreal Engine IoStore containers (.utoc/.ucas) are "
+                                   "encrypted",
+                                   reasons.empty() ? "" : ", and ", iostore_totals.encrypted);
+        }
+        if (iostore_off) {
             reasons += fmt::format("{}its shaders are kept in Unreal Engine IoStore containers "
-                                   "(.utoc/.ucas), which the search does not read",
+                                   "(.utoc/.ucas), which the search is set not to read",
                                    reasons.empty() ? "" : ", and ");
         }
         LOG_WARNING(Frontend,
@@ -1901,6 +1925,29 @@ public:
                     "quick afterwards). This is not about owning the game: the files are encrypted "
                     "by the game itself, and the search does not get around that.",
                     reasons);
+    }
+
+    void ReportIoStore() const {
+        if (iostore_totals.containers == 0) {
+            return;
+        }
+        std::string methods;
+        for (size_t method = 0; method < iostore_totals.methods.size(); ++method) {
+            if (iostore_totals.methods[method] != 0) {
+                methods += fmt::format(
+                    "{}{} {}", methods.empty() ? "" : ", ",
+                    Preforged::Unreal::MethodName(static_cast<Preforged::Unreal::Method>(method)),
+                    iostore_totals.methods[method]);
+            }
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal IoStore containers: {} ({} encrypted and not read), {} "
+                 "chunks read ({} MiB packed, {} MiB unpacked), {} did not unpack; blocks by "
+                 "method: {}; {} NVN code headers in them",
+                 iostore_totals.containers, iostore_totals.encrypted, iostore_totals.chunks_read,
+                 iostore_totals.packed >> 20, iostore_totals.unpacked >> 20,
+                 iostore_totals.chunks_failed, methods.empty() ? "none" : methods,
+                 iostore_totals.headers);
     }
 
 private:
@@ -3323,6 +3370,121 @@ private:
         return true;
     }
 
+    /// The .utoc file that goes with a .ucas file: the name without ".ucas" and a trailing
+    /// "_s<number>" partition suffix, plus ".utoc".
+    static std::string UtocForUcas(std::string_view ucas_name) {
+        std::string_view base = ucas_name.substr(0, ucas_name.size() - 5); // without ".ucas"
+        const size_t underscore = base.rfind("_s");
+        if (underscore != std::string_view::npos &&
+            std::all_of(base.begin() + underscore + 2, base.end(),
+                        [](char c) { return c >= '0' && c <= '9'; }) &&
+            underscore + 2 < base.size()) {
+            base = base.substr(0, underscore);
+        }
+        return std::string(base) + ".utoc";
+    }
+
+    /// Reads an Unreal Engine IoStore container through its .utoc: unpacks each chunk from the
+    /// .ucas (and its partition files) and searches it. Encrypted containers are not read.
+    void ScanIoStore(const FileSys::VirtualDir& dir, const FileSys::VirtualFile& utoc_file,
+                     const std::string& name) {
+        const std::vector<u8> toc_bytes = utoc_file->ReadAllBytes();
+        const auto toc = Preforged::IoStore::ReadToc(toc_bytes);
+        if (!toc) {
+            LOG_INFO(Frontend, "[ShaderScan] {} is not an IoStore .utoc", name);
+            return;
+        }
+        ++iostore_totals.containers;
+        const std::string base = utoc_file->GetName().substr(
+            0, utoc_file->GetName().size() - 5); // without ".utoc"
+        if (toc->encrypted) {
+            ++iostore_totals.encrypted;
+            LOG_WARNING(Frontend,
+                        "[ShaderScan] IoStore container {}: version {}, {} chunks, {} compression "
+                        "blocks, encrypted (key GUID {}), so it is not read",
+                        name, toc->header.version, toc->header.entry_count, toc->header.block_count,
+                        Hex(toc->header.key_guid, 0, toc->header.key_guid.size()));
+            return;
+        }
+        if (!toc->error.empty()) {
+            LOG_INFO(Frontend, "[ShaderScan] IoStore container {}: its table could not be read: {}",
+                     name, toc->error);
+            return;
+        }
+
+        // The partition data files: "<base>.ucas", then "<base>_s1.ucas", "<base>_s2.ucas", ...
+        std::vector<FileSys::VirtualFile> partitions;
+        const u32 count = std::max<u32>(toc->header.partition_count, 1);
+        for (u32 part = 0; part < count; ++part) {
+            const std::string ucas =
+                part == 0 ? base + ".ucas" : fmt::format("{}_s{}.ucas", base, part);
+            FileSys::VirtualFile file = dir->GetFile(ucas);
+            if (!file) {
+                LOG_INFO(Frontend,
+                         "[ShaderScan] IoStore container {}: its data file {} is missing, so it "
+                         "is not read",
+                         name, ucas);
+                return;
+            }
+            partitions.push_back(std::move(file));
+        }
+        const u64 partition_size = toc->header.partition_size;
+        const auto read = [&](u64 offset, u64 size) -> std::vector<u8> {
+            size_t part = 0;
+            u64 local = offset;
+            if (partition_size != 0) {
+                part = static_cast<size_t>(offset / partition_size);
+                local = offset % partition_size;
+            }
+            if (part >= partitions.size()) {
+                return {};
+            }
+            return partitions[part]->ReadBytes(size, local);
+        };
+
+        const auto start = std::chrono::steady_clock::now();
+        Preforged::IoStore::ReadStats stats;
+        Preforged::IoStore::ReadChunks(
+            *toc, read, MAX_DECOMPRESSED, Common::Preforged::Options().unpack_oodle,
+            [&](size_t index, std::span<const u8> bytes) {
+                const std::string chunk_name = fmt::format("{}#chunk{}", name, index);
+                bytes_scanned += bytes.size();
+                const size_t headers_before = code_headers;
+                if (!ScanShaderArchive(bytes, chunk_name, true)) {
+                    if (Preforged::Unreal::IsPackage(bytes)) {
+                        SearchShaders(bytes, chunk_name, 0);
+                    } else {
+                        ScanBuffer(bytes, chunk_name, 1);
+                    }
+                }
+                iostore_totals.headers += code_headers - headers_before;
+                LogProgress();
+            },
+            [this] { return !Stopped(); }, stats);
+
+        for (size_t method = 0; method < stats.methods.size(); ++method) {
+            iostore_totals.methods[method] += stats.methods[method];
+        }
+        iostore_totals.chunks_read += stats.chunks_read;
+        iostore_totals.chunks_failed += stats.chunks_failed;
+        iostore_totals.packed += stats.packed_bytes;
+        iostore_totals.unpacked += stats.unpacked_bytes;
+        LOG_INFO(Frontend,
+                 "[ShaderScan] IoStore container {}: version {}, {} chunks in {} partitions, {} "
+                 "compression blocks ({}), block size {} KiB; {} chunks read ({} MiB packed, {} "
+                 "MiB unpacked), {} did not unpack, {} too large, in {} ms{}",
+                 name, toc->header.version, toc->header.entry_count, count, toc->header.block_count,
+                 toc->methods.empty() ? std::string{"no compression"}
+                                      : fmt::format("{}", fmt::join(toc->methods, ", ")),
+                 toc->header.compression_block_size >> 10, stats.chunks_read, stats.packed_bytes >> 20,
+                 stats.unpacked_bytes >> 20, stats.chunks_failed, stats.chunks_skipped,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count(),
+                 stats.first_failure.empty() ? "" : fmt::format(" (first failure: {})",
+                                                                stats.first_failure));
+    }
+
     void LogProgress() {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_progress < std::chrono::seconds{30}) {
@@ -3409,6 +3571,16 @@ private:
         std::array<size_t, Preforged::Unreal::METHOD_COUNT> methods{};
         std::map<std::string, size_t> headers_by_type;
     } pak_totals;
+    struct IoStoreTotals {
+        size_t containers = 0;
+        size_t encrypted = 0;
+        size_t chunks_read = 0;
+        size_t chunks_failed = 0;
+        u64 packed = 0;
+        u64 unpacked = 0;
+        size_t headers = 0;
+        std::array<size_t, Preforged::Unreal::METHOD_COUNT> methods{};
+    } iostore_totals;
     std::function<std::vector<u8>(std::string&)> executable_reader;
     bool executable_read = false;
     std::vector<u8> executable;
@@ -4019,6 +4191,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.StudyUnrealCaches();
     scanner.ReportUnreal();
     scanner.ReportPaks();
+    scanner.ReportIoStore();
     scanner.ReportUnity();
     scanner.ReportPackedStreams();
     scanner.ReportUnrealLinks();

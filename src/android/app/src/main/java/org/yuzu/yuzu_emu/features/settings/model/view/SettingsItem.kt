@@ -416,6 +416,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_READ_IOSTORE,
+                    titleId = R.string.preforged_read_iostore,
+                    descriptionId = R.string.preforged_read_iostore_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.PREFORGED_UNPACK_OODLE,
                     titleId = R.string.preforged_unpack_oodle,
                     descriptionId = R.string.preforged_unpack_oodle_description

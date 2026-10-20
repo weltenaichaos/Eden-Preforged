@@ -1525,6 +1525,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_UNPACK_UNREAL_PACKAGES.key)
                 add(BooleanSetting.PREFORGED_UNPACK_OODLE.key)
                 add(BooleanSetting.PREFORGED_READ_UNITY_FILES.key)
+                add(BooleanSetting.PREFORGED_READ_IOSTORE.key)
                 add(BooleanSetting.PREFORGED_SEARCH_PROGRAM.key)
                 add(BooleanSetting.PREFORGED_FIND_PACKED_DATA.key)
                 add(BooleanSetting.PREFORGED_ZSTD_DICTIONARIES.key)

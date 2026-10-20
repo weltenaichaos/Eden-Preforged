@@ -101,6 +101,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_UNPACK_UNREAL_PACKAGES("preforged_unpack_unreal_packages"),
     PREFORGED_UNPACK_OODLE("preforged_unpack_oodle"),
     PREFORGED_READ_UNITY_FILES("preforged_read_unity_files"),
+    PREFORGED_READ_IOSTORE("preforged_read_iostore"),
     PREFORGED_SEARCH_PROGRAM("preforged_search_program"),
     PREFORGED_FIND_PACKED_DATA("preforged_find_packed_data"),
     PREFORGED_ZSTD_DICTIONARIES("preforged_zstd_dictionaries"),
