@@ -52,6 +52,7 @@
 #include "jni/unreal_package.h"
 #include "jni/unreal_pak.h"
 #include "jni/embedded_streams.h"
+#include "jni/re_pak.h"
 #include "jni/unity_assets.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/program.h"
@@ -1878,11 +1879,16 @@ private:
             return;
         }
         ++files_scanned;
-        // Unity: bundles are read file by file, and large asset files searched for Shader
-        // objects piece by piece.
+        // Archives read file by file: RE Engine paks, Unity bundles. Large Unity asset files are
+        // searched for Shader objects piece by piece.
         bool unity_assets = false;
+        const std::vector<u8> start = file->ReadBytes(UNITY_START, 0);
+        if (Common::Preforged::Options().find_packed_data && Preforged::RePak::IsPak(start) &&
+            ScanRePak(file, name)) {
+            LogProgress();
+            return;
+        }
         if (Common::Preforged::Options().read_unity_files) {
-            const std::vector<u8> start = file->ReadBytes(UNITY_START, 0);
             if (Preforged::Unity::IsBundle(start) && ScanUnityBundle(file, name)) {
                 LogProgress();
                 return;
@@ -1892,7 +1898,6 @@ private:
         bool whole = size <= MAX_WHOLE_FILE;
         if (!whole && size <= MAX_WHOLE_PACKAGE &&
             Common::Preforged::Options().unpack_unreal_packages) {
-            const std::vector<u8> start = file->ReadBytes(4, 0);
             whole = Preforged::Unreal::IsPackage(start);
         }
         if (whole) {
@@ -2097,6 +2102,87 @@ public:
     }
 
 private:
+
+    /// Reads the files of an RE Engine pak one by one and searches each. Returns false when its
+    /// table can't be read, so it is searched as it is (packed data inside it is still found).
+    bool ScanRePak(const FileSys::VirtualFile& file, const std::string& name) {
+        using namespace Preforged::RePak;
+        const ReadFn read = [&file](u64 offset, u64 size) { return file->ReadBytes(size, offset); };
+        std::string error;
+        const auto pak = ReadPak(read, file->GetSize(), error);
+        if (!pak || pak->table_encrypted) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] RE Engine pak {} ({} MiB) not read ({}), so it is searched as "
+                     "it is",
+                     name, file->GetSize() >> 20,
+                     pak ? fmt::format("version {}.{}, features {:#x}: its file table is "
+                                       "encrypted",
+                                       pak->major, pak->minor, pak->features)
+                         : error);
+            return false;
+        }
+        const size_t headers_before = code_headers;
+        const size_t taken_before = extracted.size();
+        std::vector<Entry> entries = pak->entries;
+        std::ranges::sort(entries, {}, &Entry::offset);
+        std::array<size_t, 3> by_method{};
+        size_t encrypted = 0;
+        size_t too_large = 0;
+        size_t failed = 0;
+        std::string first_failure;
+        u64 unpacked = 0;
+        Preforged::Unreal::Method last = Preforged::Unreal::Method::Unknown;
+        std::vector<u8> out;
+        for (const Entry& entry : entries) {
+            if (Stopped()) {
+                break;
+            }
+            if (entry.encryption != 0) {
+                ++encrypted;
+                continue;
+            }
+            if (entry.size > MAX_DECOMPRESSED || entry.packed_size > MAX_DECOMPRESSED) {
+                ++too_large;
+                continue;
+            }
+            const std::vector<u8> packed = file->ReadBytes(entry.packed_size, entry.offset);
+            std::span<const u8> data = packed;
+            if (entry.compression != 0) {
+                out.resize(entry.size + Preforged::Unreal::UNPACK_SLACK);
+                const auto method = Preforged::Unreal::UnpackBlock(
+                    packed, std::span<u8>{out.data(), entry.size},
+                    entry.compression == 1 ? "zlib" : "zstd", last,
+                    Common::Preforged::Options().unpack_oodle);
+                if (method == Preforged::Unreal::Method::Unknown ||
+                    method == Preforged::Unreal::Method::OodleFailed) {
+                    ++failed;
+                    if (first_failure.empty()) {
+                        first_failure = fmt::format("{} {} -> {} bytes, starts {}",
+                                                    CompressionName(entry.compression),
+                                                    entry.packed_size, entry.size,
+                                                    Hex(packed, 0, 8));
+                    }
+                    continue;
+                }
+                data = std::span<const u8>{out.data(), entry.size};
+            }
+            ++by_method[std::min<u32>(entry.compression, 2)];
+            unpacked += data.size();
+            bytes_scanned += data.size();
+            ScanBuffer(data, fmt::format("{}#{:016x}", name, entry.hash), 1);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] RE Engine pak {} ({} MiB): version {}.{}, features {:#x}, {} "
+                 "files listed ({} point past the file), {} read (stored {}, deflate {}, zstd "
+                 "{}; {} MiB unpacked), {} encrypted and {} too large skipped, {} did not "
+                 "unpack{}; {} NVN code headers, {} new shaders taken",
+                 name, file->GetSize() >> 20, pak->major, pak->minor, pak->features,
+                 pak->declared, pak->invalid, by_method[0] + by_method[1] + by_method[2],
+                 by_method[0], by_method[1], by_method[2], unpacked >> 20, encrypted, too_large,
+                 failed, first_failure.empty() ? "" : fmt::format(" (first: {})", first_failure),
+                 code_headers - headers_before, extracted.size() - taken_before);
+        return true;
+    }
 
     /// Searches one Unity asset file, whole or piece by piece, for Shader objects, unpacks
     /// their Switch shaders and searches those; logs what the file held when done.
@@ -3282,7 +3368,7 @@ constexpr std::array ENGINE_RULES{
     EngineRule{"Nintendo formats (BFRES, BFSHA, BNSH)",
                EngineSupport::Read,
                {".bfsha", ".bnsh", ".bfres", "/shaderdata/"}},
-    EngineRule{"RE Engine", EngineSupport::Packed, {"re_chunk_000.pak", "/natives/nsw/", "", ""}},
+    EngineRule{"RE Engine", EngineSupport::Read, {"re_chunk_000.pak", "/natives/nsw/", "", ""}},
     EngineRule{"MT Framework", EngineSupport::Packed, {"/nativenx/", "/nativeswitch/", "", ""}},
     EngineRule{"Monolith Soft engine (Xenoblade)",
                EngineSupport::Packed,
