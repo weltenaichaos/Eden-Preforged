@@ -28,6 +28,8 @@ add_library(yuzu-android SHARED
     unreal_links.h
     unreal_package.cpp
     unreal_package.h
+    unreal_pak.cpp
+    unreal_pak.h
     ooz/kraken.cpp
     ooz/ooz.h
     ooz/ooz_platform.h

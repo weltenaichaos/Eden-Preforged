@@ -25,22 +25,32 @@
 #include <fmt/ranges.h>
 
 #include "common/cityhash.h"
+#include "common/common_funcs.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/preforged_debug.h"
 #include "common/settings.h"
+#include "common/lz4_compression.h"
 #include "common/thread.h"
 #include "common/zstd_compression.h"
 #include "core/core.h"
+#include "core/crypto/aes_util.h"
+#include "core/crypto/key_manager.h"
+#include "core/file_sys/content_archive.h"
+#include "core/file_sys/nca_metadata.h"
+#include "core/file_sys/patch_manager.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/loader/nso.h"
 #include "jni/shader_file_scan.h"
 #include "jni/unreal_links.h"
 #include "jni/unreal_package.h"
+#include "jni/unreal_pak.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -81,8 +91,10 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // the other packages. 13: Unreal shader caches read for the pairs. 14: up to 30,000 pairs
 // kept from a shader cache. 15: every shader taken from the game files kept by hash, so the
 // play log tells a missed pair from a shader the game files don't have. 16: the code of vertex
-// and fragment shaders in no pair kept too, for pipeline libraries.
-constexpr u32 SEARCH_VERSION = 16;
+// and fragment shaders in no pair kept too, for pipeline libraries. 17: Unreal Engine 4 pak
+// files unpacked (with the AES key from the game's executable when encrypted), and the shaders
+// in their shader archives.
+constexpr u32 SEARCH_VERSION = 17;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
@@ -472,7 +484,20 @@ public:
                 return;
             }
             const std::string name = path + "/" + file->GetName();
-            if (LooksLikeShaderFile(name) != shader_files || IsMedia(name)) {
+            if (IsMedia(name)) {
+                continue;
+            }
+            // Unreal Engine 4 pak files: their shader archives in the first pass, their other
+            // files in the second.
+            if (Common::Preforged::Options().unpack_unreal_packages &&
+                EndsWith(Lower(name), ".pak") && ScanPak(file, name, shader_files)) {
+                if (!shader_files) {
+                    ++files_visited;
+                    ReportProgress(false);
+                }
+                continue;
+            }
+            if (LooksLikeShaderFile(name) != shader_files) {
                 continue;
             }
             ScanFile(file, name);
@@ -1635,6 +1660,49 @@ public:
         });
     }
 
+    /// Reads the game executable's read-only data and data, where Unreal Engine 4 games keep
+    /// the AES key of their pak files. Called once, when the first encrypted pak needs a key.
+    void SetExecutableReader(std::function<std::vector<u8>(std::string&)> reader) {
+        executable_reader = std::move(reader);
+    }
+
+    /// Sums up what the Unreal Engine 4 pak files held.
+    void ReportPaks() const {
+        if (pak_totals.paks == 0) {
+            return;
+        }
+        std::string methods;
+        for (size_t method = 0; method < pak_totals.methods.size(); ++method) {
+            if (pak_totals.methods[method] != 0) {
+                methods += fmt::format(
+                    "{}{} {}", methods.empty() ? "" : ", ",
+                    Preforged::Unreal::MethodName(static_cast<Preforged::Unreal::Method>(method)),
+                    pak_totals.methods[method]);
+            }
+        }
+        std::vector<std::pair<size_t, std::string>> by_type;
+        for (const auto& [type, count] : pak_totals.headers_by_type) {
+            by_type.emplace_back(count, type);
+        }
+        std::ranges::sort(by_type, std::greater{});
+        std::string types;
+        for (const auto& [count, type] : by_type) {
+            types += fmt::format("{}{} {}", types.empty() ? "" : ", ", type, count);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal Engine 4 pak files: {} ({} readable, {} with an encrypted "
+                 "index, {} keys found), {} files listed, {} read ({} MiB unpacked), {} did not "
+                 "unpack, {} skipped (media or too large); {} shader archives with {} shaders, {} "
+                 "NVN code headers in them, {} of them new; blocks by method: {}; NVN code "
+                 "headers by file type: {}",
+                 pak_totals.paks, pak_totals.readable, pak_totals.encrypted_index,
+                 known_keys.size(), pak_totals.listed, pak_totals.read,
+                 pak_totals.unpacked >> 20, pak_totals.failed, pak_totals.skipped,
+                 pak_totals.archives, pak_totals.archive_shaders, pak_totals.archive_headers,
+                 pak_totals.archive_taken, methods.empty() ? "none" : methods,
+                 types.empty() ? "none" : types);
+    }
+
 private:
     struct Result {
         MatchKind kind = MatchKind::None;
@@ -2112,6 +2180,400 @@ private:
                  base_offset + pos, base_offset + start, bytes);
     }
 
+    /// An Unreal Engine 4 pak file, with its index once read.
+    struct PakState {
+        FileSys::VirtualFile file;
+        std::string name;
+        Preforged::UnrealPak::Footer footer;
+        Preforged::UnrealPak::Index index;
+        std::unique_ptr<Core::Crypto::AESCipher<Core::Crypto::Key256>> cipher;
+        /// The index was read, so its files can be.
+        bool readable = false;
+        /// An unreadable pak searched as stored, as other large files are.
+        bool stored_searched = false;
+    };
+
+    void DecryptPak(const PakState& pak, std::span<u8> data) const {
+        const size_t whole = data.size() / 16 * 16;
+        if (pak.cipher && whole != 0) {
+            pak.cipher->Transcode(data.data(), whole, data.data(), Core::Crypto::Op::Decrypt);
+        }
+    }
+
+    /// Finds the key of an encrypted pak index: a key found for another pak, or one in the
+    /// game's executable.
+    std::optional<Preforged::UnrealPak::Key> PakKey(const PakState& pak,
+                                                    std::span<const u8> primary,
+                                                    std::string& note) {
+        using namespace Preforged::UnrealPak;
+        if (primary.size() < 16) {
+            note = "encrypted, and too short to test keys with";
+            return std::nullopt;
+        }
+        // A wrong key gives an index start with a fitting string length and characters about
+        // once in 10^11 tries, so the entry count is enough of a check after it.
+        const auto verify{[&](const Key& key) {
+            std::vector<u8> copy(primary.begin(), primary.end());
+            Aes256{key}.Decrypt(copy);
+            return ReadIndex(pak.footer, copy, [](u64, u64) { return std::vector<u8>{}; })
+                       .declared > 0;
+        }};
+        for (const Key& key : known_keys) {
+            std::array<u8, 16> plain;
+            Aes256{key}.DecryptBlock(primary.data(), plain.data());
+            if (LooksLikeIndexStart(plain) && verify(key)) {
+                note = "encrypted, with the key found for another pak file";
+                return key;
+            }
+        }
+        if (!executable_read) {
+            executable_read = true;
+            const auto start = std::chrono::steady_clock::now();
+            if (executable_reader) {
+                executable = executable_reader(executable_note);
+            } else {
+                executable_note = "no reader";
+            }
+            LOG_INFO(Frontend, "[ShaderScan] game executable read for pak keys: {} ({} ms)",
+                     executable_note,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count());
+        }
+        if (executable.empty()) {
+            note = fmt::format("encrypted, and the game's executable could not be read ({})",
+                               executable_note);
+            return std::nullopt;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        size_t tried = 0;
+        size_t where = 0;
+        const auto key = FindKey(executable, primary.first(16), verify, tried, where);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        if (!key) {
+            note = fmt::format("encrypted, and none of the {} keys tried from the game's "
+                               "executable ({} MiB) decrypts it ({} ms)",
+                               tried, executable.size() >> 20, ms);
+            return std::nullopt;
+        }
+        known_keys.push_back(*key);
+        note = fmt::format("encrypted, key found in the game's executable at {:#x} of its data "
+                           "after {} tries ({} ms)",
+                           where, tried, ms);
+        return key;
+    }
+
+    /// Reads the footer and index of a pak file once. Returns nothing when the file is not an
+    /// Unreal Engine 4 pak.
+    PakState* OpenPak(const FileSys::VirtualFile& file, const std::string& name) {
+        using namespace Preforged::UnrealPak;
+        if (const auto it = paks.find(name); it != paks.end()) {
+            return it->second.get();
+        }
+        std::unique_ptr<PakState>& slot = paks[name];
+        const u64 size = file->GetSize();
+        if (size < 64) {
+            return nullptr;
+        }
+        const size_t tail_size = static_cast<size_t>(std::min<u64>(size, FOOTER_SEARCH));
+        const std::vector<u8> tail = file->ReadBytes(tail_size, size - tail_size);
+        const auto footer = ReadFooter(tail, size);
+        if (!footer) {
+            return nullptr;
+        }
+        slot = std::make_unique<PakState>();
+        PakState& pak = *slot;
+        pak.file = file;
+        pak.name = name;
+        pak.footer = *footer;
+        ++pak_totals.paks;
+        std::string index_note = "plain";
+        const auto log_pak{[&](std::string_view result) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unreal pak {} ({} MiB): version {}, index {} ({} KiB), "
+                     "compression methods {}: {}",
+                     name, size >> 20, footer->version, index_note, footer->index_size >> 10,
+                     fmt::join(footer->methods, "/"), result);
+        }};
+        if (footer->frozen_index) {
+            log_pak("its index is a frozen memory image, which isn't read");
+            return &pak;
+        }
+        std::vector<u8> primary = file->ReadBytes(footer->index_size, footer->index_offset);
+        if (primary.size() != footer->index_size) {
+            log_pak("its index could not be read");
+            return &pak;
+        }
+        if (footer->encrypted_index) {
+            ++pak_totals.encrypted_index;
+            const auto key = PakKey(pak, primary, index_note);
+            if (!key) {
+                log_pak("not read, so the file is searched as stored");
+                return &pak;
+            }
+            pak.cipher =
+                std::make_unique<Core::Crypto::AESCipher<Core::Crypto::Key256>>(
+                    *key, Core::Crypto::Mode::ECB);
+            DecryptPak(pak, primary);
+        }
+        pak.index = ReadIndex(*footer, primary, [&](u64 offset, u64 part_size) {
+            std::vector<u8> part = file->ReadBytes(part_size, offset);
+            if (footer->encrypted_index) {
+                DecryptPak(pak, part);
+            }
+            return part;
+        });
+        pak.readable = !pak.index.entries.empty();
+        size_t encrypted = 0;
+        std::map<std::string, size_t> by_method;
+        u64 unpacked = 0;
+        for (const auto& entry : pak.index.entries) {
+            encrypted += entry.encrypted ? 1 : 0;
+            unpacked += entry.uncompressed_size;
+            ++by_method[entry.method == 0                        ? std::string{"stored"}
+                        : entry.method <= footer->methods.size() ? footer->methods[entry.method - 1]
+                                                                 : fmt::format("#{}", entry.method)];
+        }
+        pak_totals.listed += pak.index.entries.size();
+        if (pak.readable) {
+            ++pak_totals.readable;
+        }
+        std::string methods;
+        for (const auto& [method, count] : by_method) {
+            methods += fmt::format("{}{} {}", methods.empty() ? "" : ", ", method, count);
+        }
+        log_pak(fmt::format(
+            "mount point {}, {} of {} files listed{} ({} MiB unpacked; {}), {} encrypted{}{}",
+            pak.index.mount_point, pak.index.entries.size(), pak.index.declared,
+            pak.index.named ? "" : " without names", unpacked >> 20, methods, encrypted,
+            encrypted != 0 && !pak.cipher ? ", and no key for them" : "",
+            pak.index.error.empty() ? "" : fmt::format("; index read stopped: {}", pak.index.error)));
+        return &pak;
+    }
+
+    /// Searches a pak file: its shader archives in the first pass, its other files in the
+    /// second. Returns false when the file is not an Unreal Engine 4 pak.
+    bool ScanPak(const FileSys::VirtualFile& file, const std::string& name, bool archives_pass) {
+        PakState* const pak = OpenPak(file, name);
+        if (!pak) {
+            return false;
+        }
+        if (!pak->readable) {
+            if (!archives_pass && !pak->stored_searched) {
+                pak->stored_searched = true;
+                ScanFile(file, name);
+            }
+            return true;
+        }
+        ScanPakEntries(*pak, archives_pass);
+        return true;
+    }
+
+    static bool IsPakMedia(std::string_view lower) {
+        for (const std::string_view ext : {".bik", ".bk2", ".wem", ".bnk", ".mp4", ".webm", ".ogg",
+                                           ".wav", ".opus", ".ubulk", ".uptnl", ".ufont", ".ttf",
+                                           ".otf", ".png", ".jpg", ".usm", ".awb", ".acb"}) {
+            if (EndsWith(lower, ext)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static std::string FileType(std::string_view lower) {
+        const size_t slash = lower.rfind('/');
+        const size_t dot = lower.rfind('.');
+        if (dot == std::string_view::npos || (slash != std::string_view::npos && dot < slash)) {
+            return "no extension";
+        }
+        return std::string(lower.substr(dot));
+    }
+
+    void ScanPakEntries(PakState& pak, bool archives_pass) {
+        using namespace Preforged::UnrealPak;
+        const auto start = std::chrono::steady_clock::now();
+        const ReadFn read = [&pak](u64 offset, u64 size) {
+            return pak.file->ReadBytes(size, offset);
+        };
+        DecryptFn decrypt;
+        if (pak.cipher) {
+            decrypt = [this, &pak](std::span<u8> data) { DecryptPak(pak, data); };
+        }
+        // Without names, archives are told by their contents, so every file is read in the
+        // first pass.
+        if (!pak.index.named && !archives_pass) {
+            return;
+        }
+        std::vector<size_t> order;
+        size_t skipped = 0;
+        for (size_t i = 0; i < pak.index.entries.size(); ++i) {
+            const Entry& entry = pak.index.entries[i];
+            const std::string lower = Lower(entry.path);
+            if (pak.index.named && IsShaderArchiveName(lower) != archives_pass) {
+                continue;
+            }
+            if (IsPakMedia(lower) || entry.uncompressed_size > MAX_DECOMPRESSED) {
+                ++skipped;
+                continue;
+            }
+            order.push_back(i);
+        }
+        // Material assets may hold their shaders inline, so they come first.
+        const auto rank{[&pak](size_t i) {
+            const std::string type = FileType(Lower(pak.index.entries[i].path));
+            return type == ".uexp" ? 0 : type == ".uasset" ? 1 : type == ".umap" ? 2 : 3;
+        }};
+        std::ranges::stable_sort(order, {}, rank);
+        size_t read_count = 0;
+        size_t failed = 0;
+        u64 packed = 0;
+        u64 unpacked = 0;
+        std::string first_failure;
+        bool stopped = false;
+        std::vector<u8> data;
+        for (const size_t i : order) {
+            if (Stopped()) {
+                stopped = true;
+                break;
+            }
+            const Entry& entry = pak.index.entries[i];
+            std::string error;
+            if (!ReadEntry(read, pak.footer, entry, decrypt,
+                           Common::Preforged::Options().unpack_oodle, data, pak_totals.methods,
+                           error)) {
+                ++failed;
+                if (first_failure.empty()) {
+                    first_failure = fmt::format("{}: {}", entry.path, error);
+                }
+                continue;
+            }
+            ++read_count;
+            packed += entry.size;
+            unpacked += data.size();
+            bytes_scanned += entry.size;
+            const std::string entry_name =
+                fmt::format("{}:{}", pak.name, entry.path.empty() ? fmt::format("#{}", i) : entry.path);
+            const std::string lower = Lower(entry.path);
+            const size_t headers_before = code_headers;
+            const bool archive = (IsShaderArchiveName(lower) || !pak.index.named) &&
+                                 ScanShaderArchive(data, entry_name, !pak.index.named);
+            if (!archive) {
+                if (Preforged::Unreal::IsPackage(data)) {
+                    SearchShaders(data, entry_name, 0);
+                } else {
+                    ScanBuffer(data, entry_name, 1);
+                }
+            }
+            if (code_headers != headers_before) {
+                pak_totals.headers_by_type[FileType(lower)] += code_headers - headers_before;
+            }
+            LogProgress();
+        }
+        pak_totals.read += read_count;
+        pak_totals.failed += failed;
+        pak_totals.skipped += skipped;
+        pak_totals.unpacked += unpacked;
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal pak {}: {} {} files read ({} MiB packed, {} MiB unpacked) "
+                 "in {} ms, {} did not unpack{}, {} skipped (media or over {} MiB){}",
+                 pak.name, read_count, archives_pass ? "shader archive" : "other",
+                 packed >> 20, unpacked >> 20,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count(),
+                 failed, first_failure.empty() ? "" : fmt::format(" (first: {})", first_failure),
+                 skipped, MAX_DECOMPRESSED >> 20, stopped ? ", stopped at the time limit" : "");
+    }
+
+    /// Reads the shaders of an Unreal Engine 4 shader archive, each unpacked on its own, and
+    /// searches them. Returns false when the data is not a shader archive.
+    bool ScanShaderArchive(std::span<const u8> data, const std::string& name, bool quiet) {
+        using Preforged::Unreal::Method;
+        std::string error;
+        const auto archive = Preforged::UnrealPak::ReadShaderArchive(data, error);
+        if (!archive) {
+            if (!quiet) {
+                LOG_INFO(Frontend,
+                         "[ShaderScan] Unreal shader archive {} not read ({}), so it is searched "
+                         "as stored",
+                         name, error);
+            }
+            return false;
+        }
+        const size_t headers_before = code_headers;
+        const size_t taken_before = extracted.size();
+        // Vertex, hull, domain, pixel, geometry, compute, other.
+        std::array<size_t, 7> by_stage{};
+        std::array<size_t, Preforged::Unreal::METHOD_COUNT> methods{};
+        size_t failed = 0;
+        std::string first_failure;
+        std::string first_bytes;
+        Method last = Method::Unknown;
+        std::vector<u8> out;
+        for (const auto& shader : archive->shaders) {
+            if (Stopped()) {
+                break;
+            }
+            ++by_stage[std::min<size_t>(shader.frequency, 6)];
+            const std::span<const u8> in =
+                data.subspan(archive->code_start + shader.offset, shader.size);
+            std::span<const u8> code = in;
+            if (shader.size != shader.uncompressed_size) {
+                out.resize(shader.uncompressed_size + Preforged::Unreal::UNPACK_SLACK);
+                const Method method = Preforged::Unreal::UnpackBlock(
+                    in, std::span<u8>{out.data(), shader.uncompressed_size}, "LZ4", last,
+                    Common::Preforged::Options().unpack_oodle);
+                ++methods[static_cast<size_t>(method)];
+                if (method == Method::Unknown || method == Method::OodleFailed) {
+                    ++failed;
+                    if (first_failure.empty()) {
+                        first_failure = fmt::format("{} -> {} bytes, starts {}", shader.size,
+                                                    shader.uncompressed_size, Hex(in, 0, 8));
+                    }
+                    continue;
+                }
+                code = std::span<const u8>{out.data(), shader.uncompressed_size};
+            } else {
+                ++methods[static_cast<size_t>(Method::Stored)];
+            }
+            if (first_bytes.empty()) {
+                first_bytes = Hex(code, 0, 64);
+            }
+            SearchShaders(code, name, shader.offset);
+        }
+        std::string unpacked;
+        for (size_t method = 0; method < methods.size(); ++method) {
+            if (methods[method] != 0) {
+                unpacked += fmt::format(
+                    "{}{} {}", unpacked.empty() ? "" : ", ",
+                    Preforged::Unreal::MethodName(static_cast<Method>(method)), methods[method]);
+            }
+        }
+        const size_t new_headers = code_headers - headers_before;
+        const size_t taken = extracted.size() - taken_before;
+        ++pak_totals.archives;
+        pak_totals.archive_shaders += archive->shaders.size();
+        pak_totals.archive_headers += new_headers;
+        pak_totals.archive_taken += taken;
+        size_t largest_map = 0;
+        for (const auto& [first, count] : archive->maps) {
+            largest_map = std::max<size_t>(largest_map, count);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unreal shader archive {}: version {}, {} shaders (vertex {}, "
+                 "pixel {}, compute {}, hull, domain and geometry {}, other {}) in {} shader "
+                 "maps (largest {} shaders); unpacked: {}; {} did not unpack{}; {} NVN code "
+                 "headers in them, {} new shaders taken; the first shader starts {}",
+                 name, archive->version, archive->shaders.size(), by_stage[0], by_stage[3],
+                 by_stage[5], by_stage[1] + by_stage[2] + by_stage[4], by_stage[6],
+                 archive->maps.size(), largest_map, unpacked.empty() ? "none" : unpacked, failed,
+                 first_failure.empty() ? "" : fmt::format(" (first: {})", first_failure),
+                 new_headers, taken, first_bytes.empty() ? "(none)" : first_bytes);
+        return true;
+    }
+
     void LogProgress() {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_progress < std::chrono::seconds{30}) {
@@ -2178,8 +2640,98 @@ private:
     std::map<std::string, FileSys::VirtualFile> unreal_cache_files;
     std::set<std::string> unreal_caches_read;
     bool unreal_cache_pairs_kept = false;
+    std::map<std::string, std::unique_ptr<PakState>> paks;
+    struct PakTotals {
+        size_t paks = 0;
+        size_t readable = 0;
+        size_t encrypted_index = 0;
+        size_t listed = 0;
+        size_t read = 0;
+        size_t failed = 0;
+        size_t skipped = 0;
+        u64 unpacked = 0;
+        size_t archives = 0;
+        size_t archive_shaders = 0;
+        size_t archive_headers = 0;
+        size_t archive_taken = 0;
+        std::array<size_t, Preforged::Unreal::METHOD_COUNT> methods{};
+        std::map<std::string, size_t> headers_by_type;
+    } pak_totals;
+    std::function<std::vector<u8>(std::string&)> executable_reader;
+    bool executable_read = false;
+    std::vector<u8> executable;
+    std::string executable_note;
+    std::vector<Preforged::UnrealPak::Key> known_keys;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
+
+/// Reads the read-only data and data of the game's main executable, with an update's in place
+/// of the base game's, for the AES key of Unreal Engine 4 pak files. `note` says what was read,
+/// or why nothing was.
+std::vector<u8> ReadExecutableData(Core::System& system, u64 program_id, std::string& note) {
+    const auto nca =
+        system.GetContentProvider().GetEntry(program_id, FileSys::ContentRecordType::Program);
+    if (!nca) {
+        note = "the game's program content was not found";
+        return {};
+    }
+    FileSys::VirtualDir exefs = nca->GetExeFS();
+    if (!exefs) {
+        note = "the game's program has no ExeFS";
+        return {};
+    }
+    const FileSys::PatchManager patch{program_id, system.GetFileSystemController(),
+                                      system.GetContentProvider()};
+    exefs = patch.PatchExeFS(exefs);
+    const FileSys::VirtualFile main = exefs ? exefs->GetFile("main") : nullptr;
+    if (!main) {
+        note = "the ExeFS has no main";
+        return {};
+    }
+    const std::vector<u8> nso = main->ReadAllBytes();
+    Loader::NSOHeader header;
+    if (nso.size() < sizeof(header)) {
+        note = "main is too short";
+        return {};
+    }
+    std::memcpy(&header, nso.data(), sizeof(header));
+    if (header.magic != Common::MakeMagic('N', 'S', 'O', '0')) {
+        note = "main is not an NSO";
+        return {};
+    }
+    if (header.IsZBICCompressed()) {
+        note = "main is packed with ZBIC, which isn't read here";
+        return {};
+    }
+    std::vector<u8> out;
+    std::array<size_t, 3> sizes{};
+    // Segments 1 and 2: read-only data and data. The code holds no key bytes in one piece.
+    for (size_t segment = 1; segment < 3; ++segment) {
+        const auto& info = header.segments[segment];
+        const bool packed = header.IsSegmentCompressed(segment);
+        const u64 stored = packed ? header.segments_compressed_size[segment] : info.size;
+        if (info.offset > nso.size() || stored > nso.size() - info.offset) {
+            note = fmt::format("segment {} of main lies past its end", segment);
+            return {};
+        }
+        const std::span<const u8> bytes{nso.data() + info.offset, static_cast<size_t>(stored)};
+        if (packed) {
+            const std::vector<u8> unpacked =
+                Common::Compression::DecompressDataLZ4(bytes, info.size);
+            if (unpacked.size() != info.size) {
+                note = fmt::format("segment {} of main did not unpack", segment);
+                return {};
+            }
+            out.insert(out.end(), unpacked.begin(), unpacked.end());
+        } else {
+            out.insert(out.end(), bytes.begin(), bytes.end());
+        }
+        sizes[segment] = info.size;
+    }
+    note = fmt::format("main: {} KiB of read-only data, {} KiB of data", sizes[1] >> 10,
+                       sizes[2] >> 10);
+    return out;
+}
 
 /// Lists every file the game sees with its size, sorted by path, one per line. An update or a
 /// mod changes the list.
@@ -2231,9 +2783,12 @@ constexpr std::array ENGINE_RULES{
                EngineSupport::Packed,
                {"/data/managed/metadata/global-metadata.dat", "/data/globalgamemanagers",
                 "/data/sharedassets0.assets", "/data/data.unity3d"}},
-    EngineRule{"Unreal Engine 4 or 5",
+    EngineRule{"Unreal Engine 4 (pak files)",
+               EngineSupport::Read,
+               {"/ue4commandline.txt", "/content/paks/", "", ""}},
+    EngineRule{"Unreal Engine 4 or 5 IoStore containers",
                EngineSupport::Packed,
-               {"/ue4commandline.txt", "/content/paks/", ".utoc ", ".ucas "}},
+               {".utoc ", ".ucas ", "", ""}},
     EngineRule{"Unreal Engine 3", EngineSupport::Read, {".upk ", ".xxx ", ".umap ", "/cookednx"}},
     EngineRule{"Nintendo formats (BFRES, BFSHA, BNSH)",
                EngineSupport::Read,
@@ -2500,6 +3055,9 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     WriteSearchMarker(shader_dir, marker);
 
     Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
+    scanner.SetExecutableReader([&system, program_id](std::string& note) {
+        return ReadExecutableData(system, program_id, note);
+    });
     scanner.SetProgress(&progress, std::max<size_t>(Scanner::CountFiles(root, "") + 1, 2));
     scanner.ReportProgress(true);
     scanner.FindZstdDictionaries(root);
@@ -2519,6 +3077,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.StudyUnrealLinks(graphics_keys);
     scanner.StudyUnrealCaches();
     scanner.ReportUnreal();
+    scanner.ReportPaks();
     scanner.ReportUnrealLinks();
     scanner.LearnUnrealLinksFromOtherPackages();
     scanner.ReportExtraction();

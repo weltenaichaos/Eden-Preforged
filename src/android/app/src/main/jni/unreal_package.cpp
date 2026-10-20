@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <optional>
@@ -143,9 +144,10 @@ bool DecompressOodle(std::span<const u8> in, std::span<u8> out) {
     return size >= 0 && static_cast<size_t>(size) == out.size();
 }
 
-bool Inflate(std::span<const u8> in, std::span<u8> out, bool raw) {
+/// Unpacks deflate data: raw, with a zlib header, or with a gzip header.
+bool Inflate(std::span<const u8> in, std::span<u8> out, bool raw, bool gzip = false) {
     z_stream stream{};
-    if (inflateInit2(&stream, raw ? -MAX_WBITS : MAX_WBITS) != Z_OK) {
+    if (inflateInit2(&stream, gzip ? 16 + MAX_WBITS : raw ? -MAX_WBITS : MAX_WBITS) != Z_OK) {
         return false;
     }
     stream.next_in = const_cast<Bytef*>(in.data());
@@ -248,6 +250,37 @@ bool ReadExtendedLength(const u8*& ip, const u8* ip_end, size_t& length, size_t 
 }
 
 } // Anonymous namespace
+
+Method UnpackBlock(std::span<const u8> in, std::span<u8> out, std::string_view method_name,
+                   Method& last_method, bool unpack_oodle) {
+    static_assert(UNPACK_SLACK >= Ooz::OUTPUT_SLACK);
+    std::string name(method_name);
+    std::ranges::transform(name, name.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const auto named{[&]() -> std::optional<Method> {
+        if (name == "zlib") {
+            return Method::Zlib;
+        }
+        if (name == "lz4") {
+            return Method::Lz4;
+        }
+        if (name == "zstd") {
+            return Method::Zstd;
+        }
+        if (name == "oodle") {
+            return Method::Oodle;
+        }
+        return std::nullopt;
+    }()};
+    if (name == "gzip" && Inflate(in, out, false, true)) {
+        return Method::Zlib;
+    }
+    if (named && (*named != Method::Oodle || unpack_oodle) && DecompressWith(*named, in, out)) {
+        return *named;
+    }
+    // A name that did not fit, or none: the methods in turn.
+    return DecompressBlock(in, out, last_method, unpack_oodle);
+}
 
 const char* MethodName(Method method) {
     switch (method) {

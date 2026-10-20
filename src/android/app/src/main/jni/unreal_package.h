@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -92,6 +93,18 @@ constexpr size_t MAX_FAILED_BLOCKS_KEPT = 256;
 bool Unpack(std::span<const u8> data, size_t piece_size, size_t overlap, Stats& stats,
             const std::function<bool(std::span<const u8> piece, u64 offset)>& consume,
             bool unpack_oodle = true, std::vector<FailedBlock>* failures = nullptr);
+
+/// Unpacks one block into exactly `out.size()` bytes, for Unreal Engine 4 pak files and shader
+/// archives, which name their method: "Zlib", "Gzip", "LZ4", "Oodle" or "Zstd" (any case). An
+/// empty or other name tries the methods in turn, as for packages. `out` must have
+/// UNPACK_SLACK bytes of room after it, for Oodle. Returns the method that fit, or OodleFailed
+/// or Unknown when none did.
+[[nodiscard]] Method UnpackBlock(std::span<const u8> in, std::span<u8> out,
+                                 std::string_view method_name, Method& last_method,
+                                 bool unpack_oodle = true);
+
+/// Room UnpackBlock needs after its output.
+constexpr size_t UNPACK_SLACK = 64;
 
 /// Unpacks LZO1X data into exactly `out.size()` bytes. Returns false when the data is not
 /// LZO1X data of that size. Exposed for tests.
