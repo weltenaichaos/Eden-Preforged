@@ -52,6 +52,7 @@
 #include "jni/unreal_package.h"
 #include "jni/unreal_pak.h"
 #include "jni/embedded_streams.h"
+#include "jni/gf_pak.h"
 #include "jni/re_pak.h"
 #include "jni/unity_assets.h"
 #include "shader_recompiler/exception.h"
@@ -1883,8 +1884,9 @@ private:
         // searched for Shader objects piece by piece.
         bool unity_assets = false;
         const std::vector<u8> start = file->ReadBytes(UNITY_START, 0);
-        if (Common::Preforged::Options().find_packed_data && Preforged::RePak::IsPak(start) &&
-            ScanRePak(file, name)) {
+        if (Common::Preforged::Options().find_packed_data &&
+            ((Preforged::RePak::IsPak(start) && ScanRePak(file, name)) ||
+             (Preforged::GfPak::IsPak(start) && ScanGfPak(file, name)))) {
             LogProgress();
             return;
         }
@@ -2103,6 +2105,84 @@ public:
 
 private:
 
+    /// One file of an archive read by its table.
+    struct TableEntry {
+        u64 id = 0; ///< Hash of its path, for its name in the log
+        u64 offset = 0;
+        u64 packed_size = 0;
+        u64 size = 0;
+        const char* method = "stored"; ///< As Preforged::Unreal::UnpackBlock names it
+        bool encrypted = false;
+    };
+
+    /// Reads the files of an archive by its table, in the order they are stored, unpacks and
+    /// searches each. `what` describes the archive for the log line.
+    void ScanTableEntries(const FileSys::VirtualFile& file, const std::string& name,
+                          std::string_view what, std::vector<TableEntry> entries) {
+        const size_t headers_before = code_headers;
+        const size_t taken_before = extracted.size();
+        std::ranges::sort(entries, {}, &TableEntry::offset);
+        std::map<std::string_view, size_t> by_method;
+        size_t read = 0;
+        size_t encrypted = 0;
+        size_t too_large = 0;
+        size_t failed = 0;
+        std::string first_failure;
+        u64 unpacked = 0;
+        Preforged::Unreal::Method last = Preforged::Unreal::Method::Unknown;
+        std::vector<u8> out;
+        for (const TableEntry& entry : entries) {
+            if (Stopped()) {
+                break;
+            }
+            if (entry.encrypted) {
+                ++encrypted;
+                continue;
+            }
+            if (entry.size > MAX_DECOMPRESSED || entry.packed_size > MAX_DECOMPRESSED) {
+                ++too_large;
+                continue;
+            }
+            const std::vector<u8> packed = file->ReadBytes(entry.packed_size, entry.offset);
+            std::span<const u8> data = packed;
+            const std::string_view method = entry.method;
+            if (method != "stored") {
+                out.resize(entry.size + Preforged::Unreal::UNPACK_SLACK);
+                const auto used = Preforged::Unreal::UnpackBlock(
+                    packed, std::span<u8>{out.data(), entry.size}, method, last,
+                    Common::Preforged::Options().unpack_oodle);
+                if (used == Preforged::Unreal::Method::Unknown ||
+                    used == Preforged::Unreal::Method::OodleFailed) {
+                    ++failed;
+                    if (first_failure.empty()) {
+                        first_failure = fmt::format("{} {} -> {} bytes, starts {}", method,
+                                                    entry.packed_size, entry.size,
+                                                    Hex(packed, 0, 8));
+                    }
+                    continue;
+                }
+                data = std::span<const u8>{out.data(), entry.size};
+            }
+            ++by_method[method];
+            ++read;
+            unpacked += data.size();
+            bytes_scanned += data.size();
+            ScanBuffer(data, fmt::format("{}#{:016x}", name, entry.id), 1);
+        }
+        std::string methods;
+        for (const auto& [method, count] : by_method) {
+            methods += fmt::format("{}{} {}", methods.empty() ? "" : ", ", method, count);
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] {} {} ({} MiB): {} files read ({}; {} MiB unpacked), {} encrypted "
+                 "and {} too large skipped, {} did not unpack{}; {} NVN code headers, {} new "
+                 "shaders taken",
+                 what, name, file->GetSize() >> 20, read, methods.empty() ? "none" : methods,
+                 unpacked >> 20, encrypted, too_large, failed,
+                 first_failure.empty() ? "" : fmt::format(" (first: {})", first_failure),
+                 code_headers - headers_before, extracted.size() - taken_before);
+    }
+
     /// Reads the files of an RE Engine pak one by one and searches each. Returns false when its
     /// table can't be read, so it is searched as it is (packed data inside it is still found).
     bool ScanRePak(const FileSys::VirtualFile& file, const std::string& name) {
@@ -2121,66 +2201,56 @@ private:
                          : error);
             return false;
         }
-        const size_t headers_before = code_headers;
-        const size_t taken_before = extracted.size();
-        std::vector<Entry> entries = pak->entries;
-        std::ranges::sort(entries, {}, &Entry::offset);
-        std::array<size_t, 3> by_method{};
-        size_t encrypted = 0;
-        size_t too_large = 0;
-        size_t failed = 0;
-        std::string first_failure;
-        u64 unpacked = 0;
-        Preforged::Unreal::Method last = Preforged::Unreal::Method::Unknown;
-        std::vector<u8> out;
-        for (const Entry& entry : entries) {
-            if (Stopped()) {
-                break;
-            }
-            if (entry.encryption != 0) {
-                ++encrypted;
-                continue;
-            }
-            if (entry.size > MAX_DECOMPRESSED || entry.packed_size > MAX_DECOMPRESSED) {
-                ++too_large;
-                continue;
-            }
-            const std::vector<u8> packed = file->ReadBytes(entry.packed_size, entry.offset);
-            std::span<const u8> data = packed;
-            if (entry.compression != 0) {
-                out.resize(entry.size + Preforged::Unreal::UNPACK_SLACK);
-                const auto method = Preforged::Unreal::UnpackBlock(
-                    packed, std::span<u8>{out.data(), entry.size},
-                    entry.compression == 1 ? "zlib" : "zstd", last,
-                    Common::Preforged::Options().unpack_oodle);
-                if (method == Preforged::Unreal::Method::Unknown ||
-                    method == Preforged::Unreal::Method::OodleFailed) {
-                    ++failed;
-                    if (first_failure.empty()) {
-                        first_failure = fmt::format("{} {} -> {} bytes, starts {}",
-                                                    CompressionName(entry.compression),
-                                                    entry.packed_size, entry.size,
-                                                    Hex(packed, 0, 8));
-                    }
-                    continue;
-                }
-                data = std::span<const u8>{out.data(), entry.size};
-            }
-            ++by_method[std::min<u32>(entry.compression, 2)];
-            unpacked += data.size();
-            bytes_scanned += data.size();
-            ScanBuffer(data, fmt::format("{}#{:016x}", name, entry.hash), 1);
+        std::vector<TableEntry> entries;
+        for (const Entry& entry : pak->entries) {
+            entries.push_back({
+                .id = entry.hash,
+                .offset = entry.offset,
+                .packed_size = entry.packed_size,
+                .size = entry.size,
+                .method = entry.compression == 1 ? "zlib"
+                          : entry.compression == 2 ? "zstd"
+                                                   : "stored",
+                .encrypted = entry.encryption != 0,
+            });
         }
-        LOG_INFO(Frontend,
-                 "[ShaderScan] RE Engine pak {} ({} MiB): version {}.{}, features {:#x}, {} "
-                 "files listed ({} point past the file), {} read (stored {}, deflate {}, zstd "
-                 "{}; {} MiB unpacked), {} encrypted and {} too large skipped, {} did not "
-                 "unpack{}; {} NVN code headers, {} new shaders taken",
-                 name, file->GetSize() >> 20, pak->major, pak->minor, pak->features,
-                 pak->declared, pak->invalid, by_method[0] + by_method[1] + by_method[2],
-                 by_method[0], by_method[1], by_method[2], unpacked >> 20, encrypted, too_large,
-                 failed, first_failure.empty() ? "" : fmt::format(" (first: {})", first_failure),
-                 code_headers - headers_before, extracted.size() - taken_before);
+        ScanTableEntries(file, name,
+                         fmt::format("RE Engine pak, version {}.{}, features {:#x}, {} files "
+                                     "listed ({} point past the file):",
+                                     pak->major, pak->minor, pak->features, pak->declared,
+                                     pak->invalid),
+                         std::move(entries));
+        return true;
+    }
+
+    /// Reads the files of a Game Freak archive one by one and searches each. Returns false when
+    /// its table can't be read, so it is searched as it is.
+    bool ScanGfPak(const FileSys::VirtualFile& file, const std::string& name) {
+        using namespace Preforged::GfPak;
+        const ReadFn read = [&file](u64 offset, u64 size) { return file->ReadBytes(size, offset); };
+        std::string error;
+        const auto pak = ReadPak(read, file->GetSize(), error);
+        if (!pak) {
+            LOG_INFO(Frontend, "[ShaderScan] Game Freak archive {} not read ({}), so it is "
+                               "searched as it is",
+                     name, error);
+            return false;
+        }
+        std::vector<TableEntry> entries;
+        for (const Entry& entry : pak->entries) {
+            entries.push_back({
+                .id = entry.hash,
+                .offset = entry.offset,
+                .packed_size = entry.packed_size,
+                .size = entry.size,
+                .method = MethodName(entry.compression),
+            });
+        }
+        ScanTableEntries(file, name,
+                         fmt::format("Game Freak archive, version {:#x}, {} files listed ({} "
+                                     "point past the file):",
+                                     pak->version, pak->declared, pak->invalid),
+                         std::move(entries));
         return true;
     }
 
@@ -3336,6 +3406,9 @@ void ListGameFiles(const FileSys::VirtualDir& dir, const std::string& path, std:
 enum class EngineSupport {
     /// The search unpacks the engine's shader files and pairs their shaders.
     Read,
+    /// The engine's archives aren't read by their tables, but their files are packed in ways
+    /// the packed data finder unpacks wherever they are (zstd, zlib, ZIP, CRILAYLA).
+    Streams,
     /// The shaders are in archives the search doesn't unpack yet, so it only finds the ones
     /// stored unpacked.
     Packed,
@@ -3369,16 +3442,20 @@ constexpr std::array ENGINE_RULES{
                EngineSupport::Read,
                {".bfsha", ".bnsh", ".bfres", "/shaderdata/"}},
     EngineRule{"RE Engine", EngineSupport::Read, {"re_chunk_000.pak", "/natives/nsw/", "", ""}},
-    EngineRule{"MT Framework", EngineSupport::Packed, {"/nativenx/", "/nativeswitch/", "", ""}},
+    EngineRule{"MT Framework", EngineSupport::Streams, {"/nativenx/", "/nativeswitch/", "", ""}},
     EngineRule{"Monolith Soft engine (Xenoblade)",
-               EngineSupport::Packed,
+               EngineSupport::Streams,
                {"/monolib/shader/", ".wishp ", ".wismt ", ".ard "}},
-    EngineRule{"Game Freak engine (Pokemon)",
+    EngineRule{"Game Freak engine (Pokemon, .gfpak archives)",
+               EngineSupport::Read,
+               {".gfpak ", "", "", ""}},
+    EngineRule{"Game Freak engine (Pokemon Scarlet and Violet, .trpfs)",
                EngineSupport::Packed,
-               {"/data.trpfs ", ".gfpak ", ".trpak ", ""}},
-    EngineRule{"Smash Ultimate archive", EngineSupport::Packed, {"/data.arc ", "", "", ""}},
+               {"/data.trpfs ", ".trpak ", "", ""}},
+    EngineRule{"Smash Ultimate archive", EngineSupport::Streams, {"/data.arc ", "", "", ""}},
+    EngineRule{"CRI CPK archives", EngineSupport::Streams, {".cpk ", "", "", ""}},
     EngineRule{"CryEngine",
-               EngineSupport::Packed,
+               EngineSupport::Streams,
                {"/shadercache.pak ", "/shadercachestartup.pak ", "/shaders/shaderlist.txt", ""}},
     EngineRule{"UbiArt Framework", EngineSupport::Packed, {".ipk ", "", "", ""}},
     EngineRule{"Creation Engine", EngineSupport::Packed, {".bsa ", "", "", ""}},
@@ -3452,6 +3529,9 @@ std::vector<std::string_view> LogGameEngines(std::string_view file_list) {
             switch (ENGINE_RULES[rule].support) {
             case EngineSupport::Read:
                 return "the search unpacks its shader files";
+            case EngineSupport::Streams:
+                return "its archives aren't read by their tables, but the packed data finder "
+                       "unpacks the files in them";
             case EngineSupport::Packed:
                 return "its archives aren't unpacked yet, so only shaders stored unpacked are "
                        "found";

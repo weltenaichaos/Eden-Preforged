@@ -36,6 +36,8 @@ add_library(yuzu-android SHARED
     embedded_streams.h
     re_pak.cpp
     re_pak.h
+    gf_pak.cpp
+    gf_pak.h
     ooz/kraken.cpp
     ooz/ooz.h
     ooz/ooz_platform.h
