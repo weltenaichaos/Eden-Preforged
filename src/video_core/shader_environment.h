@@ -197,6 +197,23 @@ public:
         return cbuf_replacements.size() != 0;
     }
 
+    [[nodiscard]] std::span<const u64> Code() const noexcept {
+        return code;
+    }
+
+    [[nodiscard]] const auto& TextureTypes() const noexcept {
+        return texture_types;
+    }
+
+    [[nodiscard]] size_t CbufValueCount() const noexcept {
+        return cbuf_values.size();
+    }
+
+    /// Constant buffer reads, keyed by buffer index in the upper 32 bits and offset in the lower.
+    [[nodiscard]] const auto& CbufValues() const noexcept {
+        return cbuf_values;
+    }
+
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
 private:

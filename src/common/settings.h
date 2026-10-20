@@ -681,9 +681,11 @@ struct Values {
     SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
                                                   Category::RendererHacks};
 
+    // Preforged: on by default on Android too. With it off, each cull mode, stencil or vertex
+    // stride a shader pair is drawn with becomes a pipeline of its own, compiled in play.
     SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,
 #if defined(__ANDROID__)
-                                           ExtendedDynamicState::Disabled,
+                                           ExtendedDynamicState::EDS3,
 #elif defined(__APPLE__)
                                            ExtendedDynamicState::Disabled,
 #else
@@ -702,7 +704,7 @@ struct Values {
 
     SwitchableSetting<bool> vertex_input_dynamic_state{linkage,
 #ifdef __ANDROID__
-                                                       false,
+                                                       true, // Preforged: as dyna_state above
 #else
                                                        true,
 #endif
@@ -927,6 +929,42 @@ struct Values {
     // Miscellaneous
     Setting<std::string> log_filter{linkage, "*:Info", "log_filter", Category::Miscellaneous};
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
+
+    // Eden Preforged test switches
+    Setting<bool> preforged_bake_driver_constants{linkage, false, "preforged_bake_driver_constants", Category::Miscellaneous};
+    Setting<bool> preforged_scan_game_files{linkage, true, "preforged_scan_game_files", Category::Miscellaneous};
+    Setting<bool> preforged_rescan_game_files{linkage, false, "preforged_rescan_game_files", Category::Miscellaneous};
+    Setting<bool> preforged_precompile_game_shaders{linkage, true, "preforged_precompile_game_shaders", Category::Miscellaneous};
+    Setting<bool> preforged_first_start_compile{linkage, true, "preforged_first_start_compile",
+                                                Category::Miscellaneous};
+    Setting<bool> preforged_log_shader_compiles{linkage, true, "preforged_log_shader_compiles", Category::Miscellaneous};
+    Setting<bool> preforged_store_any_state{linkage, false, "preforged_reuse_other_state", Category::Miscellaneous};
+    Setting<bool> preforged_input_types_per_shader{linkage, true, "preforged_input_types_per_shader", Category::Miscellaneous};
+    Setting<bool> preforged_log_memory{linkage, true, "preforged_log_memory", Category::Miscellaneous};
+    Setting<bool> preforged_log_slow_frames{linkage, true, "preforged_log_slow_frames", Category::Miscellaneous};
+    Setting<bool> preforged_log_allocation_sizes{linkage, true, "preforged_log_allocation_sizes", Category::Miscellaneous};
+    Setting<bool> preforged_track_allocations{linkage, true, "preforged_track_allocations", Category::Miscellaneous};
+    Setting<bool> preforged_track_driver_memory{linkage, true, "preforged_track_driver_memory", Category::Miscellaneous};
+    Setting<bool> preforged_precompile_cpu_code{linkage, true, "preforged_precompile_cpu_code", Category::Miscellaneous};
+    Setting<bool> preforged_start_after_loading{linkage, true, "preforged_start_after_loading", Category::Miscellaneous};
+    Setting<bool> preforged_limit_gpu_lag{linkage, true, "preforged_limit_gpu_lag", Category::Miscellaneous};
+    Setting<bool> preforged_merge_gpu_work{linkage, true, "preforged_merge_gpu_work", Category::Miscellaneous};
+    Setting<bool> preforged_unpack_unreal_packages{linkage, true, "preforged_unpack_unreal_packages", Category::Miscellaneous};
+    Setting<bool> preforged_unpack_oodle{linkage, true, "preforged_unpack_oodle", Category::Miscellaneous};
+    Setting<bool> preforged_read_unity_files{linkage, true, "preforged_read_unity_files", Category::Miscellaneous};
+    Setting<bool> preforged_read_iostore{linkage, true, "preforged_read_iostore", Category::Miscellaneous};
+    Setting<bool> preforged_search_program{linkage, true, "preforged_search_program", Category::Miscellaneous};
+    Setting<bool> preforged_find_packed_data{linkage, true, "preforged_find_packed_data", Category::Miscellaneous};
+    Setting<bool> preforged_zstd_dictionaries{linkage, true, "preforged_zstd_dictionaries", Category::Miscellaneous};
+    Setting<bool> preforged_log_unreal_links{linkage, true, "preforged_log_unreal_links", Category::Miscellaneous};
+    Setting<bool> preforged_unreal_learned_pairs{linkage, true, "preforged_unreal_learned_pairs", Category::Miscellaneous};
+    Setting<bool> preforged_pipeline_libraries{linkage, true, "preforged_pipeline_libraries",
+                                               Category::Miscellaneous};
+    Setting<bool> preforged_optimize_joined{linkage, true, "preforged_optimize_joined",
+                                            Category::Miscellaneous};
+    Setting<bool> preforged_join_every_pipeline{linkage, false, "preforged_join_every_pipeline",
+                                                Category::Miscellaneous};
+    Setting<u32, true> preforged_precompile_percent{linkage, 100, 0, 100, "preforged_compile_share", Category::Miscellaneous, Specialization::Scalar};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
 

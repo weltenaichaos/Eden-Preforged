@@ -33,6 +33,10 @@ class EmulationViewModel : ViewModel() {
     private val _drawerOpen = MutableStateFlow(false)
     val drawerOpen = _drawerOpen.asStateFlow()
 
+    // True while shaders load before the game runs, which happens after emulation has started
+    val shaderLoading: StateFlow<Boolean> get() = _shaderLoading
+    private val _shaderLoading = MutableStateFlow(false)
+
     fun setEmulationStarted(started: Boolean) {
         _emulationStarted.value = started
     }
@@ -68,6 +72,10 @@ class EmulationViewModel : ViewModel() {
         setShaderMessage(msg)
         setShaderProgress(progress)
         setTotalShaders(max)
+    }
+
+    fun setShaderLoading(value: Boolean) {
+        _shaderLoading.value = value
     }
 
     fun setDrawerOpen(value: Boolean) {

@@ -15,10 +15,15 @@ ResourcePool::ResourcePool(MasterSemaphore& master_semaphore_, size_t grow_step_
     : master_semaphore{&master_semaphore_}, grow_step{grow_step_} {}
 
 size_t ResourcePool::CommitResource() {
-    const auto search = [this](size_t begin, size_t end, u64 gpu_tick) -> std::optional<size_t> {
+    return CommitResource(master_semaphore->CurrentTick());
+}
+
+size_t ResourcePool::CommitResource(u64 tick) {
+    const auto search = [this, tick](size_t begin, size_t end,
+                                     u64 gpu_tick) -> std::optional<size_t> {
         for (size_t iterator = begin; iterator < end; ++iterator) {
             if (gpu_tick >= ticks[iterator]) {
-                ticks[iterator] = master_semaphore->CurrentTick();
+                ticks[iterator] = tick;
                 return iterator;
             }
         }
@@ -39,7 +44,7 @@ size_t ResourcePool::CommitResource() {
             // Both searches failed, the pool is full; handle it.
             const size_t free_resource = ManageOverflow();
 
-            ticks[free_resource] = master_semaphore->CurrentTick();
+            ticks[free_resource] = tick;
             found = free_resource;
         }
     }

@@ -147,6 +147,11 @@ inline VkResult Filter(VkResult result) {
     return result;
 }
 
+/// Allocation callbacks to pass when creating the instance, the device and the memory allocator,
+/// so the driver's own host memory shows up in the Preforged memory tracker. Null when the
+/// tracker is off for this run, which leaves the driver on its own allocator.
+[[nodiscard]] const VkAllocationCallbacks* HostAllocator();
+
 inline constexpr VkPipelineStageFlags PIPELINE_STAGE_GRAPHICS_COMPUTE =
     VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 

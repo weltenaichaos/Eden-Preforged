@@ -1517,6 +1517,41 @@ class SettingsFragmentPresenter(
 
     private fun addDebugSettings(sl: ArrayList<SettingsItem>) {
         sl.apply {
+            if (!NativeConfig.isPerGameConfigLoaded()) {
+                add(HeaderSetting(R.string.preforged_header))
+                add(BooleanSetting.PREFORGED_BAKE_DRIVER_CONSTANTS.key)
+                add(BooleanSetting.PREFORGED_SCAN_GAME_FILES.key)
+                add(BooleanSetting.PREFORGED_RESCAN_GAME_FILES.key)
+                add(BooleanSetting.PREFORGED_UNPACK_UNREAL_PACKAGES.key)
+                add(BooleanSetting.PREFORGED_UNPACK_OODLE.key)
+                add(BooleanSetting.PREFORGED_READ_UNITY_FILES.key)
+                add(BooleanSetting.PREFORGED_READ_IOSTORE.key)
+                add(BooleanSetting.PREFORGED_SEARCH_PROGRAM.key)
+                add(BooleanSetting.PREFORGED_FIND_PACKED_DATA.key)
+                add(BooleanSetting.PREFORGED_ZSTD_DICTIONARIES.key)
+                add(BooleanSetting.PREFORGED_LOG_UNREAL_LINKS.key)
+                add(BooleanSetting.PREFORGED_UNREAL_LEARNED_PAIRS.key)
+                add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
+                add(BooleanSetting.PREFORGED_FIRST_START_COMPILE.key)
+                add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
+                add(BooleanSetting.PREFORGED_PIPELINE_LIBRARIES.key)
+                add(BooleanSetting.PREFORGED_OPTIMIZE_JOINED.key)
+                add(BooleanSetting.PREFORGED_JOIN_EVERY_PIPELINE.key)
+                add(BooleanSetting.PREFORGED_INPUT_TYPES_PER_SHADER.key)
+                add(BooleanSetting.PREFORGED_PRECOMPILE_CPU_CODE.key)
+                add(BooleanSetting.PREFORGED_START_AFTER_LOADING.key)
+                add(BooleanSetting.PREFORGED_LIMIT_GPU_LAG.key)
+                add(BooleanSetting.PREFORGED_MERGE_GPU_WORK.key)
+                add(BooleanSetting.PREFORGED_LOG_SHADER_COMPILES.key)
+                add(BooleanSetting.PREFORGED_STORE_ANY_STATE.key)
+                add(BooleanSetting.PREFORGED_LOG_MEMORY.key)
+                add(BooleanSetting.PREFORGED_LOG_SLOW_FRAMES.key)
+                add(BooleanSetting.PREFORGED_LOG_ALLOCATION_SIZES.key)
+                add(BooleanSetting.PREFORGED_TRACK_ALLOCATIONS.key)
+                add(BooleanSetting.PREFORGED_TRACK_DRIVER_MEMORY.key)
+                add(BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE.key)
+            }
+
             add(HeaderSetting(R.string.gpu))
 
             add(IntSetting.RENDERER_BACKEND.key)

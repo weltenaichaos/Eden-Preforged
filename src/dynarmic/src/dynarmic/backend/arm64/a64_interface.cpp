@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 
@@ -60,6 +61,31 @@ struct Jit::Impl final {
         std::unique_lock lock{invalidation_mutex};
         invalid_cache_ranges.add(boost::icl::discrete_interval<u64>::closed(start_address, start_address + length - 1));
         HaltExecution(HaltReason::CacheInvalidation);
+    }
+
+    Jit::CompileAheadResult CompileAhead(std::span<const std::uint64_t> locations, std::size_t keep_free) {
+        ASSERT(!is_executing);
+        // The loader marks the game's code executable after the JIT exists, which queues
+        // invalidations. Applying them now keeps them from discarding what gets compiled here.
+        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
+        // Emit clears the whole cache when less than 1 MiB is left.
+        keep_free = std::max<std::size_t>(keep_free, 2 * 1024 * 1024);
+        Jit::CompileAheadResult result;
+        for (const std::uint64_t location : locations) {
+            if (current_address_space.GetRemainingSize() < keep_free) {
+                result.stopped_early = true;
+                break;
+            }
+            const IR::LocationDescriptor descriptor{location};
+            if (current_address_space.Get(descriptor)) {
+                ++result.already_compiled;
+                continue;
+            }
+            current_address_space.GetOrEmit(descriptor);
+            ++result.compiled;
+        }
+        result.code_cache_free = current_address_space.GetRemainingSize();
+        return result;
     }
 
     void Reset() {
@@ -195,6 +221,10 @@ HaltReason Jit::Step() {
 
 void Jit::ClearCache() {
     impl->ClearCache();
+}
+
+Jit::CompileAheadResult Jit::CompileAhead(std::span<const std::uint64_t> locations, std::size_t keep_free) {
+    return impl->CompileAhead(locations, keep_free);
 }
 
 void Jit::InvalidateCacheRange(std::uint64_t start_address, std::size_t length) {

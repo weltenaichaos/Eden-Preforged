@@ -22,6 +22,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/preforged_debug.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -39,6 +40,24 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+
+void VKAPI_PTR OnGpuAllocate(VmaAllocator, uint32_t memory_type, VkDeviceMemory, VkDeviceSize size,
+                             void*) {
+    Common::Preforged::NoteGpuAllocation(memory_type, size);
+}
+
+void VKAPI_PTR OnGpuFree(VmaAllocator, uint32_t memory_type, VkDeviceMemory, VkDeviceSize size,
+                         void*) {
+    Common::Preforged::NoteGpuFree(memory_type, size);
+}
+
+// Counts the memory allocator's GPU allocations for the memory log.
+const VmaDeviceMemoryCallbacks GPU_MEMORY_CALLBACKS{
+    .pfnAllocate = OnGpuAllocate,
+    .pfnFree = OnGpuFree,
+    .pUserData = nullptr,
+};
+
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -755,8 +774,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             .preferredLargeHeapBlockSize = is_integrated
                                            ? (64u * 1024u * 1024u)
                                            : (256u * 1024u * 1024u),
-            .pAllocationCallbacks = nullptr,
-            .pDeviceMemoryCallbacks = nullptr,
+            .pAllocationCallbacks = vk::HostAllocator(),
+            .pDeviceMemoryCallbacks = &GPU_MEMORY_CALLBACKS,
             .pHeapSizeLimit = nullptr,
             .pVulkanFunctions = &functions,
             .instance = instance,
@@ -765,6 +784,22 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     };
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
+    {
+        // Names the memory types the GPU memory log counts by.
+        const auto memory = physical.GetMemoryProperties().memoryProperties;
+        std::string types;
+        for (u32 type = 0; type < memory.memoryTypeCount; ++type) {
+            const auto flags = memory.memoryTypes[type].propertyFlags;
+            types += fmt::format(
+                "{}{}:{}{}{}{}", type == 0 ? "" : ", ", type,
+                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " device" : "",
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " visible" : "",
+                (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? " coherent" : "",
+                (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " cached" : "");
+        }
+        LOG_INFO(Render_Vulkan, "[Preforged] GPU memory types: {}; allocator block size {} MiB",
+                 types, allocator_info.preferredLargeHeapBlockSize >> 20);
+    }
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
@@ -1209,6 +1244,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
         SetNext(next, properties.descriptor_buffer);
     }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
+    }
     if (extensions.subgroup_size_control || features.subgroup_size_control.subgroupSizeControl) {
         properties.subgroup_size_control.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
@@ -1347,6 +1387,28 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer;
     RemoveExtensionFeatureIfUnsuitable(extensions.descriptor_buffer, features.descriptor_buffer,
                                        VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library, for joining pipelines from shaders compiled on their own.
+    // Only loaded with the setting on, so the device stays as it was with it off.
+    const bool pipeline_library_setting{Settings::values.preforged_pipeline_libraries.GetValue()};
+    extensions.graphics_pipeline_library =
+        features.graphics_pipeline_library.graphicsPipelineLibrary && extensions.pipeline_library &&
+        pipeline_library_setting;
+    LOG_INFO(
+        Render_Vulkan,
+        "[Preforged] pipeline libraries: extension {}, feature {}, VK_KHR_pipeline_library {}, "
+        "setting {}",
+        supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME),
+        features.graphics_pipeline_library.graphicsPipelineLibrary != VK_FALSE,
+        extensions.pipeline_library, pipeline_library_setting);
+    RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
+                                       features.graphics_pipeline_library,
+                                       VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    if (!extensions.graphics_pipeline_library) {
+        RemoveExtensionIfUnsuitable(extensions.graphics_pipeline_library,
+                                    VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        extensions.pipeline_library = false;
+    }
 
     // VK_EXT_extended_dynamic_state
     extensions.extended_dynamic_state = features.extended_dynamic_state.extendedDynamicState;

@@ -17,6 +17,7 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "common/preforged_debug.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -55,6 +56,12 @@ public:
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
+
+    /// Returns true when work was recorded since the last submit.
+    [[nodiscard]] bool HasUnsubmittedWork() const;
+
+    /// Returns true when the GPU has at least `submits` earlier submits left to finish.
+    [[nodiscard]] bool GpuIsBehind(u64 submits);
 
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer);
@@ -133,6 +140,8 @@ public:
     void Wait(u64 tick, double target_fps = 0.0) {
         if (tick > 0) {
             if (tick >= master_semaphore->CurrentTick()) {
+                const Common::Preforged::SubmitCauseScope cause{
+                    Common::Preforged::SubmitCause::Wait};
                 Flush();
             }
             master_semaphore->Wait(tick);
@@ -287,6 +296,9 @@ private:
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
+    /// Waits for the GPU while it has more than Preforged::MaxGpuLag submits left to finish.
+    void LimitGpuLag();
+
     void AllocateNewContext();
 
     void EndPendingOperations();
@@ -310,6 +322,12 @@ private:
 
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;
+
+    /// Set when a chunk without a submit went to the worker, cleared by each submit.
+    bool unsubmitted_work = false;
+    /// The tick of the last submit the worker made, read and written only by the worker. The
+    /// command buffers it takes next are submitted with the tick after it.
+    u64 worker_submitted_tick = 0;
 
     State state;
 

@@ -53,6 +53,7 @@ extern "C" {
 #include "common/string_util.h"
 #include "common/thread.h"
 #include "frontend_common/play_time_manager.h"
+#include "core/arm/dynarmic/preforged_cpu_code.h"
 #include "core/constants.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
@@ -92,6 +93,19 @@ extern "C" {
 #include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_amiibo.h"
 #include "jni/native.h"
+#include <cstdio>
+#include <unistd.h>
+
+#include "jni/crash_report.h"
+#include "jni/gpu_driver_check.h"
+#include "jni/shader_file_scan.h"
+#include "common/fs/fs_paths.h"
+#include "common/preforged_debug.h"
+#include "core/arm/debug.h"
+#include "core/hle/kernel/k_light_lock.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/frame_gen/lossless_dll.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -179,7 +193,20 @@ void EmulationSession::InitializeGpuDriver(const std::string& hook_lib_dir,
         handle = adrenotools_open_libvulkan(
             RTLD_NOW, featureFlags | ADRENOTOOLS_DRIVER_CUSTOM, nullptr, hook_lib_dir.c_str(),
             custom_driver_dir.c_str(), custom_driver_name.c_str(), file_redirect_dir_, nullptr);
+        // Without this line a driver that fails to load looks like the system driver was chosen.
+        // This only sets up Vulkan's loader to use it; the driver itself loads when Vulkan
+        // starts, which LogCustomDriverCheck below checks.
+        const char* const reason = handle ? nullptr : dlerror();
+        LOG_INFO(Frontend, "[Preforged] GPU driver: custom driver {} in {}: {}{}",
+                 custom_driver_name, custom_driver_dir,
+                 handle ? "set up" : "could not be set up, using the system driver",
+                 reason ? fmt::format(" ({})", reason) : std::string{});
+    } else {
+        LOG_INFO(Frontend, "[Preforged] GPU driver: no custom driver installed, using the "
+                           "system driver");
     }
+
+    const bool custom_handle = handle != nullptr;
 
     // Try to load the system driver.
     if (!handle) {
@@ -188,6 +215,9 @@ void EmulationSession::InitializeGpuDriver(const std::string& hook_lib_dir,
     }
 
     m_vulkan_library = std::make_shared<Common::DynamicLibrary>(handle);
+    if (custom_handle) {
+        Preforged::LogCustomDriverCheck(*m_vulkan_library, custom_driver_dir, custom_driver_name);
+    }
 #endif
 }
 
@@ -259,6 +289,7 @@ void EmulationSession::InitializeSystem(bool reload) {
         Common::Log::Initialize();
         Common::Log::SetColorConsoleBackendEnabled(true);
         Common::Log::Start();
+        InstallCrashReport(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / LOG_FILE);
 
         m_input_subsystem.Initialize();
     }
@@ -294,6 +325,10 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
     m_system.SetShuttingDown(false);
     m_system.ApplySettings();
     Settings::LogSettings();
+    // Read on every game start, so a changed switch only needs the game restarted.
+    Common::Preforged::LoadOptions();
+    Shader::Optimization::SetDriverConstBufferFolding(
+        Common::Preforged::Options().bake_driver_constants);
     m_system.HIDCore().ReloadInputDevices();
     m_system.SetFrontendAppletSet({
         nullptr,                     // Amiibo Settings
@@ -338,7 +373,14 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
 
     // Complete initialization.
     m_system.GPU().Start();
-    m_system.GetCpuManager().OnGpuReady();
+    // The CPU cores start running the game at OnGpuReady. Called after loading by default, as on
+    // desktop: otherwise the game boots while the shader file scan reads its files, and the
+    // decryption layer under them can't be read from two threads at once.
+    m_cores_wait_for_loading = Common::Preforged::Options().start_after_loading;
+    m_loaded_time = std::chrono::steady_clock::now();
+    if (!m_cores_wait_for_loading) {
+        m_system.GetCpuManager().OnGpuReady();
+    }
     m_system.RegisterExitCallback([&] { HaltEmulation(); });
 
     m_system.RegisterApplicationChangedCallback(
@@ -373,6 +415,7 @@ void EmulationSession::ShutdownEmulation() {
 
     // Shutdown the main emulated process
     if (m_load_result == Core::SystemResultStatus::Success) {
+        Core::Preforged::CpuCode::Stop();
         m_system.DetachDebugger();
         m_system.ShutdownMainProcess();
         m_load_result = Core::SystemResultStatus::ErrorNotInitialized;
@@ -395,6 +438,8 @@ void EmulationSession::UnPauseEmulation() {
     std::scoped_lock lock(m_mutex);
     m_system.Run();
     m_is_paused = false;
+    // Time spent paused is not a freeze.
+    Common::Preforged::NoteFrame();
 }
 
 void EmulationSession::HaltEmulation() {
@@ -409,21 +454,60 @@ void EmulationSession::RunEmulation() {
         m_is_running = true;
     }
 
+    // Compiles the CPU code earlier sessions recorded, on threads of its own while the shaders
+    // load. Each CPU core waits for it before it runs.
+    Core::Preforged::CpuCode::Start(m_system);
+
+    // Runs before the game starts (see InitializeEmulation): the game's file layers are not safe
+    // to read from two threads.
+    // Runs before the disk cache loads, which compiles the shader pairs the scan finds.
+    LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
+    RunShaderFileScan(m_system, m_system.GetApplicationProcessProgramID(), std::stop_token{},
+                      [](std::size_t done, std::size_t total) {
+                          LoadDiskCacheProgress(VideoCore::LoadCallbackStage::ScanGameFiles,
+                                                static_cast<int>(done), static_cast<int>(total));
+                      });
+    // The loading screen stays up while the disk cache and the CPU code load right after.
+
     // Load the disk shader cache.
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
         m_system.Renderer().ReadRasterizer()->LoadDiskResources(
             m_system.GetApplicationProcessProgramID(), std::stop_token{}, LoadDiskCacheProgress);
-        LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
     }
+    Core::Preforged::CpuCode::Wait([](std::size_t done, std::size_t total) {
+        LoadDiskCacheProgress(VideoCore::LoadCallbackStage::PrecompileCpuCode,
+                              static_cast<int>(done), static_cast<int>(total));
+    });
+    LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
 
+    if (m_cores_wait_for_loading) {
+        m_cores_wait_for_loading = false;
+        LOG_INFO(Frontend, "[Preforged] the game starts after loading, which took {:.1f} s",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - m_loaded_time)
+                     .count());
+        m_system.GetCpuManager().OnGpuReady();
+    } else {
+        LOG_INFO(Frontend, "[Preforged] the game started while loading");
+    }
     void(m_system.Run());
 
     if (m_system.DebuggerEnabled()) {
         m_system.InitializeDebugger();
     }
 
+    auto last_memory_log = std::chrono::steady_clock::now();
+    Common::Preforged::ResetFrameClock();
+    m_freeze_reports = 0;
     while (true) {
+        if (Common::Preforged::Options().log_memory &&
+            std::chrono::steady_clock::now() - last_memory_log > std::chrono::seconds{30}) {
+            last_memory_log = std::chrono::steady_clock::now();
+            LogMemoryUse();
+        }
+        if (Common::Preforged::Options().log_slow_frames) {
+            CheckForFreeze();
+        }
         std::optional<u64> reload_title;
         {
             [[maybe_unused]] std::unique_lock lock(m_mutex);
@@ -443,6 +527,74 @@ void EmulationSession::RunEmulation() {
 
     // Reset current applet ID.
     m_applet_id = static_cast<int>(Service::AM::AppletId::Application);
+}
+
+// Memory use and the number of memory mappings, which Android limits to about 65,000; running
+// out of either ends the app without a message.
+void EmulationSession::LogMemoryUse() {
+    const auto start = std::chrono::steady_clock::now();
+    Common::Preforged::LogMemoryUse("in game", true);
+    LOG_INFO(Frontend, "[Preforged] memory log took {:.1f} ms",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                 .count());
+}
+
+// Logs what the game and the GPU wait on once the game has shown no frame for a few seconds,
+// then every 30 seconds while that lasts.
+void EmulationSession::CheckForFreeze() {
+    constexpr double FREEZE_SECONDS = 5.0;
+    constexpr double REPEAT_SECONDS = 30.0;
+    const double seconds = Common::Preforged::SecondsSinceFrame();
+    if (seconds < FREEZE_SECONDS || m_is_paused) {
+        m_freeze_reports = 0;
+        return;
+    }
+    if (seconds < FREEZE_SECONDS + REPEAT_SECONDS * m_freeze_reports) {
+        return;
+    }
+    ++m_freeze_reports;
+    LogFreeze(seconds);
+}
+
+void EmulationSession::LogFreeze(double seconds) {
+    LOG_INFO(Frontend, "[Preforged] no frame for {:.1f} s; GPU: {}", seconds,
+             Common::Preforged::DescribeGpuProgress());
+    Kernel::KProcess* const process = m_system.ApplicationProcess();
+    if (process == nullptr) {
+        return;
+    }
+    std::vector<std::string> lines;
+    {
+        Kernel::KScopedLightLock lock{process->GetListLock()};
+        for (const Kernel::KThread& thread : process->GetThreadList()) {
+            std::string line = fmt::format(
+                "thread {} {}: {}", thread.GetThreadId(),
+                Core::GetThreadName(&thread).value_or("(no name)"), Core::GetThreadState(&thread));
+            if (thread.GetState() == Kernel::ThreadState::Waiting) {
+                line += fmt::format(" for {}", Core::GetThreadWaitReason(&thread));
+            }
+            line += fmt::format(", priority {}, core {}", thread.GetPriority(),
+                                thread.GetActiveCore());
+            // Only a waiting thread's saved registers are current.
+            if (thread.GetState() == Kernel::ThreadState::Waiting) {
+                const auto backtrace = Core::GetBacktrace(&thread);
+                line += "; calls:";
+                for (size_t i = 0; i < backtrace.size() && i < 12; ++i) {
+                    const auto& entry = backtrace[i];
+                    line += fmt::format(" {}+{:x}", entry.module.empty() ? "?" : entry.module,
+                                        entry.offset);
+                    if (!entry.name.empty()) {
+                        line += fmt::format(" ({})", entry.name);
+                    }
+                }
+            }
+            lines.push_back(std::move(line));
+        }
+    }
+    LOG_INFO(Frontend, "[Preforged] {} game threads while no frame is shown:", lines.size());
+    for (const std::string& line : lines) {
+        LOG_INFO(Frontend, "[Preforged]   {}", line);
+    }
 }
 
 void EmulationSession::RequestDiskShaderCacheReload(u64 program_id) {

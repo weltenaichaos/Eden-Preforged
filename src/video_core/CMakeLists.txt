@@ -146,6 +146,7 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
+    renderer_vulkan/preforged_state_variants.h
     renderer_vulkan/renderer_vulkan.h
     renderer_vulkan/renderer_vulkan.cpp
     renderer_vulkan/vk_blit_screen.cpp
@@ -173,6 +174,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/vk_pipeline_library.cpp
+    renderer_vulkan/vk_pipeline_library.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_query_cache.cpp
@@ -221,6 +224,8 @@ add_library(video_core STATIC
 
     shader_cache.cpp
     shader_cache.h
+    preforged_shaders.cpp
+    preforged_shaders.h
     shader_environment.cpp
     shader_environment.h
     shader_notify.cpp

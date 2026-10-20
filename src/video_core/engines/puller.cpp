@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "common/preforged_frame_stats.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -126,6 +127,9 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
+    const Common::Preforged::FrameStats::Timer timer{
+        word != value ? Common::Preforged::FrameStats::Item::SemaphoreAcquire
+                      : Common::Preforged::FrameStats::Item::Count};
     while (word != value) {
         regs.acquire_active = true;
         regs.acquire_value = value;

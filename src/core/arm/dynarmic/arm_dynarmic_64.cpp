@@ -8,6 +8,7 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/preforged_cpu_code.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
@@ -46,6 +47,10 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         last_code_addr = aligned_vaddr;
     }
     return cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+}
+
+void DynarmicCallbacks64::BlockCompiled(u64 location) {
+    Preforged::CpuCode::NoteBlock(m_process, m_parent.m_core_index, location);
 }
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
@@ -348,12 +353,42 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     m_jit.emplace(config);
 }
 
+void ArmDynarmic64::WaitForCompileAhead() {
+    u8 state = m_compile_state.load(std::memory_order_acquire);
+    if (state == 2) [[likely]] {
+        return;
+    }
+    if (state == 0 && m_compile_state.compare_exchange_strong(state, 2, std::memory_order_acq_rel)) {
+        return;
+    }
+    while ((state = m_compile_state.load(std::memory_order_acquire)) == 1) {
+        m_compile_state.wait(1, std::memory_order_acquire);
+    }
+}
+
+bool ArmDynarmic64::BeginCompileAhead() {
+    u8 expected = 0;
+    return m_compile_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel);
+}
+
+Dynarmic::A64::Jit::CompileAheadResult ArmDynarmic64::CompileAhead(std::span<const u64> locations,
+                                                                   std::size_t keep_free) {
+    return m_jit->CompileAhead(locations, keep_free);
+}
+
+void ArmDynarmic64::EndCompileAhead() {
+    m_compile_state.store(2, std::memory_order_release);
+    m_compile_state.notify_all();
+}
+
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+    WaitForCompileAhead();
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Run());
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
+    WaitForCompileAhead();
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Step());
 }
@@ -439,6 +474,10 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
+    // Throws away compiled code, including what was compiled ahead.
+    if (m_cache_clears.fetch_add(1, std::memory_order_relaxed) < 10) {
+        LOG_INFO(Core_ARM, "[Preforged] CPU core {} code cache cleared", m_core_index);
+    }
     m_cb->last_code_addr = u64(-1);
     m_jit->ClearCache();
 }

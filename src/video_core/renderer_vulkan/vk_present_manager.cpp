@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -170,6 +171,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
 PresentManager::~PresentManager() = default;
 
 Frame* PresentManager::GetRenderFrame() {
+    const Common::Preforged::FrameStats::Timer timer{Common::Preforged::FrameStats::Item::FrameWait};
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};

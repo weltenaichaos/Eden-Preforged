@@ -259,6 +259,226 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_BAKE_DRIVER_CONSTANTS,
+                    titleId = R.string.preforged_bake_driver_constants,
+                    descriptionId = R.string.preforged_bake_driver_constants_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_SCAN_GAME_FILES,
+                    titleId = R.string.preforged_scan_game_files,
+                    descriptionId = R.string.preforged_scan_game_files_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_RESCAN_GAME_FILES,
+                    titleId = R.string.preforged_rescan_game_files,
+                    descriptionId = R.string.preforged_rescan_game_files_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS,
+                    titleId = R.string.preforged_precompile_game_shaders,
+                    descriptionId = R.string.preforged_precompile_game_shaders_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_FIRST_START_COMPILE,
+                    titleId = R.string.preforged_first_start_compile,
+                    descriptionId = R.string.preforged_first_start_compile_description
+                )
+            )
+            put(
+                SliderSetting(
+                    IntSetting.PREFORGED_PRECOMPILE_PERCENT,
+                    titleId = R.string.preforged_precompile_percent,
+                    descriptionId = R.string.preforged_precompile_percent_description,
+                    min = 0,
+                    max = 100,
+                    units = "%"
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_SHADER_COMPILES,
+                    titleId = R.string.preforged_log_shader_compiles,
+                    descriptionId = R.string.preforged_log_shader_compiles_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_STORE_ANY_STATE,
+                    titleId = R.string.preforged_store_any_state,
+                    descriptionId = R.string.preforged_store_any_state_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_INPUT_TYPES_PER_SHADER,
+                    titleId = R.string.preforged_input_types_per_shader,
+                    descriptionId = R.string.preforged_input_types_per_shader_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_MEMORY,
+                    titleId = R.string.preforged_log_memory,
+                    descriptionId = R.string.preforged_log_memory_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_SLOW_FRAMES,
+                    titleId = R.string.preforged_log_slow_frames,
+                    descriptionId = R.string.preforged_log_slow_frames_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_ALLOCATION_SIZES,
+                    titleId = R.string.preforged_log_allocation_sizes,
+                    descriptionId = R.string.preforged_log_allocation_sizes_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_TRACK_ALLOCATIONS,
+                    titleId = R.string.preforged_track_allocations,
+                    descriptionId = R.string.preforged_track_allocations_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_TRACK_DRIVER_MEMORY,
+                    titleId = R.string.preforged_track_driver_memory,
+                    descriptionId = R.string.preforged_track_driver_memory_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_PRECOMPILE_CPU_CODE,
+                    titleId = R.string.preforged_precompile_cpu_code,
+                    descriptionId = R.string.preforged_precompile_cpu_code_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_START_AFTER_LOADING,
+                    titleId = R.string.preforged_start_after_loading,
+                    descriptionId = R.string.preforged_start_after_loading_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LIMIT_GPU_LAG,
+                    titleId = R.string.preforged_limit_gpu_lag,
+                    descriptionId = R.string.preforged_limit_gpu_lag_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_MERGE_GPU_WORK,
+                    titleId = R.string.preforged_merge_gpu_work,
+                    descriptionId = R.string.preforged_merge_gpu_work_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_UNPACK_UNREAL_PACKAGES,
+                    titleId = R.string.preforged_unpack_unreal_packages,
+                    descriptionId = R.string.preforged_unpack_unreal_packages_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_FIND_PACKED_DATA,
+                    titleId = R.string.preforged_find_packed_data,
+                    descriptionId = R.string.preforged_find_packed_data_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_SEARCH_PROGRAM,
+                    titleId = R.string.preforged_search_program,
+                    descriptionId = R.string.preforged_search_program_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_READ_UNITY_FILES,
+                    titleId = R.string.preforged_read_unity_files,
+                    descriptionId = R.string.preforged_read_unity_files_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_READ_IOSTORE,
+                    titleId = R.string.preforged_read_iostore,
+                    descriptionId = R.string.preforged_read_iostore_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_UNPACK_OODLE,
+                    titleId = R.string.preforged_unpack_oodle,
+                    descriptionId = R.string.preforged_unpack_oodle_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_ZSTD_DICTIONARIES,
+                    titleId = R.string.preforged_zstd_dictionaries,
+                    descriptionId = R.string.preforged_zstd_dictionaries_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_LOG_UNREAL_LINKS,
+                    titleId = R.string.preforged_log_unreal_links,
+                    descriptionId = R.string.preforged_log_unreal_links_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_UNREAL_LEARNED_PAIRS,
+                    titleId = R.string.preforged_unreal_learned_pairs,
+                    descriptionId = R.string.preforged_unreal_learned_pairs_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_PIPELINE_LIBRARIES,
+                    titleId = R.string.preforged_pipeline_libraries,
+                    descriptionId = R.string.preforged_pipeline_libraries_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_OPTIMIZE_JOINED,
+                    titleId = R.string.preforged_optimize_joined,
+                    descriptionId = R.string.preforged_optimize_joined_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_JOIN_EVERY_PIPELINE,
+                    titleId = R.string.preforged_join_every_pipeline,
+                    descriptionId = R.string.preforged_join_every_pipeline_description
+                )
+            )
+            put(
+                SwitchSetting(
+                    BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
+                    titleId = R.string.preforged_driver_pipeline_cache,
+                    descriptionId = R.string.preforged_driver_pipeline_cache_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.DEBUG_FLUSH_BY_LINE,
                     titleId = R.string.flush_by_line,
                     descriptionId = R.string.flush_by_line_description

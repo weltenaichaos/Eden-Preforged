@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <tuple>
 #include <type_traits>
@@ -19,6 +20,9 @@
 
 namespace Shader::Optimization {
 namespace {
+// Off in Eden Preforged: shaders then match ones built from the game files, which lack these values.
+std::atomic_bool fold_driver_const_buffer{false};
+
 // Metaprogramming stuff to get arguments information out of a lambda
 template <typename Func>
 struct LambdaTraits : LambdaTraits<decltype(&std::remove_reference_t<Func>::operator())> {};
@@ -1087,7 +1091,7 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
         if (env.HasHLEMacroState()) {
             FoldConstBuffer(env, block, inst);
         }
-        if (env.IsProprietaryDriver()) {
+        if (env.IsProprietaryDriver() && fold_driver_const_buffer.load(std::memory_order_relaxed)) {
             FoldDriverConstBuffer(env, block, inst, 1);
         }
         break;
@@ -1102,6 +1106,10 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
 }
 
 } // Anonymous namespace
+
+void SetDriverConstBufferFolding(bool enabled) {
+    fold_driver_const_buffer.store(enabled, std::memory_order_relaxed);
+}
 
 void ConstantPropagationPass(Environment& env, IR::Program& program) {
     const auto end{program.post_order_blocks.rend()};

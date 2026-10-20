@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
+#include <mutex>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -30,6 +32,9 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/preforged_shaders.h"
+#include "common/preforged_debug.h"
+#include "common/preforged_frame_stats.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -321,6 +326,221 @@ size_t GetTotalPipelineWorkers() {
 #endif
 }
 
+/// Why a pipeline can't be joined from pipeline libraries, and is compiled in full instead.
+enum class LibraryFallback : u8 {
+    NoFragmentShader,
+    LegacyAttributes,
+    UnwrittenInput,
+    TooManyImages,
+    TranslateFailed,
+};
+constexpr std::array<std::string_view, 5> LIBRARY_FALLBACK_NAMES{
+    "no fragment shader",
+    "the fragment shader reads legacy attributes",
+    "the fragment shader reads an output the vertex half doesn't write",
+    "too many textures or images for the rescaling bits",
+    "the fragment shader failed to translate for its library",
+};
+
+/// Folds the hash of one stage's SPIR-V into the hash of the stages before it.
+u64 FoldCodeHash(u64 previous, std::span<const u32> code) {
+    return (previous * 0x9E3779B97F4A7C15ULL) ^
+           Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size_bytes());
+}
+
+/// Whether the textures and images of a half fit the rescaling bits it gets in a pipeline joined
+/// from libraries: bits 0 to 63 and 0 to 31 for the stages before the fragment shader, the bits
+/// after those for the fragment shader.
+bool FitsLibraryScaling(std::span<const Shader::Info* const> infos, LibraryHalf half) {
+    size_t textures{};
+    size_t images{};
+    const size_t begin{half == LibraryHalf::Front ? 0U : infos.size() - 1};
+    const size_t end{half == LibraryHalf::Front ? infos.size() - 1 : infos.size()};
+    for (size_t stage = begin; stage < end; ++stage) {
+        if (infos[stage]) {
+            textures += infos[stage]->texture_descriptors.size();
+            images += infos[stage]->image_descriptors.size();
+        }
+    }
+    if (half == LibraryHalf::Front) {
+        return textures <= LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX &&
+               images <= LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX;
+    }
+    return textures <= Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS * 32 -
+                           LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX &&
+           images <= Shader::Backend::SPIRV::NUM_IMAGE_SCALING_WORDS * 32 -
+                         LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX;
+}
+
+/// Translates a fragment shader for the library of a joined pipeline: its resources in
+/// descriptor set 1 from binding 0, its rescaling bits after the other half's, and an input for
+/// every generic it reads, since the library doesn't know the stage before it. `front_stores`
+/// is what that stage writes, when it is known, so a fragment shader reading more is caught.
+std::optional<LibraryFallback> TranslateLibraryFragment(
+    ShaderPools& pools, Shader::Environment& env, const Shader::HostTranslateInfo& host_info,
+    const Shader::Profile& profile, std::span<const Shader::IR::Program> programs,
+    const GraphicsPipelineCacheKey& key, const Device& device,
+    const Shader::VaryingState* front_stores, Shader::IR::Program& program,
+    std::vector<u32>& code) try {
+    const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+    program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    if (program.info.loads.Legacy()) {
+        // Legacy attributes are matched to the generics the stage before left free.
+        return LibraryFallback::LegacyAttributes;
+    }
+    if (front_stores) {
+        for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+            if (program.info.loads.Generic(index) && !front_stores->Generic(index)) {
+                return LibraryFallback::UnwrittenInput;
+            }
+        }
+    }
+    const std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{nullptr, nullptr, nullptr,
+                                                                         nullptr, &program.info};
+    if (!FitsLibraryScaling(infos, LibraryHalf::Back)) {
+        return LibraryFallback::TooManyImages;
+    }
+    const Shader::RuntimeInfo runtime_info{
+        MakeRuntimeInfo(programs, key, program, nullptr, device)};
+    ConvertLegacyToGeneric(program, runtime_info);
+    Shader::Backend::Bindings bindings{};
+    bindings.texture_scaling_index = LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX;
+    bindings.image_scaling_index = LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX;
+    bindings.descriptor_set = 1;
+    code = EmitSPIRV(profile, runtime_info, program, bindings);
+    return std::nullopt;
+} catch (const Shader::Exception& exception) {
+    LOG_DEBUG(Render_Vulkan, "[Preforged] fragment shader for a library failed: {}",
+              exception.what());
+    return LibraryFallback::TranslateFailed;
+}
+
+/// Names a library compiled from a shader of the game files with a state, so later boots skip
+/// it without translating it again.
+u64 LibrarySource(LibraryHalf half, u64 shader, u64 state_hash) {
+    const std::array<u64, 3> words{static_cast<u64>(half) + 1, shader, state_hash};
+    return Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words));
+}
+
+/// x, y, z and w of a viewport as they are.
+constexpr u16 IDENTITY_VIEWPORT_SWIZZLE = 0x6420;
+
+/// The state the shaders from the game files are compiled with on a game's first start, before
+/// it has drawn anything: triangles, one RGBA8 color target and a depth target, no MSAA, no alpha
+/// test or transform feedback, the y direction and depth range the GPU starts with. Of the state,
+/// a shader's SPIR-V only depends on the primitive class, alpha test, early Z, the y direction,
+/// the depth range (without VK_EXT_depth_clip_control) and the attribute types, which are read
+/// from each vertex shader's code. The rest is dynamic or doesn't change the shaders.
+GraphicsPipelineCacheKey StarterKey(const DynamicFeatures& features) {
+    GraphicsPipelineCacheKey key{};
+    FixedPipelineState& state{key.state};
+    state.driver_id = features.driver_id;
+    state.driver_version = features.driver_version;
+    state.extended_dynamic_state.Assign(features.has_extended_dynamic_state ? 1 : 0);
+    state.extended_dynamic_state_2.Assign(features.has_extended_dynamic_state_2 ? 1 : 0);
+    state.extended_dynamic_state_2_logic_op.Assign(
+        features.has_extended_dynamic_state_2_logic_op ? 1 : 0);
+    state.extended_dynamic_state_3_blend.Assign(features.has_extended_dynamic_state_3_blend ? 1
+                                                                                          : 0);
+    state.extended_dynamic_state_3_enables.Assign(
+        features.has_extended_dynamic_state_3_enables ? 1 : 0);
+    state.color_write_enable_dynamic.Assign(features.has_color_write_enable ? 1 : 0);
+    state.dynamic_vertex_input.Assign(features.has_dynamic_vertex_input ? 1 : 0);
+    state.polygon_mode.Assign(FixedPipelineState::PackPolygonMode(Maxwell::PolygonMode::Fill));
+    state.topology.Assign(Maxwell::PrimitiveTopology::Triangles);
+    state.msaa_mode.Assign(Tegra::Texture::MsaaMode::Msaa1x1);
+    state.alpha_test_func.Assign(
+        FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL));
+    state.depth_enabled.Assign(1);
+    state.depth_format.Assign(static_cast<u32>(Tegra::DepthFormat::Z24_UNORM_S8_UINT));
+    // The first vertex, as the GPU starts, where the driver has it.
+    state.provoking_vertex_last.Assign(features.has_provoking_vertex &&
+                                               !features.has_provoking_vertex_first_mode &&
+                                               features.has_provoking_vertex_last_mode
+                                           ? 1
+                                           : 0);
+    state.color_formats.fill(static_cast<u8>(Tegra::RenderTargetFormat::NONE));
+    state.color_formats[0] = static_cast<u8>(Tegra::RenderTargetFormat::A8B8G8R8_UNORM);
+    state.point_size = std::bit_cast<u32>(1.0f);
+    state.viewport_swizzles.fill(IDENTITY_VIEWPORT_SWIZZLE);
+    for (FixedPipelineState::BlendingAttachment& attachment : state.attachments) {
+        attachment.mask_r.Assign(1);
+        attachment.mask_g.Assign(1);
+        attachment.mask_b.Assign(1);
+        attachment.mask_a.Assign(1);
+    }
+    if (!features.has_dynamic_vertex_input) {
+        // Without dynamic vertex input the attributes are part of the pipeline: all float.
+        for (FixedPipelineState::VertexAttribute& attribute : state.attributes) {
+            attribute.enabled.Assign(1);
+            attribute.type.Assign(static_cast<u32>(Maxwell::VertexAttribute::Type::Float));
+            attribute.size.Assign(
+                static_cast<u32>(Maxwell::VertexAttribute::Size::Size_R32_G32_B32_A32));
+        }
+    }
+    return key;
+}
+
+/// Logs how the pipelines the game drew on earlier boots differ in the state that changes their
+/// shaders, against the starter state a first start compiles with, to see how well it fits.
+void LogPlayedStates(std::span<const GraphicsPipelineCacheKey> keys) {
+    if (keys.empty()) {
+        return;
+    }
+    using Topology = Maxwell::PrimitiveTopology;
+    const u32 always{FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL)};
+    size_t points{};
+    size_t lines{};
+    size_t patches{};
+    size_t other_stages{};
+    size_t lower_left{};
+    size_t minus_one{};
+    size_t alpha_test{};
+    size_t early_z{};
+    size_t msaa{};
+    size_t xfb{};
+    size_t dual_source{};
+    size_t like_starter{};
+    for (const GraphicsPipelineCacheKey& key : keys) {
+        const FixedPipelineState& state{key.state};
+        const Topology topology{state.topology.Value()};
+        const bool is_points{topology == Topology::Points};
+        points += is_points ? 1 : 0;
+        lines += topology == Topology::Lines || topology == Topology::LineLoop ||
+                         topology == Topology::LineStrip || topology == Topology::LinesAdjacency ||
+                         topology == Topology::LineStripAdjacency
+                     ? 1
+                     : 0;
+        patches += topology == Topology::Patches ? 1 : 0;
+        const bool more_stages{key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 ||
+                               key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0};
+        other_stages += more_stages ? 1 : 0;
+        lower_left += state.y_negate != 0 ? 1 : 0;
+        minus_one += state.ndc_minus_one_to_one != 0 ? 1 : 0;
+        const bool alpha{state.alpha_test_func != always};
+        alpha_test += alpha ? 1 : 0;
+        early_z += state.early_z != 0 ? 1 : 0;
+        msaa += state.msaa_mode.Value() != Tegra::Texture::MsaaMode::Msaa1x1 ? 1 : 0;
+        xfb += state.xfb_enabled != 0 ? 1 : 0;
+        dual_source += state.attachment0_dual_source_blend != 0 ? 1 : 0;
+        like_starter += !more_stages && !is_points && !alpha && state.early_z == 0 &&
+                                state.xfb_enabled == 0 &&
+                                state.attachment0_dual_source_blend == 0
+                            ? 1
+                            : 0;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] the {} pipelines the game drew: {} points, {} lines, {} patches, {} "
+             "with more stages than a vertex and a fragment shader, {} with the window origin "
+             "lower left, {} with depth -1 to 1, {} with alpha test, {} with early Z, {} with "
+             "MSAA, {} with transform feedback, {} with dual source blending; {} change their "
+             "shaders as the starter state of a first start does (by primitive, stages, alpha "
+             "test, early Z, transform feedback and blending)",
+             keys.size(), points, lines, patches, other_stages, lower_left, minus_one, alpha_test,
+             early_z, msaa, xfb, dual_source, like_starter);
+}
+
 } // Anonymous namespace
 
 size_t ComputePipelineCacheKey::Hash() const noexcept {
@@ -350,15 +570,19 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
     : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_},
-      render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
-      texture_cache{texture_cache_}, shader_notify{shader_notify_},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, render_pass_cache{render_pass_cache_},
+      buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
+      pipeline_libraries{device_}, use_pipeline_libraries{device_.CanJoinPipelineLibraries()},
+      join_every_pipeline{use_pipeline_libraries &&
+                          Common::Preforged::Options().join_every_pipeline},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
-      serialization_thread(1, "VkPipelineSerialization", {},
-                           Common::ThreadPlacement::Background) {
+      full_worker(1, "VkPipelineFull", {}, Common::ThreadPlacement::Background),
+      serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background) {
+    GraphicsPipeline::ResetPlayTally();
+    ComputePipeline::ResetPlayTally();
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -498,6 +722,22 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     LOG_INFO(Render_Vulkan, "[ShaderTiming] VK_EXT_graphics_pipeline_library available: {}",
              device.GetAvailableExtensions().contains(
                  VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME));
+    {
+        const auto& library_properties{device.GraphicsPipelineLibraryProperties()};
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] joining pipelines from shader libraries: {} (fast linking {}, "
+                 "interpolation decorations only in the fragment shader {}, setting {}); "
+                 "compiling joined pipelines in full afterwards: {}; test, join every pipeline: "
+                 "{}",
+                 use_pipeline_libraries ? "on" : "off",
+                 library_properties.graphicsPipelineLibraryFastLinking != VK_FALSE,
+                 library_properties.graphicsPipelineLibraryIndependentInterpolationDecoration !=
+                     VK_FALSE,
+                 Common::Preforged::Options().pipeline_libraries,
+                 use_pipeline_libraries && Common::Preforged::Options().optimize_joined &&
+                     !join_every_pipeline,
+                 join_every_pipeline ? "on, so joined pipelines are kept as they are" : "off");
+    }
 
     dynamic_features = {};
     dynamic_features.driver_id = device.GetDriverID();
@@ -616,10 +856,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     pipeline_cache_filename = base_dir / "vulkan.bin";
 
+    OpenPreforgedStore(base_dir);
+    if (use_pipeline_libraries) {
+        pipeline_libraries.OpenStore(base_dir);
+    }
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
+        Common::Preforged::LogMemoryUse("before loading the driver pipeline cache");
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
+        Common::Preforged::LogMemoryUse("after loading the driver pipeline cache");
     }
 
     struct {
@@ -636,6 +882,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // Keys queued for building, so entries that collapse onto the same key after retargeting
     // are only built once. Only touched from this thread while the cache file is parsed.
     std::unordered_set<GraphicsPipelineCacheKey> queued_graphics_keys;
+    std::vector<GraphicsPipelineCacheKey> played_keys;
+    preforged_attribute_votes = {};
     size_t retargeted_graphics{};
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
@@ -700,6 +948,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!queued_graphics_keys.insert(key).second) {
             return;
         }
+        played_keys.push_back(key);
 
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
@@ -707,12 +956,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             for (auto& env : envs_) {
                 env_ptrs.push_back(&env);
             }
+            PreforgedCode code;
+            // Also keeps the libraries of the pipeline's two halves, so the game can join its
+            // shaders with others in play.
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
-                                                 state.statistics.get(), false)};
+                                                 state.statistics.get(), false, {}, &code, true)};
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
                 graphics_cache.emplace(key, std::move(pipeline));
+                CountPreforgedAttributeTypes(key, code);
             }
             ++state.built;
             if (state.has_loaded) {
@@ -736,6 +989,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    Common::Preforged::LogMemoryUse("after building the played pipelines");
+    if (join_every_pipeline) {
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] test, join every pipeline: of the {} pipelines the game drew, {}",
+                 played_keys.size(), LibraryJoinSummary());
+        // The counts in play start again.
+        library_joins = 0;
+        library_not_needed = 0;
+        for (auto& count : library_fallbacks) {
+            count = 0;
+        }
+        pipeline_libraries.ResetCounts();
+    }
+
+    PrecompilePreforgedPairs(base_dir, played_keys, stop_loading, callback);
+    Common::Preforged::LogMemoryUse("after compiling game file pairs");
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -748,6 +1017,1250 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     if (state.statistics) {
         state.statistics->Report();
+    }
+}
+
+std::vector<PipelineCache::CachedShaderCode> PipelineCache::ReadCachedShaderCode(
+    const std::filesystem::path& filename, std::stop_token stop_loading,
+    std::vector<GraphicsPipelineCacheKey>* graphics_keys) {
+    std::vector<CachedShaderCode> result;
+    std::unordered_set<u64> seen;
+    const auto add{[&](FileEnvironment& env) {
+        const std::span<const u64> code{env.Code()};
+        if (code.size() < 3) {
+            return;
+        }
+        // The unique hash covers the code up to the terminating instruction. Pipelines store the
+        // cached size, which adds the terminator, plus one more word from SetCachedSize.
+        const u64 hash{Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+                                          (code.size() - 2) * sizeof(u64))};
+        if (seen.insert(hash).second) {
+            std::vector<Shader::TextureType> texture_types;
+            for (const auto& [handle, type] : env.TextureTypes()) {
+                texture_types.push_back(type);
+            }
+            std::vector<u64> code_copy(code.begin(), code.end());
+            const size_t cbuf_value_count{env.CbufValueCount()};
+            const Shader::Stage stage{env.ShaderStage()};
+            result.push_back({hash, stage, std::move(code_copy), std::move(texture_types),
+                              cbuf_value_count,
+                              std::make_shared<FileEnvironment>(std::move(env))});
+        }
+    }};
+    VideoCommon::LoadPipelines(
+        stop_loading, filename, CACHE_VERSION,
+        [&](std::ifstream& file, FileEnvironment env) {
+            ComputePipelineCacheKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            add(env);
+        },
+        [&](std::ifstream& file, std::vector<FileEnvironment> envs) {
+            GraphicsPipelineCacheKey key;
+            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            if (graphics_keys) {
+                graphics_keys->push_back(key);
+            }
+            for (FileEnvironment& env : envs) {
+                add(env);
+            }
+        });
+    return result;
+}
+
+u64 PipelineCache::ShaderStateHash(const GraphicsPipelineCacheKey& key) {
+    const FixedPipelineState& state{key.state};
+    std::array<u32, 8 + Maxwell::NumVertexAttributes> words{};
+    words[0] = static_cast<u32>(state.topology.Value());
+    words[1] = state.topology == Maxwell::PrimitiveTopology::Points ? state.point_size : 0;
+    words[2] = state.xfb_enabled;
+    words[3] = state.ndc_minus_one_to_one;
+    words[4] = state.alpha_test_func;
+    words[5] = state.alpha_test_ref;
+    words[6] = state.attachment0_dual_source_blend;
+    words[7] = static_cast<u32>(state.msaa_mode.Value());
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        words[8 + index] = static_cast<u32>(
+            state.dynamic_vertex_input ? AttributeType(state, index)
+                                       : CastAttributeType(state.attributes[index]));
+    }
+    return Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words));
+}
+
+namespace {
+constexpr std::array<char, 4> PREFORGED_STORE_MAGIC{'P', 'F', 'D', 'S'};
+// Version 2 records what each pair was translated to, so stored code is matched by SPIR-V.
+// Version 3 compiles each vertex shader with its own attribute types; pairs stored by earlier
+// builds have the most common types, so the store starts over once.
+constexpr u32 PREFORGED_STORE_VERSION = 3;
+
+struct PreforgedStoreHeader {
+    std::array<char, 4> magic;
+    u32 version;
+    u32 driver_id;
+    u32 driver_version;
+};
+
+struct PreforgedStoreRecord {
+    u64 pair_id;
+    u64 state_hash;
+    u64 code_hash;
+    u32 size;
+    /// A bit for each attribute whose type was read from the vertex shader's code. Earlier builds
+    /// wrote 0 here.
+    u32 code_typed;
+    PipelineCache::PreforgedShaderInputs inputs;
+};
+
+PipelineCache::PreforgedShaderInputs MakePreforgedInputs(const GraphicsPipelineCacheKey& key,
+                                                         const Shader::Info& vertex_info) {
+    const FixedPipelineState& state{key.state};
+    PipelineCache::PreforgedShaderInputs inputs{};
+    inputs.attributes.fill(0xFF);
+    for (size_t index = 0; index < inputs.attributes.size(); ++index) {
+        if (!vertex_info.loads.Generic(index)) {
+            continue;
+        }
+        inputs.attributes[index] = static_cast<u8>(
+            state.dynamic_vertex_input ? AttributeType(state, index)
+                                       : CastAttributeType(state.attributes[index]));
+    }
+    inputs.points = state.topology == Maxwell::PrimitiveTopology::Points;
+    inputs.point_size = inputs.points ? state.point_size : 0;
+    inputs.xfb = state.xfb_enabled != 0;
+    inputs.ndc_minus_one_to_one = state.ndc_minus_one_to_one != 0;
+    inputs.alpha_test_func = static_cast<u8>(state.alpha_test_func.Value());
+    inputs.alpha_test_ref = state.alpha_test_ref;
+    inputs.dual_source_blend = state.attachment0_dual_source_blend != 0;
+    inputs.early_z = state.early_z != 0;
+    inputs.y_negate = state.y_negate != 0;
+    return inputs;
+}
+
+std::string_view AttributeTypeName(u8 type) {
+    switch (static_cast<Shader::AttributeType>(type)) {
+    case Shader::AttributeType::Float:
+        return "float";
+    case Shader::AttributeType::SignedInt:
+        return "int";
+    case Shader::AttributeType::UnsignedInt:
+        return "uint";
+    case Shader::AttributeType::SignedScaled:
+        return "int scaled";
+    case Shader::AttributeType::UnsignedScaled:
+        return "uint scaled";
+    case Shader::AttributeType::Disabled:
+        return "off";
+    }
+    return "?";
+}
+
+/// Lists what differs between the inputs a pair was compiled with and the ones the game uses.
+std::string DescribeInputDifference(const PipelineCache::PreforgedShaderInputs& stored,
+                                    const PipelineCache::PreforgedShaderInputs& game) {
+    std::vector<std::string> parts;
+    for (size_t index = 0; index < stored.attributes.size(); ++index) {
+        if (stored.attributes[index] != game.attributes[index]) {
+            parts.push_back(fmt::format("attribute {} {} instead of {}", index,
+                                        AttributeTypeName(game.attributes[index]),
+                                        AttributeTypeName(stored.attributes[index])));
+        }
+    }
+    if (stored.points != game.points || stored.point_size != game.point_size) {
+        parts.emplace_back("point size");
+    }
+    if (stored.xfb != game.xfb) {
+        parts.emplace_back("transform feedback");
+    }
+    if (stored.ndc_minus_one_to_one != game.ndc_minus_one_to_one) {
+        parts.emplace_back("depth range");
+    }
+    if (stored.alpha_test_func != game.alpha_test_func) {
+        parts.push_back(fmt::format("alpha test {} instead of {}", game.alpha_test_func,
+                                    stored.alpha_test_func));
+    } else if (stored.alpha_test_ref != game.alpha_test_ref) {
+        parts.emplace_back("alpha test reference");
+    }
+    if (stored.dual_source_blend != game.dual_source_blend) {
+        parts.emplace_back("dual source blend");
+    }
+    if (stored.early_z != game.early_z) {
+        parts.emplace_back("early depth test");
+    }
+    if (stored.y_negate != game.y_negate) {
+        parts.emplace_back("y flip");
+    }
+    if (parts.empty()) {
+        // Same state, so what the game files guessed for the shaders, such as texture types,
+        // differs from what the game uses.
+        return "same state, shader guesses differ";
+    }
+    return fmt::format("{}", fmt::join(parts, ", "));
+}
+
+/// What a vertex shader's code does with an attribute it reads: float math, or it takes the bits
+/// as an integer. The game feeds an attribute an integer type when the shader works on its bits
+/// as an integer, and a float type when the shader does float math with it.
+constexpr u8 INPUT_USED_AS_FLOAT = 1;
+constexpr u8 INPUT_USED_AS_INTEGER = 2;
+
+struct InputUse {
+    /// INPUT_USED_AS_FLOAT and INPUT_USED_AS_INTEGER for each attribute, both when the code does
+    /// both, neither when it only passes the value on.
+    std::array<u8, 32> kinds{};
+    /// A bit for each attribute the shader reads.
+    u32 read{};
+};
+
+/// Whether an instruction does float math with a float value it takes.
+bool IsFloatMath(Shader::IR::Opcode opcode) {
+    using Shader::IR::Opcode;
+    switch (opcode) {
+    case Opcode::FPAbs32:
+    case Opcode::FPAdd32:
+    case Opcode::FPFma32:
+    case Opcode::FPMax32:
+    case Opcode::FPMin32:
+    case Opcode::FPMul32:
+    case Opcode::FPNeg32:
+    case Opcode::FPRecip32:
+    case Opcode::FPRecipSqrt32:
+    case Opcode::FPSqrt:
+    case Opcode::FPSin:
+    case Opcode::FPExp2:
+    case Opcode::FPCos:
+    case Opcode::FPLog2:
+    case Opcode::FPSaturate32:
+    case Opcode::FPClamp32:
+    case Opcode::FPRoundEven32:
+    case Opcode::FPFloor32:
+    case Opcode::FPCeil32:
+    case Opcode::FPTrunc32:
+    case Opcode::FPOrdEqual32:
+    case Opcode::FPUnordEqual32:
+    case Opcode::FPOrdNotEqual32:
+    case Opcode::FPUnordNotEqual32:
+    case Opcode::FPOrdLessThan32:
+    case Opcode::FPUnordLessThan32:
+    case Opcode::FPOrdGreaterThan32:
+    case Opcode::FPUnordGreaterThan32:
+    case Opcode::FPOrdLessThanEqual32:
+    case Opcode::FPUnordLessThanEqual32:
+    case Opcode::FPOrdGreaterThanEqual32:
+    case Opcode::FPUnordGreaterThanEqual32:
+    case Opcode::FPIsNan32:
+    case Opcode::ConvertS16F32:
+    case Opcode::ConvertS32F32:
+    case Opcode::ConvertS64F32:
+    case Opcode::ConvertU16F32:
+    case Opcode::ConvertU32F32:
+    case Opcode::ConvertU64F32:
+    case Opcode::ConvertF16F32:
+    case Opcode::ConvertF64F32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Whether an instruction works on the bits of a 32-bit value it takes as an integer: integer
+/// math, integer to float conversion, or an offset or address, as in a constant buffer read
+/// indexed by a bone number.
+bool IsIntegerMath(Shader::IR::Opcode opcode) {
+    using Shader::IR::Opcode;
+    switch (opcode) {
+    case Opcode::IAdd32:
+    case Opcode::ISub32:
+    case Opcode::IMul32:
+    case Opcode::SDiv32:
+    case Opcode::UDiv32:
+    case Opcode::INeg32:
+    case Opcode::IAbs32:
+    case Opcode::ShiftLeftLogical32:
+    case Opcode::ShiftRightLogical32:
+    case Opcode::ShiftRightArithmetic32:
+    case Opcode::BitwiseAnd32:
+    case Opcode::BitwiseOr32:
+    case Opcode::BitwiseXor32:
+    case Opcode::BitwiseNot32:
+    case Opcode::BitFieldInsert:
+    case Opcode::BitFieldSExtract:
+    case Opcode::BitFieldUExtract:
+    case Opcode::BitReverse32:
+    case Opcode::BitCount32:
+    case Opcode::FindSMsb32:
+    case Opcode::FindUMsb32:
+    case Opcode::SMin32:
+    case Opcode::UMin32:
+    case Opcode::SMax32:
+    case Opcode::UMax32:
+    case Opcode::SClamp32:
+    case Opcode::UClamp32:
+    case Opcode::SLessThan:
+    case Opcode::ULessThan:
+    case Opcode::IEqual:
+    case Opcode::SLessThanEqual:
+    case Opcode::ULessThanEqual:
+    case Opcode::SGreaterThan:
+    case Opcode::UGreaterThan:
+    case Opcode::INotEqual:
+    case Opcode::SGreaterThanEqual:
+    case Opcode::UGreaterThanEqual:
+    case Opcode::ConvertF32S8:
+    case Opcode::ConvertF32S16:
+    case Opcode::ConvertF32S32:
+    case Opcode::ConvertF32U8:
+    case Opcode::ConvertF32U16:
+    case Opcode::ConvertF32U32:
+    case Opcode::GetCbufU8:
+    case Opcode::GetCbufS8:
+    case Opcode::GetCbufU16:
+    case Opcode::GetCbufS16:
+    case Opcode::GetCbufU32:
+    case Opcode::GetCbufF32:
+    case Opcode::GetCbufU32x2:
+    case Opcode::LoadLocal:
+    case Opcode::LoadStorage32:
+    case Opcode::LoadStorage64:
+    case Opcode::LoadStorage128:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Reads from a translated vertex shader whether it does float math with each attribute it
+/// reads or works on its bits as an integer. Each read is followed through bit casts, selects
+/// and phis to the instructions that use it.
+InputUse InputUseFromCode(const Shader::IR::Program& program) {
+    using Shader::IR::Inst;
+    using Shader::IR::Opcode;
+    InputUse use{};
+    for (size_t index = 0; index < use.kinds.size(); ++index) {
+        use.read |= program.info.loads.Generic(index) ? 1u << index : 0u;
+    }
+    std::unordered_map<const Inst*, std::vector<const Inst*>> users;
+    std::vector<std::pair<const Inst*, u32>> reads;
+    for (const Shader::IR::Block* const block : program.blocks) {
+        for (const Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == Opcode::GetAttribute) {
+                const Shader::IR::Value attribute{inst.Arg(0)};
+                if (attribute.Type() == Shader::IR::Type::Attribute &&
+                    Shader::IR::IsGeneric(attribute.Attribute())) {
+                    reads.emplace_back(&inst,
+                                       Shader::IR::GenericAttributeIndex(attribute.Attribute()));
+                }
+            }
+            for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+                if (const Inst* const producer{inst.Arg(arg).TryInstRecursive()}) {
+                    users[producer].push_back(&inst);
+                }
+            }
+        }
+    }
+    for (const auto& [read, index] : reads) {
+        // Each value the read flows into, and whether it holds the bits as an integer.
+        std::vector<std::pair<const Inst*, bool>> work{{read, false}};
+        std::unordered_set<const Inst*> visited{read};
+        while (!work.empty()) {
+            const auto [value, bits] = work.back();
+            work.pop_back();
+            const auto it{users.find(value)};
+            if (it == users.end()) {
+                continue;
+            }
+            for (const Inst* const user : it->second) {
+                const Opcode opcode{user->GetOpcode()};
+                const bool same{opcode == Opcode::Phi || opcode == Opcode::Identity ||
+                                opcode == (bits ? Opcode::SelectU32 : Opcode::SelectF32)};
+                const bool cast{opcode == (bits ? Opcode::BitCastF32U32 : Opcode::BitCastU32F32)};
+                if (same || cast) {
+                    if (visited.insert(user).second) {
+                        work.emplace_back(user, cast ? !bits : bits);
+                    }
+                    continue;
+                }
+                if (bits ? IsIntegerMath(opcode) : IsFloatMath(opcode)) {
+                    use.kinds[index] |= bits ? INPUT_USED_AS_INTEGER : INPUT_USED_AS_FLOAT;
+                }
+            }
+        }
+    }
+    return use;
+}
+
+/// Gives each attribute whose use the code makes clear float, or an integer type (the integer
+/// type the game feeds more often there, else unsigned). Attributes the guess turned off stay
+/// off. Returns a bit for each attribute it typed.
+u32 ApplyInputUse(GraphicsPipelineCacheKey& key, const InputUse& use,
+                  const std::array<std::array<size_t, 4>, 32>& votes) {
+    u32 typed{};
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        const u8 kind{use.kinds[index]};
+        const u64 current{key.state.DynamicAttributeType(index)};
+        if (((use.read >> index) & 1) == 0 || current == 0 ||
+            (kind != INPUT_USED_AS_FLOAT && kind != INPUT_USED_AS_INTEGER)) {
+            continue;
+        }
+        u64 type{1};
+        if (kind == INPUT_USED_AS_INTEGER) {
+            type = current != 1 ? current : votes[index][2] > votes[index][3] ? 2 : 3;
+        }
+        key.state.attribute_types &= ~(u64{3} << (index * 2));
+        key.state.attribute_types |= type << (index * 2);
+        typed |= 1u << index;
+    }
+    return typed;
+}
+} // Anonymous namespace
+
+void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
+    std::scoped_lock lock{preforged_store_mutex};
+    preforged_store.clear();
+    preforged_store_path = base_dir / "preforged_driver_store.bin";
+    std::error_code ec;
+
+    // Earlier builds compiled the pairs into the driver pipeline cache, which the driver keeps
+    // in memory as a whole. Start that cache over once; the played pipelines are built again
+    // from vulkan.bin on this boot and land in it.
+    const auto warmed_path{base_dir / "preforged_warmed.bin"};
+    if (std::filesystem::exists(warmed_path, ec)) {
+        std::filesystem::remove(warmed_path, ec);
+        std::filesystem::remove(base_dir / "preforged_percent.txt", ec);
+        std::filesystem::remove(base_dir / "vulkan_pipelines.bin", ec);
+        LOG_INFO(Render_Vulkan, "[Preforged] cleared the driver pipeline cache of pairs compiled "
+                                "by earlier builds, they now go to storage");
+    }
+
+    const PreforgedStoreHeader expected{
+        .magic = PREFORGED_STORE_MAGIC,
+        .version = PREFORGED_STORE_VERSION,
+        .driver_id = dynamic_features.driver_id,
+        .driver_version = dynamic_features.driver_version,
+    };
+    u64 valid_end{0};
+    u64 bytes{0};
+    {
+        const u64 file_size{std::filesystem::file_size(preforged_store_path, ec)};
+        std::ifstream file{preforged_store_path, std::ios::binary};
+        PreforgedStoreHeader header{};
+        if (file && file.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
+            std::memcmp(&header, &expected, sizeof(header)) == 0) {
+            valid_end = sizeof(header);
+            PreforgedStoreRecord record{};
+            while (valid_end + sizeof(record) <= file_size &&
+                   file.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+                const u64 offset{valid_end + sizeof(record)};
+                if (offset + record.size > file_size) {
+                    break;
+                }
+                preforged_store.insert_or_assign(
+                    record.pair_id,
+                    PreforgedStoreEntry{offset, record.state_hash, record.size,
+                                        PreforgedCode{record.code_hash, record.inputs},
+                                        record.code_typed});
+                valid_end = offset + record.size;
+                bytes += record.size;
+                file.seekg(static_cast<std::streamoff>(valid_end));
+            }
+        } else if (file) {
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] pair store is from another driver or build, starting over");
+        }
+    }
+    if (valid_end == 0) {
+        std::ofstream file{preforged_store_path, std::ios::binary | std::ios::trunc};
+        file.write(reinterpret_cast<const char*>(&expected), sizeof(expected));
+        valid_end = sizeof(expected);
+    } else if (std::filesystem::file_size(preforged_store_path, ec) != valid_end) {
+        // A write that was cut off, for example by a crash, is dropped.
+        std::filesystem::resize_file(preforged_store_path, valid_end, ec);
+    }
+    LOG_INFO(Render_Vulkan, "[Preforged] pair store on storage: {} pairs, {} MiB",
+             preforged_store.size(), bytes >> 20);
+}
+
+void PipelineCache::AppendPreforgedStore(u64 pair_id, u64 state_hash, const PreforgedCode& code,
+                                         u32 code_typed, const vk::PipelineCache& cache) {
+    size_t size{};
+    if (cache.Read(&size, nullptr) != VK_SUCCESS || size == 0) {
+        return;
+    }
+    std::vector<char> data(size);
+    if (cache.Read(&size, data.data()) != VK_SUCCESS) {
+        return;
+    }
+    std::scoped_lock lock{preforged_store_mutex};
+    if (!preforged_store_out.is_open()) {
+        return;
+    }
+    const PreforgedStoreRecord record{
+        pair_id, state_hash, code.code_hash, static_cast<u32>(size), code_typed, code.inputs};
+    const u64 offset{static_cast<u64>(preforged_store_out.tellp()) + sizeof(record)};
+    preforged_store_out.write(reinterpret_cast<const char*>(&record), sizeof(record));
+    preforged_store_out.write(data.data(), size);
+    if (preforged_store_out) {
+        preforged_store.insert_or_assign(
+            pair_id, PreforgedStoreEntry{offset, state_hash, record.size, code, code_typed});
+    }
+}
+
+void PipelineCache::CountPreforgedAttributeTypes(const GraphicsPipelineCacheKey& key,
+                                                 const PreforgedCode& code) {
+    if (!key.state.dynamic_vertex_input || key.unique_hashes[0] != 0 ||
+        key.unique_hashes[1] == 0) {
+        return;
+    }
+    for (size_t index = 0; index < code.inputs.attributes.size(); ++index) {
+        if (code.inputs.attributes[index] != 0xFF) {
+            ++preforged_attribute_votes[index][key.state.DynamicAttributeType(index)];
+        }
+    }
+}
+
+std::shared_ptr<vk::PipelineCache> PipelineCache::LoadPreforgedStoreEntry(
+    const GraphicsPipelineCacheKey& key, const PreforgedCode& code, std::string& match) {
+    if (key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 ||
+        key.unique_hashes[4] != 0 || key.unique_hashes[1] == 0 || key.unique_hashes[5] == 0) {
+        return {};
+    }
+    const u64 pair_id{(key.unique_hashes[1] * 0x9E3779B97F4A7C15ULL) ^ key.unique_hashes[5]};
+    PreforgedStoreEntry entry{};
+    std::filesystem::path path;
+    {
+        std::scoped_lock lock{preforged_store_mutex};
+        const auto it{preforged_store.find(pair_id)};
+        if (it == preforged_store.end()) {
+            match = "not stored";
+            return {};
+        }
+        entry = it->second;
+        path = preforged_store_path;
+    }
+    // Driver code only helps when the driver gets the same SPIR-V. Handing it code for other
+    // SPIR-V crashed the driver, so that stays behind its switch.
+    if (entry.code.code_hash == code.code_hash) {
+        match = "same code";
+    } else {
+        match = fmt::format("other code: {}",
+                            DescribeInputDifference(entry.code.inputs, code.inputs));
+        if (!Common::Preforged::Options().store_any_state) {
+            return {};
+        }
+    }
+    std::vector<char> data(entry.size);
+    std::ifstream file{path, std::ios::binary};
+    if (!file.seekg(static_cast<std::streamoff>(entry.offset)) ||
+        !file.read(data.data(), entry.size)) {
+        return {};
+    }
+    ++preforged_store_reads;
+    return std::make_shared<vk::PipelineCache>(device.GetLogical().CreatePipelineCache({
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .initialDataSize = data.size(),
+        .pInitialData = data.data(),
+    }));
+}
+
+void PipelineCache::PrecompilePreforgedPairs(
+    const std::filesystem::path& base_dir, std::span<const GraphicsPipelineCacheKey> played_keys,
+    std::stop_token stop_loading, const VideoCore::DiskResourceLoadCallback& callback) {
+    const auto programs_ptr{std::make_shared<std::optional<VideoCommon::PreforgedPrograms>>(
+        VideoCommon::ReadPreforgedPrograms(base_dir / "preforged_programs.bin"))};
+    LogPlayedStates(played_keys);
+    if (!*programs_ptr) {
+        return;
+    }
+    const VideoCommon::PreforgedPrograms& programs{**programs_ptr};
+    const auto pair_id{[](u64 vertex, u64 fragment) {
+        return (vertex * 0x9E3779B97F4A7C15ULL) ^ fragment;
+    }};
+
+    // Each vertex shader gets its own attribute types: the types the game drew it with, or for a
+    // shader it hasn't drawn yet, float or integer by what its code does with each attribute.
+    // Off gives every shader the type the game feeds most often at each attribute.
+    const bool per_shader_types{Common::Preforged::Options().input_types_per_shader};
+
+    // Pairs compiled on earlier boots, with the attribute types their vertex shader was
+    // compiled with. A pair whose types differ from what would be guessed now is compiled again.
+    // Types that were read from the shader's code stay as they are.
+    struct Warmed {
+        std::array<u8, 32> attributes;
+        u32 code_typed;
+    };
+    std::unordered_map<u64, Warmed> warmed;
+    {
+        std::scoped_lock lock{preforged_store_mutex};
+        for (const auto& [id, entry] : preforged_store) {
+            warmed.emplace(id, Warmed{entry.code.inputs.attributes,
+                                      per_shader_types ? entry.code_typed : 0u});
+        }
+    }
+    size_t stored_with_other_attributes{};
+    std::unordered_set<u64> played;
+
+    // A pair compiled with a state that changes its shaders differently than the game will is
+    // compiled again by the driver, so use a state the game drew this vertex shader with, or
+    // else the state most of its pipelines use.
+    std::unordered_map<u64, const GraphicsPipelineCacheKey*> vertex_templates;
+    std::unordered_map<u64, const GraphicsPipelineCacheKey*> played_pair_keys;
+    std::unordered_map<u64, std::pair<size_t, const GraphicsPipelineCacheKey*>> state_counts;
+    for (const GraphicsPipelineCacheKey& key : played_keys) {
+        played.insert(pair_id(key.unique_hashes[1], key.unique_hashes[5]));
+        if (key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 ||
+            key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0) {
+            continue;
+        }
+        played_pair_keys.try_emplace(pair_id(key.unique_hashes[1], key.unique_hashes[5]), &key);
+        vertex_templates.try_emplace(key.unique_hashes[1], &key);
+        auto& [count, example] = state_counts[ShaderStateHash(key)];
+        ++count;
+        example = &key;
+    }
+    // On a game's first start it hasn't drawn anything yet, so the starter state stands in for
+    // the states it draws. Later starts use the states it drew.
+    std::optional<GraphicsPipelineCacheKey> starter;
+    const GraphicsPipelineCacheKey* common_template{};
+    if (state_counts.empty()) {
+        if (!Common::Preforged::Options().first_start_compile) {
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] the game hasn't drawn any pipeline of a vertex and a fragment "
+                     "shader yet (first start), and compiling on a first start is switched off");
+            return;
+        }
+        starter = StarterKey(dynamic_features);
+        common_template = &*starter;
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] the game hasn't drawn any pipeline of a vertex and a fragment "
+                 "shader yet (first start): compiling the shaders from the game files with the "
+                 "starter state (triangles, one RGBA8 color target with depth, no MSAA, no alpha "
+                 "test, window origin upper left, depth 0 to 1), fragment shader libraries also "
+                 "with the origin lower left{}",
+                 device.IsExtDepthClipControlSupported()
+                     ? std::string{}
+                     : std::string{", vertex shader libraries also with depth -1 to 1"});
+    }
+    size_t common_count{};
+    for (const auto& [hash, entry] : state_counts) {
+        if (entry.first > common_count) {
+            common_count = entry.first;
+            common_template = entry.second;
+        }
+    }
+
+    // Each attribute gets the type the game feeds most often when a played vertex shader reads
+    // it, off included. Only the attributes a shader reads change its SPIR-V, so the others don't
+    // matter, and with dynamic vertex input the types aren't part of the pipeline's vertex input.
+    // An attribute no played shader reads stays as the template has it, or float if it's off.
+    const auto votes{preforged_attribute_votes};
+    const auto guess_attributes{[&votes](GraphicsPipelineCacheKey& key) {
+        if (!key.state.dynamic_vertex_input) {
+            return;
+        }
+        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+            const auto& counts{votes[index]};
+            u64 type{key.state.DynamicAttributeType(index) != 0 ? key.state.DynamicAttributeType(index)
+                                                                : 1};
+            if (counts[0] + counts[1] + counts[2] + counts[3] != 0) {
+                type = 0;
+                for (u64 candidate = 1; candidate < 4; ++candidate) {
+                    if (counts[candidate] > counts[type]) {
+                        type = candidate;
+                    }
+                }
+            }
+            key.state.attribute_types &= ~(u64{3} << (index * 2));
+            key.state.attribute_types |= type << (index * 2);
+        }
+    }};
+    {
+        std::vector<std::string> parts;
+        for (size_t index = 0; index < votes.size(); ++index) {
+            const auto& counts{votes[index]};
+            if (counts[0] + counts[1] + counts[2] + counts[3] == 0) {
+                continue;
+            }
+            parts.push_back(fmt::format("{}: {} off {} float {} int {} uint", index, counts[0],
+                                        counts[1], counts[2], counts[3]));
+        }
+        LOG_INFO(Render_Vulkan, "[Preforged] attribute types played shaders read: {}",
+                 parts.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(parts, "; ")));
+    }
+    const auto same_attributes{[](const std::array<u8, 32>& stored, u32 trusted,
+                                  const GraphicsPipelineCacheKey& key) {
+        for (size_t index = 0; index < stored.size(); ++index) {
+            if (stored[index] != 0xFF && ((trusted >> index) & 1) == 0 &&
+                stored[index] != static_cast<u8>(AttributeType(key.state, index))) {
+                return false;
+            }
+        }
+        return true;
+    }};
+
+    preforged_pairs.clear();
+    preforged_skipped_pairs.clear();
+    preforged_shaders.clear();
+    for (const auto& [hash, shader] : programs.shaders) {
+        preforged_shaders.insert(hash);
+    }
+    preforged_other_shaders = {programs.other_shaders.begin(), programs.other_shaders.end()};
+    std::unordered_set<u64> played_fragments;
+    for (const GraphicsPipelineCacheKey& key : played_keys) {
+        played_fragments.insert(key.unique_hashes[5]);
+    }
+    // Pairs that share a shader with what the game drew so far come first, since they belong to
+    // the same areas and effects; a pair whose vertex shader was drawn also gets its real state.
+    struct Candidate {
+        GraphicsPipelineCacheKey key;
+        /// The attribute types are the ones the game drew the vertex shader with.
+        bool drawn_types;
+    };
+    std::array<std::vector<Candidate>, 3> candidates;
+    std::unordered_set<u64> seen;
+    size_t warmed_count{};
+    size_t played_not_stored{};
+    size_t played_other_attributes{};
+    for (const auto& [vertex, fragment] : programs.pairs) {
+        if (!programs.shaders.contains(vertex) || !programs.shaders.contains(fragment)) {
+            continue;
+        }
+        const u64 id{pair_id(vertex, fragment)};
+        if (!seen.insert(id).second) {
+            continue;
+        }
+        const auto it{vertex_templates.find(vertex)};
+        const bool drawn_types{per_shader_types && it != vertex_templates.end()};
+        GraphicsPipelineCacheKey key{it != vertex_templates.end() ? *it->second : *common_template};
+        key.unique_hashes = {};
+        key.unique_hashes[1] = vertex;
+        key.unique_hashes[5] = fragment;
+        if (!drawn_types) {
+            guess_attributes(key);
+        }
+        if (played.contains(id)) {
+            preforged_pairs.try_emplace(id, ShaderStateHash(key));
+            // The game draws a pair with more states as it goes, and each new one looks for the
+            // pair's stored code. Without stored code, or with code compiled with other attribute
+            // types than the game drew the pair with, the driver compiles the new state in full,
+            // so the pair is compiled with the state the game drew.
+            if (per_shader_types) {
+                const auto stored{warmed.find(id)};
+                const auto drawn{played_pair_keys.find(id)};
+                if (drawn != played_pair_keys.end() &&
+                    (stored == warmed.end() ||
+                     (drawn->second->state.dynamic_vertex_input &&
+                      !same_attributes(stored->second.attributes, 0, *drawn->second)))) {
+                    ++(stored == warmed.end() ? played_not_stored : played_other_attributes);
+                    candidates[0].push_back(Candidate{*drawn->second, true});
+                }
+            }
+            continue;
+        }
+        if (const auto stored{warmed.find(id)}; stored != warmed.end()) {
+            // Types the game drew the vertex shader with count over types read from its code.
+            const u32 trusted{drawn_types ? 0u : stored->second.code_typed};
+            if (!key.state.dynamic_vertex_input ||
+                same_attributes(stored->second.attributes, trusted, key)) {
+                preforged_pairs.try_emplace(id, ShaderStateHash(key));
+                ++warmed_count;
+                continue;
+            }
+            ++stored_with_other_attributes;
+        }
+        const size_t rank{it != vertex_templates.end() ? 0u
+                          : played_fragments.contains(fragment) ? 1u
+                                                                : 2u};
+        candidates[rank].push_back(Candidate{key, drawn_types});
+    }
+    const size_t candidate_count{candidates[0].size() + candidates[1].size() +
+                                 candidates[2].size()};
+    // Pairs compiled on earlier boots count against the share, so it doesn't grow every boot.
+    const size_t wanted{((warmed_count + candidate_count) *
+                             Common::Preforged::Options().precompile_percent +
+                         99) /
+                        100};
+    std::vector<Candidate> todo;
+    for (const auto& rank : candidates) {
+        for (const Candidate& candidate : rank) {
+            const GraphicsPipelineCacheKey& key{candidate.key};
+            if (warmed_count + todo.size() >= wanted) {
+                preforged_skipped_pairs.insert(
+                    pair_id(key.unique_hashes[1], key.unique_hashes[5]));
+                continue;
+            }
+            todo.push_back(candidate);
+            preforged_pairs.try_emplace(pair_id(key.unique_hashes[1], key.unique_hashes[5]),
+                                        ShaderStateHash(key));
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] {} shader pairs from the game files, {} already played, {} compiled "
+             "on earlier boots, {} not compiled yet ({} with a played vertex shader, {} with a "
+             "played fragment shader, {} others), {} to compile now at {}%, {} states seen, {} "
+             "stored pairs compiled again with other attribute types",
+             programs.pairs.size(), played.size(), warmed_count, candidate_count,
+             candidates[0].size(), candidates[1].size(), candidates[2].size(), todo.size(),
+             Common::Preforged::Options().precompile_percent, state_counts.size(),
+             stored_with_other_attributes);
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] attribute types per vertex shader {}: {} drawn vertex shaders keep "
+             "the types the game drew them with; played pairs to compile with the state the "
+             "game drew: {} not stored yet, {} stored with other attribute types",
+             per_shader_types, per_shader_types ? vertex_templates.size() : 0,
+             played_not_stored, played_other_attributes);
+    if (!Common::Preforged::Options().precompile_game_shaders) {
+        LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in the settings");
+        return;
+    }
+    struct {
+        std::mutex mutex;
+        size_t built{};
+        size_t failed{};
+        size_t slow{};
+        double total_ms{};
+        std::vector<u64> warmed;
+        // Attribute types read from the vertex shaders' code, counted once per vertex shader.
+        size_t typed_shaders{};
+        size_t typed_attributes{};
+        size_t typed_changed{};
+        size_t typed_unclear{};
+        size_t typed_failed{};
+        size_t typed_pairs{};
+        // The same reading on vertex shaders the game drew, against the types it drew them with.
+        size_t check_shaders{};
+        size_t check_agree{};
+        size_t check_differ{};
+        size_t check_off{};
+        size_t check_unclear{};
+        std::vector<std::string> check_examples;
+        std::unordered_map<u64, InputUse> input_uses;
+    } state;
+
+    // Reads, once per vertex shader, what its code does with each attribute, and counts how that
+    // compares with the types it is compiled with.
+    const auto input_use_of{[this, &state](u64 hash, const VideoCommon::PreforgedShader& shader,
+                                           u32 texture_bound, const GraphicsPipelineCacheKey& key,
+                                           bool drawn_types) {
+        {
+            std::scoped_lock lock{state.mutex};
+            if (const auto it{state.input_uses.find(hash)}; it != state.input_uses.end()) {
+                return it->second;
+            }
+        }
+        InputUse use{};
+        bool translated{};
+        try {
+            VideoCommon::PreforgedEnvironment env{shader.code, shader.stage, shader.start_address,
+                                                  texture_bound};
+            ShaderPools pools;
+            const u32 cfg_offset{
+                static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+            const Shader::IR::Program program{
+                TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+            use = InputUseFromCode(program);
+            translated = true;
+        } catch (const std::exception& e) {
+            LOG_DEBUG(Render_Vulkan, "[Preforged] vertex shader {:016x} failed: {}", hash,
+                      e.what());
+        }
+        std::scoped_lock lock{state.mutex};
+        const auto [it, is_new]{state.input_uses.try_emplace(hash, use)};
+        if (!is_new) {
+            return it->second;
+        }
+        if (!translated) {
+            ++state.typed_failed;
+            return use;
+        }
+        if (drawn_types) {
+            ++state.check_shaders;
+        } else {
+            ++state.typed_shaders;
+        }
+        for (size_t index = 0; index < use.kinds.size(); ++index) {
+            if (((use.read >> index) & 1) == 0) {
+                continue;
+            }
+            const u8 kind{use.kinds[index]};
+            const u32 type{key.state.DynamicAttributeType(index)};
+            const bool clear{kind == INPUT_USED_AS_FLOAT || kind == INPUT_USED_AS_INTEGER};
+            if (!drawn_types) {
+                if (!clear || type == 0) {
+                    ++state.typed_unclear;
+                    continue;
+                }
+                ++state.typed_attributes;
+                state.typed_changed += (kind == INPUT_USED_AS_FLOAT) != (type == 1) ? 1 : 0;
+                continue;
+            }
+            if (type == 0) {
+                ++state.check_off;
+            } else if (!clear) {
+                ++state.check_unclear;
+            } else if ((kind == INPUT_USED_AS_FLOAT) == (type == 1)) {
+                ++state.check_agree;
+            } else {
+                ++state.check_differ;
+                if (state.check_examples.size() < 8) {
+                    state.check_examples.push_back(
+                        fmt::format("{:016x} attribute {} drawn as {}, code reads it as {}", hash,
+                                    index, type == 1 ? "float" : type == 2 ? "int" : "uint",
+                                    kind == INPUT_USED_AS_FLOAT ? "float" : "integer"));
+                }
+            }
+        }
+        return use;
+    }};
+
+    if (!todo.empty()) {
+        std::scoped_lock lock{preforged_store_mutex};
+        preforged_store_out.open(preforged_store_path, std::ios::binary | std::ios::app);
+    }
+    const auto start{std::chrono::steady_clock::now()};
+    if (!todo.empty()) {
+        callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, todo.size());
+    }
+    for (const Candidate& candidate : todo) {
+        workers.QueueWork([this, candidate, programs_ptr, pair_id, per_shader_types, &votes,
+                           &input_use_of, total = todo.size(), &state, &callback] {
+            const VideoCommon::PreforgedPrograms& shared{**programs_ptr};
+            GraphicsPipelineCacheKey key{candidate.key};
+            const auto& vertex{shared.shaders.at(key.unique_hashes[1])};
+            const auto& fragment{shared.shaders.at(key.unique_hashes[5])};
+            // A vertex shader the game hasn't drawn yet gets float or an integer type at each
+            // attribute by what its code does with it; one it drew keeps the types it drew.
+            u32 code_typed{};
+            if (per_shader_types && key.state.dynamic_vertex_input) {
+                const InputUse use{input_use_of(key.unique_hashes[1], vertex,
+                                                shared.texture_bound, key, candidate.drawn_types)};
+                if (!candidate.drawn_types) {
+                    code_typed = ApplyInputUse(key, use, votes);
+                }
+            }
+            if (code_typed != 0) {
+                std::scoped_lock lock{state.mutex};
+                ++state.typed_pairs;
+            }
+            VideoCommon::PreforgedEnvironment vertex_env{vertex.code, vertex.stage,
+                                                         vertex.start_address,
+                                                         shared.texture_bound};
+            VideoCommon::PreforgedEnvironment fragment_env{fragment.code, fragment.stage,
+                                                           fragment.start_address,
+                                                           shared.texture_bound};
+            std::array<Shader::Environment*, 2> envs{&vertex_env, &fragment_env};
+            const auto pipeline_start{std::chrono::steady_clock::now()};
+            bool built{};
+            try {
+                // Each pair gets its own driver cache, so its code can be stored on its own and
+                // nothing piles up in the driver pipeline cache the driver keeps in memory.
+                const auto cache{std::make_shared<vk::PipelineCache>(
+                    device.GetLogical().CreatePipelineCache({
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                        .pNext = nullptr,
+                        .flags = 0,
+                        .initialDataSize = 0,
+                        .pInitialData = nullptr,
+                    }))};
+                ShaderPools pools;
+                PreforgedCode code;
+                built = CreateGraphicsPipeline(pools, key, envs, nullptr, false, cache, &code) !=
+                        nullptr;
+                if (built) {
+                    AppendPreforgedStore(pair_id(key.unique_hashes[1], key.unique_hashes[5]),
+                                         ShaderStateHash(key), code, code_typed, *cache);
+                }
+            } catch (const std::exception& e) {
+                LOG_DEBUG(Render_Vulkan, "[Preforged] pair failed: {}", e.what());
+            }
+            const std::chrono::duration<double, std::milli> time{
+                std::chrono::steady_clock::now() - pipeline_start};
+            std::scoped_lock lock{state.mutex};
+            if (built) {
+                state.total_ms += time.count();
+                state.slow += time.count() > 5.0 ? 1 : 0;
+                state.warmed.push_back(pair_id(key.unique_hashes[1], key.unique_hashes[5]));
+            } else {
+                ++state.failed;
+            }
+            ++state.built;
+            callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, state.built, total);
+        });
+    }
+    workers.WaitForRequests(stop_loading);
+    {
+        std::scoped_lock lock{preforged_store_mutex};
+        preforged_store_out.close();
+    }
+    const auto seconds{std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start)};
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] compiled {} shader pairs in {} s ({} failed, {} over 5 ms, {:.1f} ms "
+             "average per pair)",
+             state.warmed.size(), seconds.count(), state.failed, state.slow,
+             state.warmed.empty() ? 0.0 : state.total_ms / state.warmed.size());
+
+    // Pipeline libraries of every vertex and fragment shader from the game files, in a pair or
+    // not, so a pipeline the game needs in play that no compiled pair has is joined from the
+    // libraries of its two shaders instead of compiled.
+    if (use_pipeline_libraries && !stop_loading.stop_requested()) {
+        std::unordered_map<u64, const GraphicsPipelineCacheKey*> fragment_templates;
+        for (const GraphicsPipelineCacheKey& key : played_keys) {
+            if (key.unique_hashes[0] == 0 && key.unique_hashes[2] == 0 &&
+                key.unique_hashes[3] == 0 && key.unique_hashes[4] == 0) {
+                fragment_templates.try_emplace(key.unique_hashes[5], &key);
+            }
+        }
+        struct LibraryJob {
+            u64 hash;
+            const VideoCommon::PreforgedShader* shader;
+            LibraryHalf half;
+            GraphicsPipelineCacheKey key;
+            bool drawn_types;
+            u64 source;
+        };
+        // Shaders the game drew come first, since a new pipeline in play most often pairs a
+        // drawn shader with another.
+        std::array<std::vector<LibraryJob>, 2> library_candidates;
+        size_t library_stored{};
+        size_t vertex_shaders{};
+        size_t fragment_shaders{};
+        size_t unpaired_shaders{};
+        // Libraries for the other window origin or depth range, on a first start.
+        size_t starter_variants{};
+        const auto add_library{
+            [&](u64 hash, const VideoCommon::PreforgedShader& shader, bool unpaired) {
+                LibraryHalf half{};
+                if (shader.stage == Shader::Stage::VertexB) {
+                    half = LibraryHalf::Front;
+                    ++vertex_shaders;
+                } else if (shader.stage == Shader::Stage::Fragment) {
+                    half = LibraryHalf::Back;
+                    ++fragment_shaders;
+                } else {
+                    return;
+                }
+                unpaired_shaders += unpaired ? 1 : 0;
+                const bool front{half == LibraryHalf::Front};
+                const auto& templates{front ? vertex_templates : fragment_templates};
+                const auto it{templates.find(hash)};
+                const bool drawn{it != templates.end()};
+                GraphicsPipelineCacheKey key{drawn ? *it->second : *common_template};
+                key.unique_hashes = {};
+                key.unique_hashes[front ? 1 : 5] = hash;
+                const bool drawn_types{front && per_shader_types && drawn};
+                if (front && !drawn_types) {
+                    guess_attributes(key);
+                }
+                const u64 source{LibrarySource(half, hash, ShaderStateHash(key))};
+                if (pipeline_libraries.HasSource(source)) {
+                    ++library_stored;
+                    return;
+                }
+                library_candidates[drawn ? 0 : 1].push_back(
+                    LibraryJob{hash, &shader, half, key, drawn_types, source});
+                if (!starter) {
+                    return;
+                }
+                // Before the game has drawn, its window origin isn't known, nor its depth range,
+                // which changes vertex shaders without VK_EXT_depth_clip_control. Both change the
+                // SPIR-V of the shaders that read them, so the other one is compiled too. A
+                // shader whose SPIR-V stays the same is stored once.
+                GraphicsPipelineCacheKey other{key};
+                if (!front) {
+                    other.state.y_negate.Assign(1);
+                } else if (!device.IsExtDepthClipControlSupported()) {
+                    other.state.ndc_minus_one_to_one.Assign(1);
+                } else {
+                    return;
+                }
+                const u64 other_source{LibrarySource(half, hash, ShaderStateHash(other))};
+                if (other_source != source && pipeline_libraries.HasSource(other_source)) {
+                    return;
+                }
+                library_candidates[1].push_back(
+                    LibraryJob{hash, &shader, half, other, drawn_types, other_source});
+                ++starter_variants;
+            }};
+        for (const auto& [hash, shader] : programs.shaders) {
+            add_library(hash, shader, false);
+        }
+        for (const auto& [hash, shader] : programs.unpaired_shaders) {
+            add_library(hash, shader, true);
+        }
+        const size_t library_count{library_candidates[0].size() + library_candidates[1].size()};
+        const size_t library_wanted{
+            ((library_stored + library_count) * Common::Preforged::Options().precompile_percent +
+             99) /
+            100};
+        std::vector<LibraryJob> library_todo;
+        for (const auto& rank : library_candidates) {
+            for (const LibraryJob& job : rank) {
+                if (library_stored + library_todo.size() >= library_wanted) {
+                    break;
+                }
+                library_todo.push_back(job);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] pipeline libraries: {} vertex and {} fragment shaders from the game "
+                 "files ({} of them in no pair{}), {} compiled on earlier boots, {} not compiled "
+                 "yet ({} drawn by the game), {} to compile now at {}%",
+                 vertex_shaders, fragment_shaders, unpaired_shaders,
+                 programs.unpaired_shaders.empty() && !programs.other_shaders.empty()
+                     ? "; the code of shaders in no pair is kept from search version 16 on"
+                     : "",
+                 library_stored, library_count, library_candidates[0].size(), library_todo.size(),
+                 Common::Preforged::Options().precompile_percent);
+
+        struct {
+            std::mutex mutex;
+            size_t done{};
+            size_t compiled{};
+            size_t failed{};
+            std::array<size_t, LIBRARY_FALLBACK_NAMES.size()> fallbacks{};
+            double total_ms{};
+            double longest_ms{};
+        } library_state;
+        const auto library_start{std::chrono::steady_clock::now()};
+        const size_t stored_before{pipeline_libraries.StoredCount()};
+        if (!library_todo.empty()) {
+            callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, library_todo.size());
+        }
+        for (const LibraryJob& job : library_todo) {
+            workers.QueueWork([this, job, programs_ptr, per_shader_types, &votes, &input_use_of,
+                               total = library_todo.size(), &library_state, &callback] {
+                const VideoCommon::PreforgedPrograms& shared{**programs_ptr};
+                GraphicsPipelineCacheKey key{job.key};
+                const bool front{job.half == LibraryHalf::Front};
+                // Attribute types for a vertex shader the game hasn't drawn, as for the pairs.
+                if (front && per_shader_types && key.state.dynamic_vertex_input) {
+                    const InputUse use{input_use_of(job.hash, *job.shader, shared.texture_bound,
+                                                    key, job.drawn_types)};
+                    if (!job.drawn_types) {
+                        ApplyInputUse(key, use, votes);
+                    }
+                }
+                VideoCommon::PreforgedEnvironment env{job.shader->code, job.shader->stage,
+                                                      job.shader->start_address,
+                                                      shared.texture_bound};
+                const auto job_start{std::chrono::steady_clock::now()};
+                std::optional<LibraryFallback> fallback;
+                bool compiled{};
+                try {
+                    ShaderPools pools;
+                    std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> stage_programs;
+                    std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+                    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+                    std::vector<u32> code;
+                    const size_t stage{front ? 0U : Maxwell::MaxShaderStage - 1};
+                    if (front) {
+                        // The vertex shader as a pipeline of only it and a fragment shader
+                        // translates it: in set 0 from binding 0, the stage first in line.
+                        Shader::IR::Program& program{stage_programs[1]};
+                        const u32 cfg_offset{
+                            static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+                        program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                        infos[stage] = &program.info;
+                        if (!FitsLibraryScaling(infos, LibraryHalf::Front)) {
+                            fallback = LibraryFallback::TooManyImages;
+                        } else {
+                            const Shader::RuntimeInfo runtime_info{
+                                MakeRuntimeInfo(stage_programs, key, program, nullptr, device)};
+                            ConvertLegacyToGeneric(program, runtime_info);
+                            Shader::Backend::Bindings bindings{};
+                            code = EmitSPIRV(profile, runtime_info, program, bindings);
+                        }
+                    } else {
+                        Shader::IR::Program& program{stage_programs[Maxwell::MaxShaderProgram - 1]};
+                        fallback =
+                            TranslateLibraryFragment(pools, env, host_info, profile, stage_programs,
+                                                     key, device, nullptr, program, code);
+                        infos[stage] = &program.info;
+                    }
+                    if (!fallback) {
+                        modules[stage] = BuildShader(device, code);
+                        compiled = pipeline_libraries.CompileIntoStore(
+                            job.half, FoldCodeHash(0, code), job.source,
+                            [&](VkPipelineCache cache) {
+                                return GraphicsPipeline::CreateLibrary(device, render_pass_cache,
+                                                                       key, job.half, modules,
+                                                                       infos, cache);
+                            });
+                    }
+                } catch (const std::exception& e) {
+                    LOG_DEBUG(Render_Vulkan, "[Preforged] library of {:016x} failed: {}", job.hash,
+                              e.what());
+                    fallback = LibraryFallback::TranslateFailed;
+                }
+                if (fallback || !compiled) {
+                    // Not tried again on later boots.
+                    pipeline_libraries.NoteSource(job.source);
+                }
+                const std::chrono::duration<double, std::milli> time{
+                    std::chrono::steady_clock::now() - job_start};
+                std::scoped_lock lock{library_state.mutex};
+                if (fallback) {
+                    ++library_state.fallbacks[static_cast<size_t>(*fallback)];
+                } else if (compiled) {
+                    ++library_state.compiled;
+                    library_state.total_ms += time.count();
+                    library_state.longest_ms = std::max(library_state.longest_ms, time.count());
+                } else {
+                    ++library_state.failed;
+                }
+                ++library_state.done;
+                callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, library_state.done,
+                         total);
+            });
+        }
+        workers.WaitForRequests(stop_loading);
+        std::vector<std::string> skipped;
+        for (size_t index = 0; index < library_state.fallbacks.size(); ++index) {
+            if (library_state.fallbacks[index] != 0) {
+                skipped.push_back(fmt::format("{} {}", library_state.fallbacks[index],
+                                              LIBRARY_FALLBACK_NAMES[index]));
+            }
+        }
+        LOG_INFO(
+            Render_Vulkan,
+            "[Preforged] compiled {} pipeline libraries in {} s ({:.1f} ms average, longest "
+            "{:.1f} ms), {} failed in the driver, skipped: {}; the library store holds {}",
+            library_state.compiled,
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                             library_start)
+                .count(),
+            library_state.compiled == 0 ? 0.0 : library_state.total_ms / library_state.compiled,
+            library_state.longest_ms, library_state.failed,
+            skipped.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(skipped, ", ")),
+            pipeline_libraries.StoredCount());
+        if (starter) {
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] first start: {} of the libraries were for the other window "
+                     "origin or depth range; {} new libraries were stored in all, the rest had "
+                     "the SPIR-V of another",
+                     starter_variants, pipeline_libraries.StoredCount() - stored_before);
+        }
+    }
+    if (per_shader_types) {
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] attribute types from the code of {} vertex shaders the game hasn't "
+                 "drawn: {} attributes set to float or integer by the code, {} of them other "
+                 "than the most common type, {} unclear (both or neither in the code, or off); "
+                 "{} pairs got types from the code; {} vertex shaders failed to translate",
+                 state.typed_shaders, state.typed_attributes, state.typed_changed,
+                 state.typed_unclear, state.typed_pairs, state.typed_failed);
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] check on {} vertex shaders the game drew: the code gives the type "
+                 "the game drew for {} attributes, another type for {}, {} were off in the game, "
+                 "{} unclear in the code",
+                 state.check_shaders, state.check_agree, state.check_differ, state.check_off,
+                 state.check_unclear);
+        for (const std::string& example : state.check_examples) {
+            LOG_INFO(Render_Vulkan, "[Preforged]   other type: {}", example);
+        }
     }
 }
 
@@ -784,6 +2297,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
+        if (Common::Preforged::Options().log_shader_compiles) {
+            LogStateVariant(graphics_key);
+        }
         pipeline = CreateGraphicsPipeline();
     }
     if (!pipeline) {
@@ -794,6 +2310,76 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     }
     current_pipeline = pipeline.get();
     return BuiltPipeline(current_pipeline);
+}
+
+void PipelineCache::LogStateVariant(const GraphicsPipelineCacheKey& key) {
+    // How many variants are shown one by one, and how often the counts are logged.
+    static constexpr size_t STATE_EXAMPLES = 24;
+    static constexpr size_t SUMMARY_EVERY = 100;
+    static constexpr auto SUMMARY_INTERVAL = std::chrono::seconds{30};
+    const auto start{std::chrono::steady_clock::now()};
+    std::vector<const FixedPipelineState*> states;
+    for (const auto& [other, other_pipeline] : graphics_cache) {
+        if (other.unique_hashes == key.unique_hashes && other != key) {
+            states.push_back(&other.state);
+        }
+    }
+    if (states.empty()) {
+        ++state_tally.new_shaders;
+    } else {
+        const auto [closest, parts]{PreforgedState::Closest(key.state, states)};
+        state_tally.Add(parts);
+        if (state_examples < STATE_EXAMPLES) {
+            ++state_examples;
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] state variant: shaders {:016x} had {} pipelines; the closest "
+                     "differs in {}: {}; they would share one with {}",
+                     fmt::join(key.unique_hashes, ","), states.size(),
+                     PreforgedState::PartNames(parts),
+                     PreforgedState::DescribeDifference(key.state, *closest, parts),
+                     PreforgedState::WAY_NAMES[PreforgedState::WayFor(parts)]);
+        }
+    }
+    const auto now{std::chrono::steady_clock::now()};
+    state_search_time += now - start;
+    const size_t total{state_tally.new_shaders + state_tally.variants};
+    if (total % SUMMARY_EVERY != 0 && now - last_state_summary < SUMMARY_INTERVAL) {
+        return;
+    }
+    last_state_summary = now;
+    const auto yes = [](bool value) { return value ? "yes" : "no"; };
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] pipelines compiled in play: {}; {} (in use now: Extended Dynamic "
+             "State 1 {}, 2 {}, 3 blending {}, Vertex Input Dynamic State {}, from the setting "
+             "level {}; {} pipelines known, looked through in {} ms in all)",
+             total, state_tally.Summary(), yes(dynamic_features.has_extended_dynamic_state),
+             yes(dynamic_features.has_extended_dynamic_state_2),
+             yes(dynamic_features.has_extended_dynamic_state_3_blend),
+             yes(dynamic_features.has_dynamic_vertex_input),
+             static_cast<u32>(Settings::values.dyna_state.GetValue()), graphics_cache.size(),
+             std::chrono::duration_cast<std::chrono::milliseconds>(state_search_time).count());
+    if (use_pipeline_libraries) {
+        LOG_INFO(Render_Vulkan, "[Preforged] pipeline libraries in play: {}",
+                 LibraryJoinSummary());
+    }
+}
+
+std::string PipelineCache::LibraryJoinSummary() {
+    std::vector<std::string> not_joined;
+    for (size_t index = 0; index < library_fallbacks.size(); ++index) {
+        if (const size_t count{library_fallbacks[index].load()}; count != 0) {
+            not_joined.push_back(fmt::format("{} {}", count, LIBRARY_FALLBACK_NAMES[index]));
+        }
+    }
+    const PipelineLibraries::Counts counts{pipeline_libraries.PlayCounts()};
+    return fmt::format("{} pipelines joined, {} didn't need them (the driver had their code), "
+                       "not joined: {}; libraries {} from memory, {} from storage ({} of them "
+                       "slow, so the driver compiled them again), {} compiled, {} failed",
+                       library_joins.load(), library_not_needed.load(),
+                       not_joined.empty() ? std::string{"none"}
+                                          : fmt::format("{}", fmt::join(not_joined, ", ")),
+                       counts.memory, counts.storage, counts.slow_storage, counts.compiled,
+                       counts.failed);
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
@@ -816,7 +2402,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-    bool build_in_parallel) try {
+    bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache, PreforgedCode* code_out,
+    bool store_libraries) try {
     const auto translate_start{std::chrono::steady_clock::now()};
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
@@ -873,6 +2460,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
+    PreforgedCode preforged_code;
+    // The SPIR-V of the stages before the fragment shader, which names their library, and the
+    // last of those stages.
+    u64 front_code{};
+    const Shader::IR::Program* front_last{};
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
          ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -890,6 +2482,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
         device.SaveShader(code);
+        preforged_code.code_hash = FoldCodeHash(preforged_code.code_hash, code);
+        if (stage_index + 1 < Maxwell::MaxShaderStage) {
+            front_code = FoldCodeHash(front_code, code);
+        } else {
+            front_last = previous_stage;
+        }
         modules[stage_index] = BuildShader(device, code);
 
         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
@@ -916,18 +2514,165 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    if (uses_vertex_b && !uses_vertex_a) {
+        preforged_code.inputs = MakePreforgedInputs(key, programs[1].info);
+    }
+    if (code_out) {
+        *code_out = preforged_code;
+    }
+    const bool given_build_cache{build_cache != nullptr};
+    std::string store_match{"not stored"};
+    if (!build_cache) {
+        build_cache = LoadPreforgedStoreEntry(key, preforged_code, store_match);
+    }
+
+    // A pipeline the driver would compile in play is joined from pipeline libraries of its two
+    // halves instead: the stages before the fragment shader as they are, and the fragment shader
+    // translated once more for its own descriptor set. The driver needs no libraries when it has
+    // the pipeline's code already: a stored pair with the same SPIR-V, or a pipeline with the
+    // same SPIR-V compiled this session.
+    // The test switch joins every pipeline the game drew, while it loads, and every pipeline
+    // built in play, but not the pairs compiled into the pair store.
+    const bool join_for_test{join_every_pipeline && (build_in_parallel || store_libraries)};
+    bool built_before{};
+    if (use_pipeline_libraries && build_in_parallel && !build_cache && !join_for_test) {
+        std::scoped_lock lock{built_codes_mutex};
+        built_before = built_codes.contains(preforged_code.code_hash);
+    }
+    const bool join{join_for_test || (use_pipeline_libraries && build_in_parallel &&
+                                      !build_cache && !built_before)};
+    // A pipeline the game drew whose libraries were kept on an earlier boot isn't translated
+    // for them again.
+    const u64 played_source{store_libraries ? LibrarySource(LibraryHalf::Back, hash, 1) : 0};
+    const bool keep_libraries{use_pipeline_libraries && store_libraries &&
+                              !pipeline_libraries.HasSource(played_source)};
+    std::string library_note{use_pipeline_libraries ? "not needed, the driver has the code"
+                                                    : "off"};
+    std::optional<GraphicsPipelineLibraryInfo> library_info;
+    Shader::IR::Program library_fragment;
+    vk::ShaderModule library_module;
+    u64 back_code{};
+    if (join || keep_libraries) {
+        std::optional<LibraryFallback> fallback;
+        if (key.unique_hashes[5] == 0 || !modules[Maxwell::MaxShaderStage - 1]) {
+            fallback = LibraryFallback::NoFragmentShader;
+        } else if (!FitsLibraryScaling(infos, LibraryHalf::Front)) {
+            fallback = LibraryFallback::TooManyImages;
+        } else {
+            // In play the fragment shader's inputs are checked against the stage before it.
+            // Libraries kept while the game loads are for any stage before, as the game file
+            // shaders' are.
+            Shader::VaryingState front_stores{};
+            if (front_last) {
+                front_stores = front_last->info.stores;
+                if (front_last->is_geometry_passthrough) {
+                    front_stores.mask |= front_last->info.passthrough.mask;
+                }
+            }
+            std::vector<u32> code;
+            fallback = TranslateLibraryFragment(
+                pools, *envs.back(), host_info, profile, programs, key, device,
+                join && front_last ? &front_stores : nullptr, library_fragment, code);
+            if (!fallback) {
+                back_code = FoldCodeHash(0, code);
+                library_module = BuildShader(device, code);
+            }
+        }
+        if (fallback) {
+            library_note = LIBRARY_FALLBACK_NAMES[static_cast<size_t>(*fallback)];
+            if (join) {
+                ++library_fallbacks[static_cast<size_t>(*fallback)];
+            }
+        }
+        if (!fallback && keep_libraries) {
+            // A pipeline the game drew, built while the game loads: its libraries go to
+            // storage, so the game can join its shaders with others in play.
+            constexpr size_t fragment_stage{Maxwell::MaxShaderStage - 1};
+            std::swap(modules[fragment_stage], library_module);
+            const Shader::Info* const fragment_info{
+                std::exchange(infos[fragment_stage], &library_fragment.info)};
+            bool kept{true};
+            for (const auto& [half, code] : {std::pair{LibraryHalf::Front, front_code},
+                                             std::pair{LibraryHalf::Back, back_code}}) {
+                const LibraryHalf library_half{half};
+                kept &= pipeline_libraries.CompileIntoStore(
+                    library_half, code, 0, [&](VkPipelineCache cache) {
+                        return GraphicsPipeline::CreateLibrary(device, render_pass_cache, key,
+                                                               library_half, modules, infos, cache);
+                    });
+            }
+            std::swap(modules[fragment_stage], library_module);
+            infos[fragment_stage] = fragment_info;
+            if (kept) {
+                pipeline_libraries.NoteSource(played_source);
+            }
+        } else if (fallback && keep_libraries) {
+            pipeline_libraries.NoteSource(played_source);
+        }
+        if (!fallback && join) {
+            constexpr size_t fragment_stage{Maxwell::MaxShaderStage - 1};
+            modules[fragment_stage] = std::move(library_module);
+            infos[fragment_stage] = &library_fragment.info;
+            library_info = GraphicsPipelineLibraryInfo{
+                .libraries = &pipeline_libraries,
+                .front_code = front_code,
+                .back_code = back_code,
+                .full_worker = Common::Preforged::Options().optimize_joined && !join_every_pipeline
+                                   ? &full_worker
+                                   : nullptr,
+            };
+            library_note = "joined";
+            ++library_joins;
+        }
+    } else if (use_pipeline_libraries && build_in_parallel) {
+        ++library_not_needed;
+    }
+    if (!build_cache && !library_info) {
+        // Compiled into the driver pipeline cache, which other states of the same SPIR-V find.
+        std::scoped_lock lock{built_codes_mutex};
+        built_codes.insert(preforged_code.code_hash);
+    }
     if (build_in_parallel) {
+        Common::Preforged::FrameStats::Add(Common::Preforged::FrameStats::Item::ShaderTranslate,
+                                           std::chrono::steady_clock::now() - translate_start);
+    }
+    if (build_in_parallel && Common::Preforged::Options().log_shader_compiles) {
         // Shader timing test: guest shader translation to SPIR-V, done on the GPU thread in game
         const std::chrono::duration<double, std::milli> translate_time{
             std::chrono::steady_clock::now() - translate_start};
-        LOG_INFO(Render_Vulkan, "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x}",
-                 hash, translate_time.count(), fmt::join(key.unique_hashes, ","));
+        // Whether the shaders came from the game files and the pair was compiled ahead of time,
+        // to tell missed pairs from pairs the driver compiled again.
+        std::string game_files{"no list"};
+        if (!preforged_shaders.empty()) {
+            const u64 vertex{key.unique_hashes[1]};
+            const u64 fragment{key.unique_hashes[5]};
+            const auto pair{preforged_pairs.find((vertex * 0x9E3779B97F4A7C15ULL) ^ fragment)};
+            // Files from searches before the list of other shaders can't tell the last two apart.
+            const auto where{[this](u64 shader) {
+                return preforged_shaders.contains(shader)         ? "in a pair"
+                       : preforged_other_shaders.contains(shader) ? "in no pair"
+                       : preforged_other_shaders.empty()          ? "not in a pair"
+                                                                  : "not among them";
+            }};
+            game_files = fmt::format(
+                "vertex {}, fragment {}, pair {}", where(vertex), where(fragment),
+                pair != preforged_pairs.end() ? fmt::format("yes, {}", store_match)
+                : preforged_skipped_pairs.contains((vertex * 0x9E3779B97F4A7C15ULL) ^ fragment)
+                    ? std::string{"skipped by the pre-compile share"}
+                    : std::string{"no"});
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x} game files: {}, "
+                 "from storage {}, libraries: {}",
+                 hash, translate_time.count(), fmt::join(key.unique_hashes, ","), game_files,
+                 build_cache && !given_build_cache ? "yes" : "no", library_note);
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos);
+        render_pass_cache, key, std::move(modules), infos, std::move(build_cache),
+        library_info ? &*library_info : nullptr);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -973,13 +2718,32 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
 std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+    const Common::Preforged::FrameStats::Timer timer{
+        Common::Preforged::FrameStats::Item::ShaderTranslate};
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
     env.SetCachedSize(shader->size_bytes);
 
     main_pools.ReleaseContents();
+    const auto translate_start{std::chrono::steady_clock::now()};
     auto pipeline{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    if (Common::Preforged::Options().log_shader_compiles) {
+        // Compute shaders from the game files aren't compiled ahead yet: their workgroup size
+        // and shared memory come from the dispatch, not the code. This shows how many the game
+        // needs in play and whether the search has them.
+        const std::chrono::duration<double, std::milli> translate_time{
+            std::chrono::steady_clock::now() - translate_start};
+        const bool listed{!preforged_shaders.empty() || !preforged_other_shaders.empty()};
+        const bool found{preforged_shaders.contains(key.unique_hash) ||
+                         preforged_other_shaders.contains(key.unique_hash)};
+        LOG_INFO(Render_Vulkan,
+                 "[ShaderTiming] compute {:016x} translate {:.2f} ms, in the game files: {}, "
+                 "workgroup {}x{}x{}, shared memory {} bytes",
+                 key.unique_hash, translate_time.count(),
+                 !listed ? "no list" : found ? "yes" : "no", key.workgroup_size[0],
+                 key.workgroup_size[1], key.workgroup_size[2], key.shared_memory_size);
+    }
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
@@ -1138,8 +2902,8 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         std::vector<char> cache_data(cache_size);
         file.read(cache_data.data(), cache_size);
 
-        LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+        LOG_INFO(Render_Vulkan, "Loaded Vulkan driver pipeline cache: {} MiB from {}",
+                 cache_size >> 20, Common::FS::PathToUTF8String(filename));
 
         return create_pipeline_cache(cache_size, cache_data.data());
 

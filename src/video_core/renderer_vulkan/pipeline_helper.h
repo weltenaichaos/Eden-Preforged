@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <optional>
 
@@ -23,6 +24,18 @@
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
+
+/// In a pipeline joined from libraries, the fragment shader's rescaling bits start here in the
+/// push constants, so its library doesn't depend on how many textures the vertex shader has.
+/// The stages before it may use the bits below.
+constexpr u32 LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX = 64;
+constexpr u32 LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX = 32;
+static_assert(LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX % 32 == 0 &&
+              LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX <
+                  Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS * 32);
+static_assert(LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX % 32 == 0 &&
+              LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX <
+                  Shader::Backend::SPIRV::NUM_IMAGE_SCALING_WORDS * 32);
 
 [[nodiscard]] inline std::optional<PixelFormat> PixelFormatFromImageFormat(
     Shader::ImageFormat format) {
@@ -243,16 +256,7 @@ public:
     }
 
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
-        using Shader::Backend::SPIRV::RenderAreaLayout;
-        using Shader::Backend::SPIRV::RescalingLayout;
-        const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
-        const VkPushConstantRange range{
-            .stageFlags = static_cast<VkShaderStageFlags>(
-                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS),
-            .offset = 0,
-            .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
-                    static_cast<u32>(sizeof(RenderAreaLayout)),
-        };
+        const VkPushConstantRange range{PushConstantRange()};
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
@@ -262,6 +266,35 @@ public:
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &range,
         });
+    }
+
+    /// A layout for a pipeline joined from libraries, or for one of its libraries: set 0 holds
+    /// the descriptors of the stages before the fragment shader and set 1 the fragment shader's,
+    /// either of them null when the library doesn't have it or its stages use no descriptors.
+    /// The push constants are the same as in every graphics pipeline.
+    vk::PipelineLayout CreateLibraryPipelineLayout(VkDescriptorSetLayout front_set,
+                                                   VkDescriptorSetLayout back_set) const {
+        const VkPushConstantRange range{PushConstantRange()};
+        const std::array<VkDescriptorSetLayout, 2> sets{front_set, back_set};
+        return device->GetLogical().CreatePipelineLayout({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT,
+            .setLayoutCount = static_cast<u32>(sets.size()),
+            .pSetLayouts = sets.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+    }
+
+    /// Where the descriptors of the stages added next start in the descriptor data of a draw,
+    /// for a second builder that takes the stages after those of a first one.
+    void StartPayloadAt(u32 descriptor_entries) noexcept {
+        offset = sizeof(DescriptorUpdateEntry) * descriptor_entries;
+    }
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return bindings.empty();
     }
 
     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
@@ -276,6 +309,19 @@ public:
     }
 
 private:
+    VkPushConstantRange PushConstantRange() const noexcept {
+        using Shader::Backend::SPIRV::RenderAreaLayout;
+        using Shader::Backend::SPIRV::RescalingLayout;
+        const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+        return VkPushConstantRange{
+            .stageFlags = static_cast<VkShaderStageFlags>(
+                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS),
+            .offset = 0,
+            .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+                    static_cast<u32>(sizeof(RenderAreaLayout)),
+        };
+    }
+
     template <typename Descriptors>
     void Add(VkDescriptorType type, VkShaderStageFlags stage, const Descriptors& descriptors) {
         const size_t num{descriptors.size()};
@@ -330,6 +376,15 @@ public:
             image_bit = 1u;
             ++image_ptr;
         }
+    }
+
+    /// Moves on to the bits the fragment shader of a pipeline joined from libraries reads.
+    void StartLibraryFragmentStage() noexcept {
+        texture_ptr = words.data() + LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX / 32;
+        image_ptr = words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS +
+                    LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX / 32;
+        texture_bit = 1u;
+        image_bit = 1u;
     }
 
     const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& Data() const noexcept {

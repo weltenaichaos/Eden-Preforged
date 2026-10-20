@@ -122,6 +122,10 @@ struct UserCallbacks {
     virtual void InstructionCacheOperationRaised(InstructionCacheOperation /*op*/, VAddr /*value*/) {}
     virtual void InstructionSynchronizationBarrierRaised() {}
 
+    // Called by the arm64 backend after it compiles a block, with the block's location
+    // (an IR::LocationDescriptor value), so the frontend can compile it ahead next time.
+    virtual void BlockCompiled(std::uint64_t /*location*/) {}
+
     // Timing-related callbacks
     // ticks ticks have passed
     virtual void AddTicks(std::uint64_t ticks) = 0;
