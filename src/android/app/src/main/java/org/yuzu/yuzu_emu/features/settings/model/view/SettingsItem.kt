@@ -388,6 +388,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_FIND_PACKED_DATA,
+                    titleId = R.string.preforged_find_packed_data,
+                    descriptionId = R.string.preforged_find_packed_data_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.PREFORGED_SEARCH_PROGRAM,
                     titleId = R.string.preforged_search_program,
                     descriptionId = R.string.preforged_search_program_description

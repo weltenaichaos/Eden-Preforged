@@ -951,6 +951,7 @@ struct Values {
     Setting<bool> preforged_unpack_oodle{linkage, true, "preforged_unpack_oodle", Category::Miscellaneous};
     Setting<bool> preforged_read_unity_files{linkage, true, "preforged_read_unity_files", Category::Miscellaneous};
     Setting<bool> preforged_search_program{linkage, true, "preforged_search_program", Category::Miscellaneous};
+    Setting<bool> preforged_find_packed_data{linkage, true, "preforged_find_packed_data", Category::Miscellaneous};
     Setting<bool> preforged_zstd_dictionaries{linkage, true, "preforged_zstd_dictionaries", Category::Miscellaneous};
     Setting<bool> preforged_log_unreal_links{linkage, true, "preforged_log_unreal_links", Category::Miscellaneous};
     Setting<bool> preforged_unreal_learned_pairs{linkage, true, "preforged_unreal_learned_pairs", Category::Miscellaneous};

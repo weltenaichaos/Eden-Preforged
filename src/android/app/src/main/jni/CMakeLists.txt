@@ -32,6 +32,8 @@ add_library(yuzu-android SHARED
     unreal_pak.h
     unity_assets.cpp
     unity_assets.h
+    embedded_streams.cpp
+    embedded_streams.h
     ooz/kraken.cpp
     ooz/ooz.h
     ooz/ooz_platform.h

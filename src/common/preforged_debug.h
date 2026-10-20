@@ -27,6 +27,9 @@ struct DebugOptions {
     bool read_unity_files = true;
     /// Searches the read-only data and data of the game's program modules for shaders too.
     bool search_program = true;
+    /// Finds zstd frames, zlib streams, ZIP entries and CRILAYLA files inside any file and
+    /// searches them.
+    bool find_packed_data = true;
     /// Finds the zstd dictionaries in the game files and unpacks the files packed with them.
     bool zstd_dictionaries = true;
     /// Logs how an Unreal game's packages refer to their shader code, during the search.

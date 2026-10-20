@@ -51,6 +51,7 @@
 #include "jni/unreal_links.h"
 #include "jni/unreal_package.h"
 #include "jni/unreal_pak.h"
+#include "jni/embedded_streams.h"
 #include "jni/unity_assets.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/program.h"
@@ -95,8 +96,14 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // and fragment shaders in no pair kept too, for pipeline libraries. 17: Unreal Engine 4 pak
 // files unpacked (with the AES key from the game's executable when encrypted), and the shaders
 // in their shader archives; the Switch shaders of Unity games' Shader objects, in their asset
-// files and bundles; the read-only data and data of the game's program modules.
+// files and bundles; the read-only data and data of the game's program modules; zstd frames,
+// zlib streams, ZIP entries and CRILAYLA files found inside any file.
 constexpr u32 SEARCH_VERSION = 17;
+/// Packed streams found inside files that unpack to fewer bytes are left out: too small to hold
+/// a shader worth the search.
+constexpr size_t MIN_PACKED_STREAM = 256;
+/// Files whose packed streams are logged one by one; the rest are only in the sums.
+constexpr size_t PACKED_FILES_LOGGED = 16;
 /// Bytes read from the start of a file to tell a Unity bundle or asset file.
 constexpr size_t UNITY_START = 0x100;
 /// Unity asset files and bundles logged one by one; the rest are only in the sums.
@@ -1909,6 +1916,7 @@ private:
                 return file->ReadBytes(length, offset);
             };
             UnitySearch unity{*this, name};
+            u64 streams_end = 0;
             for (size_t offset = 0; offset < size && !Stopped();
                  offset += CHUNK_SIZE) {
                 const size_t length = std::min(size - offset, CHUNK_SIZE + CHUNK_OVERLAP);
@@ -1922,6 +1930,11 @@ private:
                 if (unity_assets) {
                     unity.Search(chunk, offset, &fetch);
                 }
+                // Streams that start in this piece; the overlap belongs to the next one.
+                const u64 to = offset + length == size ? size : offset + CHUNK_SIZE;
+                streams_end = SearchPackedStreams(chunk, name, offset,
+                                                  std::max<u64>(offset, streams_end), to, size,
+                                                  &fetch, 0);
                 SearchShaders(chunk, name, offset);
             }
         }
@@ -1991,11 +2004,99 @@ private:
             Preforged::Unity::IsSerializedFile(data, data.size())) {
             UnitySearch{*this, name}.Search(data, 0, nullptr);
         }
+        SearchPackedStreams(data, name, 0, 0, data.size(), data.size(), nullptr, depth);
         auto& stored = formats.stored_starts[Start32(data)];
         ++stored.first;
         stored.second += data.size();
         SearchShaders(data, name, 0);
     }
+
+    /// Finds zstd frames, zlib streams, ZIP entries and CRILAYLA files that start in [from, to)
+    /// of `data` (the bytes at `base` of a file of `file_size` bytes), unpacks them and searches
+    /// what they hold like a file of their own. Returns where the last stream found ends.
+    u64 SearchPackedStreams(std::span<const u8> data, const std::string& name, u64 base, u64 from,
+                            u64 to, u64 file_size, const Preforged::Embedded::ReadFn* fetch,
+                            int depth) {
+        using namespace Preforged::Embedded;
+        if (!Common::Preforged::Options().find_packed_data || depth >= 4 || Stopped()) {
+            return from;
+        }
+        // Only the outermost search counts what is found, as streams can hold streams.
+        const bool outermost = packed_nesting == 0;
+        ++packed_nesting;
+        const size_t headers_before = code_headers;
+        const size_t taken_before = extracted.size();
+        size_t found = 0;
+        Source source{data, base, file_size, fetch};
+        Handlers handlers;
+        handlers.zstd = [&](u64 offset, std::span<const u8> frame) -> u64 {
+            const std::vector<u8> out = Decompress(frame);
+            if (out.empty()) {
+                ++packed_totals.zstd_failed;
+                return 0;
+            }
+            ++found;
+            ScanBuffer(out, fmt::format("{}@{:x}", name, offset), depth + 1);
+            return out.size();
+        };
+        handlers.unpacked = [&](Kind, u64 offset, std::span<const u8> out) {
+            ++found;
+            ScanBuffer(out, fmt::format("{}@{:x}", name, offset), depth + 1);
+        };
+        handlers.stop = [this] { return Stopped(); };
+        const u64 end = FindStreams(source, from, to, MIN_PACKED_STREAM, MAX_DECOMPRESSED,
+                                    handlers, packed_stats);
+        --packed_nesting;
+        if (outermost && found != 0) {
+            const size_t new_headers = code_headers - headers_before;
+            const size_t taken = extracted.size() - taken_before;
+            packed_totals.code_headers += new_headers;
+            packed_totals.taken += taken;
+            auto& file = packed_totals.files[name];
+            file.streams += found;
+            file.code_headers += new_headers;
+            file.taken += taken;
+        }
+        return end;
+    }
+
+public:
+    /// Sums up the packed streams found inside files.
+    void ReportPackedStreams() const {
+        if (!Common::Preforged::Options().find_packed_data) {
+            LOG_INFO(Frontend, "[ShaderScan] 'Find packed data inside files' is off");
+            return;
+        }
+        using namespace Preforged::Embedded;
+        const auto& stats = packed_stats;
+        std::vector<std::string> kinds;
+        for (size_t kind = 0; kind < KIND_COUNT; ++kind) {
+            kinds.push_back(fmt::format(
+                "{} {} of {} that looked like one ({} MiB packed, {} MiB unpacked, {} too large)",
+                KindName(static_cast<Kind>(kind)), stats.streams[kind], stats.candidates[kind],
+                stats.packed[kind] >> 20, stats.unpacked[kind] >> 20, stats.too_large[kind]));
+        }
+        std::vector<std::pair<size_t, std::string>> by_headers;
+        for (const auto& [file, counts] : packed_totals.files) {
+            by_headers.emplace_back(counts.code_headers * 1000000 + counts.streams, file);
+        }
+        std::ranges::sort(by_headers, std::greater{});
+        std::vector<std::string> files;
+        for (size_t i = 0; i < std::min(by_headers.size(), PACKED_FILES_LOGGED); ++i) {
+            const auto& counts = packed_totals.files.at(by_headers[i].second);
+            files.push_back(fmt::format("{} ({} streams, {} NVN code headers, {} new shaders)",
+                                        by_headers[i].second, counts.streams,
+                                        counts.code_headers, counts.taken));
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] packed data inside files: {}; {} zstd frames did not unpack; {} "
+                 "files held some; {} NVN code headers in them, {} new shaders taken; most: {}",
+                 fmt::join(kinds, "; "), packed_totals.zstd_failed, packed_totals.files.size(),
+                 packed_totals.code_headers, packed_totals.taken,
+                 files.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(files, ", ")));
+    }
+
+private:
 
     /// Searches one Unity asset file, whole or piece by piece, for Shader objects, unpacks
     /// their Switch shaders and searches those; logs what the file held when done.
@@ -2191,12 +2292,20 @@ private:
         }
         size_t hits = 0;
         size_t terminators = 0;
-        const auto [file_it, inserted] = file_ids.try_emplace(name, file_names.size());
-        if (inserted) {
-            file_names.push_back(name);
-            headers.emplace_back();
-        }
-        const u32 file_id = file_it->second;
+        // A file gets an id when it is first found to hold shader code, so the many pieces of
+        // data searched that hold none (each packed stream in an archive) take no memory.
+        std::optional<u32> known_id;
+        const auto file_id = [&] {
+            if (!known_id) {
+                const auto [file_it, inserted] = file_ids.try_emplace(name, file_names.size());
+                if (inserted) {
+                    file_names.push_back(name);
+                    headers.emplace_back();
+                }
+                known_id = file_it->second;
+            }
+            return *known_id;
+        };
         std::unordered_map<u64, HeaderInfo> local_headers;
         std::vector<u64> bnsh_starts;
         const size_t end = data.size() - NEEDLE_WORDS * sizeof(u64);
@@ -2209,8 +2318,8 @@ private:
                 ++terminators;
             }
             if (static_cast<u32>(first) == NVN_CODE_MAGIC) {
-                Extract(data, pos + NVN_CODE_HEADER_SIZE, file_id, base_offset + pos);
-                const auto& file_headers = headers[file_id];
+                Extract(data, pos + NVN_CODE_HEADER_SIZE, file_id(), base_offset + pos);
+                const auto& file_headers = headers[file_id()];
                 if (const auto it = file_headers.find(base_offset + pos);
                     it != file_headers.end()) {
                     local_headers.emplace(pos, it->second);
@@ -2234,7 +2343,7 @@ private:
             for (const size_t index : it->second) {
                 const MatchKind kind = Verify(index, data, pos);
                 auto& result = results[index];
-                NotePartialMatch(index, data, pos, file_id, base_offset);
+                NotePartialMatch(index, data, pos, file_id(), base_offset);
                 if (kind > result.kind) {
                     if (result.kind < MatchKind::CodeOnly && kind >= MatchKind::CodeOnly) {
                         ++hits;
@@ -2980,6 +3089,19 @@ private:
         size_t bundles_logged = 0;
     } unity_totals;
     Preforged::Unity::BlobStats unity_stats;
+    Preforged::Embedded::Stats packed_stats;
+    struct PackedFile {
+        size_t streams = 0;
+        size_t code_headers = 0;
+        size_t taken = 0;
+    };
+    struct PackedTotals {
+        size_t zstd_failed = 0;
+        size_t code_headers = 0;
+        size_t taken = 0;
+        std::map<std::string, PackedFile> files;
+    } packed_totals;
+    int packed_nesting = 0;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
@@ -3454,6 +3576,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.ReportUnreal();
     scanner.ReportPaks();
     scanner.ReportUnity();
+    scanner.ReportPackedStreams();
     scanner.ReportUnrealLinks();
     scanner.LearnUnrealLinksFromOtherPackages();
     scanner.ReportExtraction();
