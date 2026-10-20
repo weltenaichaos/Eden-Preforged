@@ -95,7 +95,7 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // and fragment shaders in no pair kept too, for pipeline libraries. 17: Unreal Engine 4 pak
 // files unpacked (with the AES key from the game's executable when encrypted), and the shaders
 // in their shader archives; the Switch shaders of Unity games' Shader objects, in their asset
-// files and bundles.
+// files and bundles; the read-only data and data of the game's program modules.
 constexpr u32 SEARCH_VERSION = 17;
 /// Bytes read from the start of a file to tell a Unity bundle or asset file.
 constexpr size_t UNITY_START = 0x100;
@@ -1672,6 +1672,45 @@ public:
         executable_reader = std::move(reader);
     }
 
+    using ModuleReader =
+        std::function<std::vector<std::pair<std::string, std::vector<u8>>>(std::string&)>;
+
+    void SetModuleReader(ModuleReader reader) {
+        module_reader = std::move(reader);
+    }
+
+    /// Searches the read-only data and data of the game's program modules, where small engines
+    /// and ports keep the shaders built into them.
+    void ScanModules() {
+        if (!module_reader || Stopped()) {
+            return;
+        }
+        if (!Common::Preforged::Options().search_program) {
+            LOG_INFO(Frontend, "[ShaderScan] 'Search the game's program' is off, so its modules "
+                               "aren't searched");
+            return;
+        }
+        std::string note;
+        const auto modules = module_reader(note);
+        std::vector<std::string> read;
+        for (const auto& [module, data] : modules) {
+            if (Stopped()) {
+                break;
+            }
+            const size_t headers_before = code_headers;
+            const size_t taken_before = extracted.size();
+            bytes_scanned += data.size();
+            SearchShaders(data, "exefs/" + module, 0);
+            read.push_back(fmt::format("{} {} KiB ({} NVN code headers, {} new shaders)", module,
+                                       data.size() >> 10, code_headers - headers_before,
+                                       extracted.size() - taken_before));
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] game program modules searched (read-only data and data): {}{}",
+                 read.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(read, ", ")),
+                 note.empty() ? "" : fmt::format("; not read: {}", note));
+    }
+
     /// The engines the game's file names point to, from LogGameEngines.
     void SetEngines(std::vector<std::string_view> engines_) {
         engines = std::move(engines_);
@@ -2919,6 +2958,7 @@ private:
     std::string executable_note;
     std::vector<Preforged::UnrealPak::Key> known_keys;
     std::vector<std::string_view> engines;
+    ModuleReader module_reader;
     struct UnityTotals {
         size_t bundles = 0;
         size_t bundles_failed = 0;
@@ -2943,53 +2983,58 @@ private:
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
-/// Reads the read-only data and data of the game's main executable, with an update's in place
-/// of the base game's, for the AES key of Unreal Engine 4 pak files. `note` says what was read,
-/// or why nothing was.
-std::vector<u8> ReadExecutableData(Core::System& system, u64 program_id, std::string& note) {
+/// Opens the game's ExeFS, with an update's in place of the base game's. `note` says why
+/// nothing was opened.
+FileSys::VirtualDir OpenExeFS(Core::System& system, u64 program_id, std::string& note) {
     const auto nca =
         system.GetContentProvider().GetEntry(program_id, FileSys::ContentRecordType::Program);
     if (!nca) {
         note = "the game's program content was not found";
-        return {};
+        return nullptr;
     }
     FileSys::VirtualDir exefs = nca->GetExeFS();
     if (!exefs) {
         note = "the game's program has no ExeFS";
-        return {};
+        return nullptr;
     }
     const FileSys::PatchManager patch{program_id, system.GetFileSystemController(),
                                       system.GetContentProvider()};
     exefs = patch.PatchExeFS(exefs);
-    const FileSys::VirtualFile main = exefs ? exefs->GetFile("main") : nullptr;
-    if (!main) {
-        note = "the ExeFS has no main";
-        return {};
+    if (!exefs) {
+        note = "the patched ExeFS could not be opened";
     }
-    const std::vector<u8> nso = main->ReadAllBytes();
+    return exefs;
+}
+
+/// Reads the read-only data and data of one NSO module (main, subsdk0, sdk, ...), unpacked.
+/// The code segment is left out: it holds no shaders or keys in one piece. `note` says what
+/// was read, or why nothing was.
+std::vector<u8> ReadModuleData(const FileSys::VirtualFile& file, std::string& note) {
+    const std::string name = file->GetName();
+    const std::vector<u8> nso = file->ReadAllBytes();
     Loader::NSOHeader header;
     if (nso.size() < sizeof(header)) {
-        note = "main is too short";
+        note = fmt::format("{} is too short", name);
         return {};
     }
     std::memcpy(&header, nso.data(), sizeof(header));
     if (header.magic != Common::MakeMagic('N', 'S', 'O', '0')) {
-        note = "main is not an NSO";
+        note = fmt::format("{} is not an NSO", name);
         return {};
     }
     if (header.IsZBICCompressed()) {
-        note = "main is packed with ZBIC, which isn't read here";
+        note = fmt::format("{} is packed with ZBIC, which isn't read here", name);
         return {};
     }
     std::vector<u8> out;
     std::array<size_t, 3> sizes{};
-    // Segments 1 and 2: read-only data and data. The code holds no key bytes in one piece.
+    // Segments 1 and 2: read-only data and data.
     for (size_t segment = 1; segment < 3; ++segment) {
         const auto& info = header.segments[segment];
         const bool packed = header.IsSegmentCompressed(segment);
         const u64 stored = packed ? header.segments_compressed_size[segment] : info.size;
         if (info.offset > nso.size() || stored > nso.size() - info.offset) {
-            note = fmt::format("segment {} of main lies past its end", segment);
+            note = fmt::format("segment {} of {} lies past its end", segment, name);
             return {};
         }
         const std::span<const u8> bytes{nso.data() + info.offset, static_cast<size_t>(stored)};
@@ -2997,7 +3042,7 @@ std::vector<u8> ReadExecutableData(Core::System& system, u64 program_id, std::st
             const std::vector<u8> unpacked =
                 Common::Compression::DecompressDataLZ4(bytes, info.size);
             if (unpacked.size() != info.size) {
-                note = fmt::format("segment {} of main did not unpack", segment);
+                note = fmt::format("segment {} of {} did not unpack", segment, name);
                 return {};
             }
             out.insert(out.end(), unpacked.begin(), unpacked.end());
@@ -3006,9 +3051,53 @@ std::vector<u8> ReadExecutableData(Core::System& system, u64 program_id, std::st
         }
         sizes[segment] = info.size;
     }
-    note = fmt::format("main: {} KiB of read-only data, {} KiB of data", sizes[1] >> 10,
+    note = fmt::format("{}: {} KiB of read-only data, {} KiB of data", name, sizes[1] >> 10,
                        sizes[2] >> 10);
     return out;
+}
+
+/// Reads the read-only data and data of the game's main executable, with an update's in place
+/// of the base game's, for the AES key of Unreal Engine 4 pak files. `note` says what was read,
+/// or why nothing was.
+std::vector<u8> ReadExecutableData(Core::System& system, u64 program_id, std::string& note) {
+    const FileSys::VirtualDir exefs = OpenExeFS(system, program_id, note);
+    const FileSys::VirtualFile main = exefs ? exefs->GetFile("main") : nullptr;
+    if (!main) {
+        if (exefs) {
+            note = "the ExeFS has no main";
+        }
+        return {};
+    }
+    return ReadModuleData(main, note);
+}
+
+/// Reads the read-only data and data of every module of the game's program: main, the
+/// subsdk modules and sdk. Small engines and ports keep their few shaders built into them.
+std::vector<std::pair<std::string, std::vector<u8>>> ReadProgramModules(Core::System& system,
+                                                                        u64 program_id,
+                                                                        std::string& note) {
+    std::vector<std::pair<std::string, std::vector<u8>>> modules;
+    const FileSys::VirtualDir exefs = OpenExeFS(system, program_id, note);
+    if (!exefs) {
+        return modules;
+    }
+    std::vector<std::string> notes;
+    for (const auto& file : exefs->GetFiles()) {
+        const std::string name = file->GetName();
+        // rtld is the system's loader; main.npdm is the program's description, not code.
+        if (name == "rtld" || name.find('.') != std::string::npos) {
+            continue;
+        }
+        std::string module_note;
+        std::vector<u8> data = ReadModuleData(file, module_note);
+        if (data.empty()) {
+            notes.push_back(module_note);
+            continue;
+        }
+        modules.emplace_back(name, std::move(data));
+    }
+    note = fmt::format("{}", fmt::join(notes, ", "));
+    return modules;
 }
 
 /// Lists every file the game sees with its size, sorted by path, one per line. An update or a
@@ -3340,9 +3429,13 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
         return ReadExecutableData(system, program_id, note);
     });
     scanner.SetEngines(std::move(engines));
+    scanner.SetModuleReader([&system, program_id](std::string& note) {
+        return ReadProgramModules(system, program_id, note);
+    });
     scanner.SetProgress(&progress, std::max<size_t>(Scanner::CountFiles(root, "") + 1, 2));
     scanner.ReportProgress(true);
     scanner.FindZstdDictionaries(root);
+    scanner.ScanModules();
     scanner.ScanDir(root, "", true);
     scanner.Report("shader-named files");
     scanner.StudyUnrealLinks(graphics_keys);

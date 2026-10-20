@@ -388,6 +388,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_SEARCH_PROGRAM,
+                    titleId = R.string.preforged_search_program,
+                    descriptionId = R.string.preforged_search_program_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.PREFORGED_READ_UNITY_FILES,
                     titleId = R.string.preforged_read_unity_files,
                     descriptionId = R.string.preforged_read_unity_files_description

@@ -25,6 +25,8 @@ struct DebugOptions {
     bool unpack_oodle = true;
     /// Reads the bundles and Shader objects of Unity games during the game file search.
     bool read_unity_files = true;
+    /// Searches the read-only data and data of the game's program modules for shaders too.
+    bool search_program = true;
     /// Finds the zstd dictionaries in the game files and unpacks the files packed with them.
     bool zstd_dictionaries = true;
     /// Logs how an Unreal game's packages refer to their shader code, during the search.
