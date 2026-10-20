@@ -67,6 +67,13 @@ struct DebugOptions {
     /// While the GPU still has earlier work to finish, adds the GPU work of a finished command
     /// list or draw batch to the next submit instead of submitting it on its own.
     bool merge_gpu_work = true;
+    /// Compiles each shader on its own as a pipeline library while the game loads, and joins a
+    /// pipeline the game needs in play from the libraries of its shaders instead of compiling it.
+    /// Read when the GPU device is made, so it takes effect at the next game start.
+    bool pipeline_libraries = true;
+    /// After joining a pipeline from libraries, compiles the full pipeline on a background thread
+    /// and switches to it, since a joined pipeline can run a little slower on the GPU.
+    bool optimize_joined = true;
 };
 
 /// How many queue submits the GPU may have left to finish before the next one waits for it.

@@ -1244,6 +1244,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
         SetNext(next, properties.descriptor_buffer);
     }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
+    }
     if (extensions.subgroup_size_control || features.subgroup_size_control.subgroupSizeControl) {
         properties.subgroup_size_control.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
@@ -1382,6 +1387,28 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer;
     RemoveExtensionFeatureIfUnsuitable(extensions.descriptor_buffer, features.descriptor_buffer,
                                        VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library, for joining pipelines from shaders compiled on their own.
+    // Only loaded with the setting on, so the device stays as it was with it off.
+    const bool pipeline_library_setting{Settings::values.preforged_pipeline_libraries.GetValue()};
+    extensions.graphics_pipeline_library =
+        features.graphics_pipeline_library.graphicsPipelineLibrary && extensions.pipeline_library &&
+        pipeline_library_setting;
+    LOG_INFO(
+        Render_Vulkan,
+        "[Preforged] pipeline libraries: extension {}, feature {}, VK_KHR_pipeline_library {}, "
+        "setting {}",
+        supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME),
+        features.graphics_pipeline_library.graphicsPipelineLibrary != VK_FALSE,
+        extensions.pipeline_library, pipeline_library_setting);
+    RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
+                                       features.graphics_pipeline_library,
+                                       VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    if (!extensions.graphics_pipeline_library) {
+        RemoveExtensionIfUnsuitable(extensions.graphics_pipeline_library,
+                                    VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        extensions.pipeline_library = false;
+    }
 
     // VK_EXT_extended_dynamic_state
     extensions.extended_dynamic_state = features.extended_dynamic_state.extendedDynamicState;

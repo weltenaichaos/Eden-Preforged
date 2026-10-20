@@ -214,6 +214,8 @@ public:
     const Profile& profile;
     const RuntimeInfo& runtime_info;
     Stage stage{};
+    /// The descriptor set every resource of the shader is decorated with.
+    u32 descriptor_set{};
 
     Id void_id{};
     Id U1{};

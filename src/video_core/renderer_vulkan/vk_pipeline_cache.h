@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
 
@@ -234,7 +235,7 @@ private:
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache = {},
-        PreforgedCode* code_out = nullptr);
+        PreforgedCode* code_out = nullptr, bool store_libraries = false);
 
     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                            const ShaderInfo* shader);
@@ -273,6 +274,21 @@ private:
     GraphicsPipeline* current_pipeline{};
 
     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
+    /// Pipeline libraries of single shaders, which pipelines the game needs in play are joined
+    /// from. Declared before the pipelines, so it goes after them.
+    PipelineLibraries pipeline_libraries;
+    bool use_pipeline_libraries{};
+    /// Pipelines the game needed in play that were joined from libraries, that didn't need
+    /// them because the driver had their code, and that couldn't be joined, by reason.
+    std::atomic<size_t> library_joins{};
+    std::atomic<size_t> library_not_needed{};
+    std::array<std::atomic<size_t>, 5> library_fallbacks{};
+    /// The SPIR-V of every pipeline compiled this session, in the driver pipeline cache. A
+    /// pipeline with the same SPIR-V and another state gets the shaders from there and needs no
+    /// libraries.
+    std::mutex built_codes_mutex;
+    std::unordered_set<u64> built_codes;
+
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;
@@ -290,6 +306,9 @@ private:
     std::atomic_bool flush_in_flight{};
 
     Common::ThreadWorker workers;
+    /// Compiles the full pipeline of each joined pipeline, one at a time in the background.
+    /// Declared after the pipelines, so it stops before they go.
+    Common::ThreadWorker full_worker;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 

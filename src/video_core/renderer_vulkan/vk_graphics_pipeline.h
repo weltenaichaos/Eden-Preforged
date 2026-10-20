@@ -67,26 +67,60 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 namespace Vulkan {
 
 class Device;
+class PipelineLibraries;
+struct PipelineLibrary;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
 
+/// Which half of a graphics pipeline a pipeline library holds: the front has the vertex input
+/// and the stages before the fragment shader, the back has the fragment shader and its output.
+enum class LibraryHalf : u8 {
+    Front,
+    Back,
+};
+
+/// What a pipeline joined from libraries needs from the pipeline cache.
+struct GraphicsPipelineLibraryInfo {
+    /// Hands out the libraries of both halves, compiling the ones nobody has yet.
+    PipelineLibraries* libraries{};
+    /// Hashes of the SPIR-V of the front stages and of the fragment shader, which name the
+    /// libraries.
+    u64 front_code{};
+    u64 back_code{};
+    /// Compiles the full pipeline after joining, or nullptr to keep the joined one.
+    Common::ThreadWorker* full_worker{};
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
 public:
+    /// Starts the count of the pipelines a game needs in play anew, for a new game.
+    static void ResetPlayTally();
+
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
         vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
-        GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
-        PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-        const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+        GuestDescriptorQueue& guest_descriptor_queue, DescriptorBufferRing& descriptor_buffer_ring,
+        Common::ThreadWorker* worker_thread, PipelineStatistics* pipeline_statistics,
+        RenderPassCache& render_pass_cache, const GraphicsPipelineCacheKey& key,
+        std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::shared_ptr<vk::PipelineCache> build_cache = {});
+        std::shared_ptr<vk::PipelineCache> build_cache = {},
+        const GraphicsPipelineLibraryInfo* library_info = nullptr);
+
+    /// Compiles one half of the pipeline of `key` as a pipeline library, for the game file
+    /// shaders compiled while the game loads. `modules` and `infos` are those of a pipeline
+    /// joined from libraries, where the fragment shader is on set 1.
+    [[nodiscard]] static PipelineLibrary CreateLibrary(
+        const Device& device, RenderPassCache& render_pass_cache,
+        const GraphicsPipelineCacheKey& key, LibraryHalf half,
+        const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+        const std::array<const Shader::Info*, NUM_STAGES>& infos, VkPipelineCache cache);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     bool SupportsAlphaToCoverage() const noexcept {
@@ -125,6 +159,11 @@ public:
         return is_built.load(std::memory_order::relaxed);
     }
 
+    /// Whether the pipeline was joined from libraries.
+    [[nodiscard]] bool UsesLibraries() const noexcept {
+        return uses_libraries;
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -143,6 +182,14 @@ private:
                        const RenderAreaPushConstant& render_are);
 
     void MakePipeline(VkRenderPass render_pass);
+
+    /// Joins the pipeline from the libraries of its two halves. Returns false when the driver
+    /// failed to.
+    bool JoinPipeline(VkRenderPass render_pass, const GraphicsPipelineLibraryInfo& library_info);
+
+    /// Compiles the full pipeline of one joined from libraries, from the same shaders and with
+    /// the same layout.
+    [[nodiscard]] vk::Pipeline CompileFullPipeline(VkRenderPass render_pass);
 
     void Validate();
 
@@ -180,6 +227,19 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    /// The pipeline draws bind: the joined or compiled one, then the full one compiled after
+    /// joining.
+    std::atomic<VkPipeline> bound_pipeline{VK_NULL_HANDLE};
+
+    /// For a pipeline joined from libraries: descriptor_set_layout and its allocator and
+    /// template are set 0, for the stages before the fragment shader, and these are set 1, for
+    /// the fragment shader.
+    bool uses_libraries{false};
+    vk::DescriptorSetLayout back_set_layout;
+    DescriptorAllocator back_descriptor_allocator;
+    vk::DescriptorUpdateTemplate back_update_template;
+    /// The full pipeline compiled after joining.
+    vk::Pipeline full_pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;

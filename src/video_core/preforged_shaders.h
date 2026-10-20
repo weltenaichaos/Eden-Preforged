@@ -57,6 +57,10 @@ struct PreforgedPrograms {
     /// The other shaders taken from the game files, which are in no pair, by hash only. They let
     /// the play log tell a game file shader no pair has from a shader the game files don't have.
     std::vector<u64> other_shaders;
+    /// The code of the vertex and fragment shaders among the other shaders, so each can be
+    /// compiled on its own as a pipeline library. Missing in files from searches before
+    /// version 16.
+    std::unordered_map<u64, PreforgedShader> unpaired_shaders;
 };
 
 [[nodiscard]] bool WritePreforgedPrograms(const std::filesystem::path& path,

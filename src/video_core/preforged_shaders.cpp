@@ -24,6 +24,28 @@ template <typename T>
 bool Read(std::ifstream& file, T& value) {
     return static_cast<bool>(file.read(reinterpret_cast<char*>(&value), sizeof(value)));
 }
+
+void WriteShader(std::ofstream& file, u64 hash, const PreforgedShader& shader) {
+    Write(file, hash);
+    Write(file, static_cast<u32>(shader.stage));
+    Write(file, shader.start_address);
+    Write(file, static_cast<u32>(shader.code.size()));
+    file.write(reinterpret_cast<const char*>(shader.code.data()), shader.code.size() * sizeof(u64));
+}
+
+bool ReadShader(std::ifstream& file, u64& hash, PreforgedShader& shader) {
+    u32 stage{};
+    u32 word_count{};
+    if (!Read(file, hash) || !Read(file, stage) || !Read(file, shader.start_address) ||
+        !Read(file, word_count) || word_count > MAX_SHADER_WORDS ||
+        stage > static_cast<u32>(Shader::Stage::VertexA)) {
+        return false;
+    }
+    shader.stage = static_cast<Shader::Stage>(stage);
+    shader.code.resize(word_count);
+    return static_cast<bool>(
+        file.read(reinterpret_cast<char*>(shader.code.data()), word_count * sizeof(u64)));
+}
 } // Anonymous namespace
 
 PreforgedEnvironment::PreforgedEnvironment(std::span<const u64> code_, Shader::Stage stage_,
@@ -103,12 +125,7 @@ bool WritePreforgedPrograms(const std::filesystem::path& path,
     Write(file, static_cast<u32>(programs.shaders.size()));
     Write(file, static_cast<u32>(programs.pairs.size()));
     for (const auto& [hash, shader] : programs.shaders) {
-        Write(file, hash);
-        Write(file, static_cast<u32>(shader.stage));
-        Write(file, shader.start_address);
-        Write(file, static_cast<u32>(shader.code.size()));
-        file.write(reinterpret_cast<const char*>(shader.code.data()),
-                   shader.code.size() * sizeof(u64));
+        WriteShader(file, hash, shader);
     }
     for (const auto& [vertex, fragment] : programs.pairs) {
         Write(file, vertex);
@@ -118,6 +135,11 @@ bool WritePreforgedPrograms(const std::filesystem::path& path,
     Write(file, static_cast<u32>(programs.other_shaders.size()));
     file.write(reinterpret_cast<const char*>(programs.other_shaders.data()),
                programs.other_shaders.size() * sizeof(u64));
+    // After the other shaders' hashes, so builds that don't read it still read the rest.
+    Write(file, static_cast<u32>(programs.unpaired_shaders.size()));
+    for (const auto& [hash, shader] : programs.unpaired_shaders) {
+        WriteShader(file, hash, shader);
+    }
     return static_cast<bool>(file);
 }
 
@@ -138,17 +160,8 @@ std::optional<PreforgedPrograms> ReadPreforgedPrograms(const std::filesystem::pa
     }
     for (u32 index = 0; index < shader_count; ++index) {
         u64 hash{};
-        u32 stage{};
-        u32 word_count{};
         PreforgedShader shader{};
-        if (!Read(file, hash) || !Read(file, stage) || !Read(file, shader.start_address) ||
-            !Read(file, word_count) || word_count > MAX_SHADER_WORDS ||
-            stage > static_cast<u32>(Shader::Stage::VertexA)) {
-            return std::nullopt;
-        }
-        shader.stage = static_cast<Shader::Stage>(stage);
-        shader.code.resize(word_count);
-        if (!file.read(reinterpret_cast<char*>(shader.code.data()), word_count * sizeof(u64))) {
+        if (!ReadShader(file, hash, shader)) {
             return std::nullopt;
         }
         programs.shaders.emplace(hash, std::move(shader));
@@ -166,6 +179,19 @@ std::optional<PreforgedPrograms> ReadPreforgedPrograms(const std::filesystem::pa
         if (!file.read(reinterpret_cast<char*>(programs.other_shaders.data()),
                        other_count * sizeof(u64))) {
             programs.other_shaders.clear();
+        }
+    }
+    // Files from searches before version 16 end here.
+    u32 unpaired_count{};
+    if (Read(file, unpaired_count) && unpaired_count <= MAX_OTHER_SHADERS) {
+        for (u32 index = 0; index < unpaired_count; ++index) {
+            u64 hash{};
+            PreforgedShader shader{};
+            if (!ReadShader(file, hash, shader)) {
+                // A cut off file keeps the shaders read whole.
+                break;
+            }
+            programs.unpaired_shaders.emplace(hash, std::move(shader));
         }
     }
     return programs;

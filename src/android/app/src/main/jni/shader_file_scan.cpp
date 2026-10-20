@@ -80,8 +80,9 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // link log. 12: Unreal shader pairs learned from the played ones, in the code package and in
 // the other packages. 13: Unreal shader caches read for the pairs. 14: up to 30,000 pairs
 // kept from a shader cache. 15: every shader taken from the game files kept by hash, so the
-// play log tells a missed pair from a shader the game files don't have.
-constexpr u32 SEARCH_VERSION = 15;
+// play log tells a missed pair from a shader the game files don't have. 16: the code of vertex
+// and fragment shaders in no pair kept too, for pipeline libraries.
+constexpr u32 SEARCH_VERSION = 16;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
@@ -1600,17 +1601,28 @@ public:
             }
             programs.pairs.emplace_back(vertex, fragment);
         }
+        size_t unpaired_bytes = 0;
         for (const auto& [hash, shader] : extracted) {
-            if (!programs.shaders.contains(hash)) {
-                programs.other_shaders.push_back(hash);
+            if (programs.shaders.contains(hash)) {
+                continue;
+            }
+            programs.other_shaders.push_back(hash);
+            // Vertex and fragment shaders in no pair are compiled on their own as pipeline
+            // libraries, so a pair the game makes in play is joined instead of compiled.
+            if (shader.stage == Shader::Stage::VertexB || shader.stage == Shader::Stage::Fragment) {
+                programs.unpaired_shaders.try_emplace(
+                    hash,
+                    VideoCommon::PreforgedShader{shader.stage, shader.start_address, shader.code});
+                unpaired_bytes += shader.code.size() * sizeof(u64);
             }
         }
         const bool written = VideoCommon::WritePreforgedPrograms(path, programs);
         LOG_INFO(Frontend,
                  "[ShaderScan] saved {} shader pairs with {} shaders, and the hashes of the {} "
-                 "other shaders taken from the game files: {}",
+                 "other shaders taken from the game files, with the code of the {} vertex and "
+                 "fragment shaders among them ({} KiB): {}",
                  programs.pairs.size(), programs.shaders.size(), programs.other_shaders.size(),
-                 written ? "ok" : "failed");
+                 programs.unpaired_shaders.size(), unpaired_bytes >> 10, written ? "ok" : "failed");
     }
 
     bool Stopped() const {
@@ -2193,6 +2205,142 @@ void ListGameFiles(const FileSys::VirtualDir& dir, const std::string& path, std:
     }
 }
 
+/// How far the search gets with an engine's shaders.
+enum class EngineSupport {
+    /// The search unpacks the engine's shader files and pairs their shaders.
+    Read,
+    /// The shaders are in archives the search doesn't unpack yet, so it only finds the ones
+    /// stored unpacked.
+    Packed,
+    /// The engine ships shader source and compiles it while the game runs, so the game files
+    /// hold no compiled shaders to find.
+    Source,
+};
+
+/// A game engine and the file names that give it away, from the engine survey in
+/// notes/engine-survey.md. Matched against paths in lower case.
+struct EngineRule {
+    std::string_view name;
+    EngineSupport support;
+    /// Each matches a path that contains it.
+    std::array<std::string_view, 4> markers;
+};
+
+constexpr std::array ENGINE_RULES{
+    EngineRule{"Unity",
+               EngineSupport::Packed,
+               {"/data/managed/metadata/global-metadata.dat", "/data/globalgamemanagers",
+                "/data/sharedassets0.assets", "/data/data.unity3d"}},
+    EngineRule{"Unreal Engine 4 or 5",
+               EngineSupport::Packed,
+               {"/ue4commandline.txt", "/content/paks/", ".utoc ", ".ucas "}},
+    EngineRule{"Unreal Engine 3", EngineSupport::Read, {".upk ", ".xxx ", ".umap ", "/cookednx"}},
+    EngineRule{"Nintendo formats (BFRES, BFSHA, BNSH)",
+               EngineSupport::Read,
+               {".bfsha", ".bnsh", ".bfres", "/shaderdata/"}},
+    EngineRule{"RE Engine", EngineSupport::Packed, {"re_chunk_000.pak", "/natives/nsw/", "", ""}},
+    EngineRule{"MT Framework", EngineSupport::Packed, {"/nativenx/", "/nativeswitch/", "", ""}},
+    EngineRule{"Monolith Soft engine (Xenoblade)",
+               EngineSupport::Packed,
+               {"/monolib/shader/", ".wishp ", ".wismt ", ".ard "}},
+    EngineRule{"Game Freak engine (Pokemon)",
+               EngineSupport::Packed,
+               {"/data.trpfs ", ".gfpak ", ".trpak ", ""}},
+    EngineRule{"Smash Ultimate archive", EngineSupport::Packed, {"/data.arc ", "", "", ""}},
+    EngineRule{"CryEngine",
+               EngineSupport::Packed,
+               {"/shadercache.pak ", "/shadercachestartup.pak ", "/shaders/shaderlist.txt", ""}},
+    EngineRule{"UbiArt Framework", EngineSupport::Packed, {".ipk ", "", "", ""}},
+    EngineRule{"Creation Engine", EngineSupport::Packed, {".bsa ", "", "", ""}},
+    EngineRule{"Source engine", EngineSupport::Packed, {".vpk ", "", "", ""}},
+    EngineRule{"PhyreEngine", EngineSupport::Packed, {".phyre ", "", "", ""}},
+    EngineRule{"GameMaker", EngineSupport::Source, {"/game.win ", "/data.win ", "", ""}},
+    EngineRule{"MonoGame or FNA", EngineSupport::Source, {".xnb ", "", "", ""}},
+    EngineRule{"Heaps (HashLink)", EngineSupport::Source, {"/res/shaders.cache", "", "", ""}},
+    EngineRule{"RPG Maker MV or MZ",
+               EngineSupport::Source,
+               {"/js/rpg_core.js ", "/js/rmmz_core.js ", "/js/rpg_managers.js ", ""}},
+};
+
+/// Logs which engines the game's file names point to and how far the search gets with each,
+/// so a log tells why a game's shaders were or weren't found.
+void LogGameEngines(std::string_view file_list) {
+    struct Match {
+        size_t files = 0;
+        std::vector<std::string> examples;
+    };
+    std::array<Match, ENGINE_RULES.size()> matches{};
+    std::string line;
+    size_t begin = 0;
+    while (begin < file_list.size()) {
+        size_t end = file_list.find('\n', begin);
+        if (end == std::string_view::npos) {
+            end = file_list.size();
+        }
+        // Each line is the path, a space and the size.
+        line.assign(file_list.substr(begin, end - begin));
+        begin = end + 1;
+        const size_t name_end = line.rfind(' ');
+        if (name_end == std::string::npos) {
+            continue;
+        }
+        line.resize(name_end);
+        std::transform(line.begin(), line.end(), line.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::string_view path = line;
+        for (size_t rule = 0; rule < ENGINE_RULES.size(); ++rule) {
+            for (const std::string_view marker : ENGINE_RULES[rule].markers) {
+                if (marker.empty()) {
+                    continue;
+                }
+                // A marker ending in a space matches the end of the path, so ".pak " only
+                // matches a name ending in .pak.
+                const bool hit = marker.back() == ' '
+                                     ? path.ends_with(marker.substr(0, marker.size() - 1))
+                                     : path.find(marker) != std::string_view::npos;
+                if (!hit) {
+                    continue;
+                }
+                Match& match = matches[rule];
+                ++match.files;
+                if (match.examples.size() < 2) {
+                    match.examples.emplace_back(path);
+                }
+                break;
+            }
+        }
+    }
+    std::vector<std::string> found;
+    for (size_t rule = 0; rule < ENGINE_RULES.size(); ++rule) {
+        const Match& match = matches[rule];
+        if (match.files == 0) {
+            continue;
+        }
+        const char* const support = [&] {
+            switch (ENGINE_RULES[rule].support) {
+            case EngineSupport::Read:
+                return "the search unpacks its shader files";
+            case EngineSupport::Packed:
+                return "its archives aren't unpacked yet, so only shaders stored unpacked are "
+                       "found";
+            case EngineSupport::Source:
+                return "it compiles shader source while the game runs, so the files hold no "
+                       "compiled shaders";
+            }
+            return "";
+        }();
+        found.push_back(fmt::format("{} ({} files, such as {}; {})", ENGINE_RULES[rule].name,
+                                    match.files, fmt::join(match.examples, ", "), support));
+    }
+    if (found.empty()) {
+        LOG_INFO(Frontend,
+                 "[ShaderScan] game engine: not recognized from the file names; the search looks "
+                 "for shaders stored unpacked in every file");
+        return;
+    }
+    LOG_INFO(Frontend, "[ShaderScan] game engine from the file names: {}", fmt::join(found, "; "));
+}
+
 /// What the last search of a game left in its shader folder.
 struct SearchMarker {
     std::string files_id; ///< Id of the game file list it searched
@@ -2290,6 +2438,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - start_time)
                  .count());
+    LogGameEngines(file_list);
     if (const auto last = ReadSearchMarker(shader_dir)) {
         if (options.rescan_game_files) {
             LOG_INFO(Frontend,

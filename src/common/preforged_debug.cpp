@@ -67,6 +67,8 @@ void LoadOptions() {
     options.zstd_dictionaries = Settings::values.preforged_zstd_dictionaries.GetValue();
     options.log_unreal_links = Settings::values.preforged_log_unreal_links.GetValue();
     options.unreal_learned_pairs = Settings::values.preforged_unreal_learned_pairs.GetValue();
+    options.pipeline_libraries = Settings::values.preforged_pipeline_libraries.GetValue();
+    options.optimize_joined = Settings::values.preforged_optimize_joined.GetValue();
     FrameStats::SetEnabled(options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
@@ -93,6 +95,10 @@ void LoadOptions() {
              options.limit_gpu_lag, MaxGpuLag, options.merge_gpu_work, MergeGpuLag,
              options.unpack_unreal_packages, options.unpack_oodle, options.zstd_dictionaries,
              options.log_unreal_links, options.unreal_learned_pairs);
+    LOG_INFO(Common,
+             "[Preforged] join pipelines from shader libraries {}, compile joined pipelines in "
+             "full afterwards {}",
+             options.pipeline_libraries, options.optimize_joined);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {

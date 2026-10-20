@@ -326,6 +326,103 @@ size_t GetTotalPipelineWorkers() {
 #endif
 }
 
+/// Why a pipeline can't be joined from pipeline libraries, and is compiled in full instead.
+enum class LibraryFallback : u8 {
+    NoFragmentShader,
+    LegacyAttributes,
+    UnwrittenInput,
+    TooManyImages,
+    TranslateFailed,
+};
+constexpr std::array<std::string_view, 5> LIBRARY_FALLBACK_NAMES{
+    "no fragment shader",
+    "the fragment shader reads legacy attributes",
+    "the fragment shader reads an output the vertex half doesn't write",
+    "too many textures or images for the rescaling bits",
+    "the fragment shader failed to translate for its library",
+};
+
+/// Folds the hash of one stage's SPIR-V into the hash of the stages before it.
+u64 FoldCodeHash(u64 previous, std::span<const u32> code) {
+    return (previous * 0x9E3779B97F4A7C15ULL) ^
+           Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size_bytes());
+}
+
+/// Whether the textures and images of a half fit the rescaling bits it gets in a pipeline joined
+/// from libraries: bits 0 to 63 and 0 to 31 for the stages before the fragment shader, the bits
+/// after those for the fragment shader.
+bool FitsLibraryScaling(std::span<const Shader::Info* const> infos, LibraryHalf half) {
+    size_t textures{};
+    size_t images{};
+    const size_t begin{half == LibraryHalf::Front ? 0U : infos.size() - 1};
+    const size_t end{half == LibraryHalf::Front ? infos.size() - 1 : infos.size()};
+    for (size_t stage = begin; stage < end; ++stage) {
+        if (infos[stage]) {
+            textures += infos[stage]->texture_descriptors.size();
+            images += infos[stage]->image_descriptors.size();
+        }
+    }
+    if (half == LibraryHalf::Front) {
+        return textures <= LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX &&
+               images <= LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX;
+    }
+    return textures <= Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS * 32 -
+                           LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX &&
+           images <= Shader::Backend::SPIRV::NUM_IMAGE_SCALING_WORDS * 32 -
+                         LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX;
+}
+
+/// Translates a fragment shader for the library of a joined pipeline: its resources in
+/// descriptor set 1 from binding 0, its rescaling bits after the other half's, and an input for
+/// every generic it reads, since the library doesn't know the stage before it. `front_stores`
+/// is what that stage writes, when it is known, so a fragment shader reading more is caught.
+std::optional<LibraryFallback> TranslateLibraryFragment(
+    ShaderPools& pools, Shader::Environment& env, const Shader::HostTranslateInfo& host_info,
+    const Shader::Profile& profile, std::span<const Shader::IR::Program> programs,
+    const GraphicsPipelineCacheKey& key, const Device& device,
+    const Shader::VaryingState* front_stores, Shader::IR::Program& program,
+    std::vector<u32>& code) try {
+    const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+    program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    if (program.info.loads.Legacy()) {
+        // Legacy attributes are matched to the generics the stage before left free.
+        return LibraryFallback::LegacyAttributes;
+    }
+    if (front_stores) {
+        for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+            if (program.info.loads.Generic(index) && !front_stores->Generic(index)) {
+                return LibraryFallback::UnwrittenInput;
+            }
+        }
+    }
+    const std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{nullptr, nullptr, nullptr,
+                                                                         nullptr, &program.info};
+    if (!FitsLibraryScaling(infos, LibraryHalf::Back)) {
+        return LibraryFallback::TooManyImages;
+    }
+    const Shader::RuntimeInfo runtime_info{
+        MakeRuntimeInfo(programs, key, program, nullptr, device)};
+    ConvertLegacyToGeneric(program, runtime_info);
+    Shader::Backend::Bindings bindings{};
+    bindings.texture_scaling_index = LIBRARY_FRAGMENT_TEXTURE_SCALING_INDEX;
+    bindings.image_scaling_index = LIBRARY_FRAGMENT_IMAGE_SCALING_INDEX;
+    bindings.descriptor_set = 1;
+    code = EmitSPIRV(profile, runtime_info, program, bindings);
+    return std::nullopt;
+} catch (const Shader::Exception& exception) {
+    LOG_DEBUG(Render_Vulkan, "[Preforged] fragment shader for a library failed: {}",
+              exception.what());
+    return LibraryFallback::TranslateFailed;
+}
+
+/// Names a library compiled from a shader of the game files with a state, so later boots skip
+/// it without translating it again.
+u64 LibrarySource(LibraryHalf half, u64 shader, u64 state_hash) {
+    const std::array<u64, 3> words{static_cast<u64>(half) + 1, shader, state_hash};
+    return Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words));
+}
+
 } // Anonymous namespace
 
 size_t ComputePipelineCacheKey::Hash() const noexcept {
@@ -355,15 +452,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
     : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_},
-      render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
-      texture_cache{texture_cache_}, shader_notify{shader_notify_},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, render_pass_cache{render_pass_cache_},
+      buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
+      pipeline_libraries{device_}, use_pipeline_libraries{device_.CanJoinPipelineLibraries()},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
-      serialization_thread(1, "VkPipelineSerialization", {},
-                           Common::ThreadPlacement::Background) {
+      full_worker(1, "VkPipelineFull", {}, Common::ThreadPlacement::Background),
+      serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background) {
+    GraphicsPipeline::ResetPlayTally();
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -503,6 +601,19 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     LOG_INFO(Render_Vulkan, "[ShaderTiming] VK_EXT_graphics_pipeline_library available: {}",
              device.GetAvailableExtensions().contains(
                  VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME));
+    {
+        const auto& library_properties{device.GraphicsPipelineLibraryProperties()};
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] joining pipelines from shader libraries: {} (fast linking {}, "
+                 "interpolation decorations only in the fragment shader {}, setting {}); "
+                 "compiling joined pipelines in full afterwards: {}",
+                 use_pipeline_libraries ? "on" : "off",
+                 library_properties.graphicsPipelineLibraryFastLinking != VK_FALSE,
+                 library_properties.graphicsPipelineLibraryIndependentInterpolationDecoration !=
+                     VK_FALSE,
+                 Common::Preforged::Options().pipeline_libraries,
+                 use_pipeline_libraries && Common::Preforged::Options().optimize_joined);
+    }
 
     dynamic_features = {};
     dynamic_features.driver_id = device.GetDriverID();
@@ -622,6 +733,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     pipeline_cache_filename = base_dir / "vulkan.bin";
 
     OpenPreforgedStore(base_dir);
+    if (use_pipeline_libraries) {
+        pipeline_libraries.OpenStore(base_dir);
+    }
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
         Common::Preforged::LogMemoryUse("before loading the driver pipeline cache");
@@ -719,8 +833,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 env_ptrs.push_back(&env);
             }
             PreforgedCode code;
+            // Also keeps the libraries of the pipeline's two halves, so the game can join its
+            // shaders with others in play.
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
-                                                 state.statistics.get(), false, {}, &code)};
+                                                 state.statistics.get(), false, {}, &code, true)};
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1541,14 +1657,6 @@ void PipelineCache::PrecompilePreforgedPairs(
         LOG_INFO(Render_Vulkan, "[Preforged] compiling switched off in the settings");
         return;
     }
-    if (todo.empty()) {
-        return;
-    }
-    {
-        std::scoped_lock lock{preforged_store_mutex};
-        preforged_store_out.open(preforged_store_path, std::ios::binary | std::ios::app);
-    }
-
     struct {
         std::mutex mutex;
         size_t built{};
@@ -1650,8 +1758,14 @@ void PipelineCache::PrecompilePreforgedPairs(
         return use;
     }};
 
+    if (!todo.empty()) {
+        std::scoped_lock lock{preforged_store_mutex};
+        preforged_store_out.open(preforged_store_path, std::ios::binary | std::ios::app);
+    }
     const auto start{std::chrono::steady_clock::now()};
-    callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, todo.size());
+    if (!todo.empty()) {
+        callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, todo.size());
+    }
     for (const Candidate& candidate : todo) {
         workers.QueueWork([this, candidate, programs_ptr, pair_id, per_shader_types, &votes,
                            &input_use_of, total = todo.size(), &state, &callback] {
@@ -1730,6 +1844,218 @@ void PipelineCache::PrecompilePreforgedPairs(
              "average per pair)",
              state.warmed.size(), seconds.count(), state.failed, state.slow,
              state.warmed.empty() ? 0.0 : state.total_ms / state.warmed.size());
+
+    // Pipeline libraries of every vertex and fragment shader from the game files, in a pair or
+    // not, so a pipeline the game needs in play that no compiled pair has is joined from the
+    // libraries of its two shaders instead of compiled.
+    if (use_pipeline_libraries && !stop_loading.stop_requested()) {
+        std::unordered_map<u64, const GraphicsPipelineCacheKey*> fragment_templates;
+        for (const GraphicsPipelineCacheKey& key : played_keys) {
+            if (key.unique_hashes[0] == 0 && key.unique_hashes[2] == 0 &&
+                key.unique_hashes[3] == 0 && key.unique_hashes[4] == 0) {
+                fragment_templates.try_emplace(key.unique_hashes[5], &key);
+            }
+        }
+        struct LibraryJob {
+            u64 hash;
+            const VideoCommon::PreforgedShader* shader;
+            LibraryHalf half;
+            GraphicsPipelineCacheKey key;
+            bool drawn_types;
+            u64 source;
+        };
+        // Shaders the game drew come first, since a new pipeline in play most often pairs a
+        // drawn shader with another.
+        std::array<std::vector<LibraryJob>, 2> library_candidates;
+        size_t library_stored{};
+        size_t vertex_shaders{};
+        size_t fragment_shaders{};
+        size_t unpaired_shaders{};
+        const auto add_library{
+            [&](u64 hash, const VideoCommon::PreforgedShader& shader, bool unpaired) {
+                LibraryHalf half{};
+                if (shader.stage == Shader::Stage::VertexB) {
+                    half = LibraryHalf::Front;
+                    ++vertex_shaders;
+                } else if (shader.stage == Shader::Stage::Fragment) {
+                    half = LibraryHalf::Back;
+                    ++fragment_shaders;
+                } else {
+                    return;
+                }
+                unpaired_shaders += unpaired ? 1 : 0;
+                const bool front{half == LibraryHalf::Front};
+                const auto& templates{front ? vertex_templates : fragment_templates};
+                const auto it{templates.find(hash)};
+                const bool drawn{it != templates.end()};
+                GraphicsPipelineCacheKey key{drawn ? *it->second : *common_template};
+                key.unique_hashes = {};
+                key.unique_hashes[front ? 1 : 5] = hash;
+                const bool drawn_types{front && per_shader_types && drawn};
+                if (front && !drawn_types) {
+                    guess_attributes(key);
+                }
+                const u64 source{LibrarySource(half, hash, ShaderStateHash(key))};
+                if (pipeline_libraries.HasSource(source)) {
+                    ++library_stored;
+                    return;
+                }
+                library_candidates[drawn ? 0 : 1].push_back(
+                    LibraryJob{hash, &shader, half, key, drawn_types, source});
+            }};
+        for (const auto& [hash, shader] : programs.shaders) {
+            add_library(hash, shader, false);
+        }
+        for (const auto& [hash, shader] : programs.unpaired_shaders) {
+            add_library(hash, shader, true);
+        }
+        const size_t library_count{library_candidates[0].size() + library_candidates[1].size()};
+        const size_t library_wanted{
+            ((library_stored + library_count) * Common::Preforged::Options().precompile_percent +
+             99) /
+            100};
+        std::vector<LibraryJob> library_todo;
+        for (const auto& rank : library_candidates) {
+            for (const LibraryJob& job : rank) {
+                if (library_stored + library_todo.size() >= library_wanted) {
+                    break;
+                }
+                library_todo.push_back(job);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] pipeline libraries: {} vertex and {} fragment shaders from the game "
+                 "files ({} of them in no pair{}), {} compiled on earlier boots, {} not compiled "
+                 "yet ({} drawn by the game), {} to compile now at {}%",
+                 vertex_shaders, fragment_shaders, unpaired_shaders,
+                 programs.unpaired_shaders.empty() && !programs.other_shaders.empty()
+                     ? "; the code of shaders in no pair is kept from search version 16 on"
+                     : "",
+                 library_stored, library_count, library_candidates[0].size(), library_todo.size(),
+                 Common::Preforged::Options().precompile_percent);
+
+        struct {
+            std::mutex mutex;
+            size_t done{};
+            size_t compiled{};
+            size_t failed{};
+            std::array<size_t, LIBRARY_FALLBACK_NAMES.size()> fallbacks{};
+            double total_ms{};
+            double longest_ms{};
+        } library_state;
+        const auto library_start{std::chrono::steady_clock::now()};
+        if (!library_todo.empty()) {
+            callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, library_todo.size());
+        }
+        for (const LibraryJob& job : library_todo) {
+            workers.QueueWork([this, job, programs_ptr, per_shader_types, &votes, &input_use_of,
+                               total = library_todo.size(), &library_state, &callback] {
+                const VideoCommon::PreforgedPrograms& shared{**programs_ptr};
+                GraphicsPipelineCacheKey key{job.key};
+                const bool front{job.half == LibraryHalf::Front};
+                // Attribute types for a vertex shader the game hasn't drawn, as for the pairs.
+                if (front && per_shader_types && key.state.dynamic_vertex_input) {
+                    const InputUse use{input_use_of(job.hash, *job.shader, shared.texture_bound,
+                                                    key, job.drawn_types)};
+                    if (!job.drawn_types) {
+                        ApplyInputUse(key, use, votes);
+                    }
+                }
+                VideoCommon::PreforgedEnvironment env{job.shader->code, job.shader->stage,
+                                                      job.shader->start_address,
+                                                      shared.texture_bound};
+                const auto job_start{std::chrono::steady_clock::now()};
+                std::optional<LibraryFallback> fallback;
+                bool compiled{};
+                try {
+                    ShaderPools pools;
+                    std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> stage_programs;
+                    std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+                    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+                    std::vector<u32> code;
+                    const size_t stage{front ? 0U : Maxwell::MaxShaderStage - 1};
+                    if (front) {
+                        // The vertex shader as a pipeline of only it and a fragment shader
+                        // translates it: in set 0 from binding 0, the stage first in line.
+                        Shader::IR::Program& program{stage_programs[1]};
+                        const u32 cfg_offset{
+                            static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+                        program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                        infos[stage] = &program.info;
+                        if (!FitsLibraryScaling(infos, LibraryHalf::Front)) {
+                            fallback = LibraryFallback::TooManyImages;
+                        } else {
+                            const Shader::RuntimeInfo runtime_info{
+                                MakeRuntimeInfo(stage_programs, key, program, nullptr, device)};
+                            ConvertLegacyToGeneric(program, runtime_info);
+                            Shader::Backend::Bindings bindings{};
+                            code = EmitSPIRV(profile, runtime_info, program, bindings);
+                        }
+                    } else {
+                        Shader::IR::Program& program{stage_programs[Maxwell::MaxShaderProgram - 1]};
+                        fallback =
+                            TranslateLibraryFragment(pools, env, host_info, profile, stage_programs,
+                                                     key, device, nullptr, program, code);
+                        infos[stage] = &program.info;
+                    }
+                    if (!fallback) {
+                        modules[stage] = BuildShader(device, code);
+                        compiled = pipeline_libraries.CompileIntoStore(
+                            job.half, FoldCodeHash(0, code), job.source,
+                            [&](VkPipelineCache cache) {
+                                return GraphicsPipeline::CreateLibrary(device, render_pass_cache,
+                                                                       key, job.half, modules,
+                                                                       infos, cache);
+                            });
+                    }
+                } catch (const std::exception& e) {
+                    LOG_DEBUG(Render_Vulkan, "[Preforged] library of {:016x} failed: {}", job.hash,
+                              e.what());
+                    fallback = LibraryFallback::TranslateFailed;
+                }
+                if (fallback || !compiled) {
+                    // Not tried again on later boots.
+                    pipeline_libraries.NoteSource(job.source);
+                }
+                const std::chrono::duration<double, std::milli> time{
+                    std::chrono::steady_clock::now() - job_start};
+                std::scoped_lock lock{library_state.mutex};
+                if (fallback) {
+                    ++library_state.fallbacks[static_cast<size_t>(*fallback)];
+                } else if (compiled) {
+                    ++library_state.compiled;
+                    library_state.total_ms += time.count();
+                    library_state.longest_ms = std::max(library_state.longest_ms, time.count());
+                } else {
+                    ++library_state.failed;
+                }
+                ++library_state.done;
+                callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, library_state.done,
+                         total);
+            });
+        }
+        workers.WaitForRequests(stop_loading);
+        std::vector<std::string> skipped;
+        for (size_t index = 0; index < library_state.fallbacks.size(); ++index) {
+            if (library_state.fallbacks[index] != 0) {
+                skipped.push_back(fmt::format("{} {}", library_state.fallbacks[index],
+                                              LIBRARY_FALLBACK_NAMES[index]));
+            }
+        }
+        LOG_INFO(
+            Render_Vulkan,
+            "[Preforged] compiled {} pipeline libraries in {} s ({:.1f} ms average, longest "
+            "{:.1f} ms), {} failed in the driver, skipped: {}; the library store holds {}",
+            library_state.compiled,
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                             library_start)
+                .count(),
+            library_state.compiled == 0 ? 0.0 : library_state.total_ms / library_state.compiled,
+            library_state.longest_ms, library_state.failed,
+            skipped.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(skipped, ", ")),
+            pipeline_libraries.StoredCount());
+    }
     if (per_shader_types) {
         LOG_INFO(Render_Vulkan,
                  "[Preforged] attribute types from the code of {} vertex shaders the game hasn't "
@@ -1844,6 +2170,25 @@ void PipelineCache::LogStateVariant(const GraphicsPipelineCacheKey& key) {
              yes(dynamic_features.has_dynamic_vertex_input),
              static_cast<u32>(Settings::values.dyna_state.GetValue()), graphics_cache.size(),
              std::chrono::duration_cast<std::chrono::milliseconds>(state_search_time).count());
+    if (use_pipeline_libraries) {
+        std::vector<std::string> not_joined;
+        for (size_t index = 0; index < library_fallbacks.size(); ++index) {
+            if (const size_t count{library_fallbacks[index].load()}; count != 0) {
+                not_joined.push_back(fmt::format("{} {}", count, LIBRARY_FALLBACK_NAMES[index]));
+            }
+        }
+        const PipelineLibraries::Counts counts{pipeline_libraries.PlayCounts()};
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] pipeline libraries in play: {} pipelines joined, {} didn't need "
+                 "them (the driver had their code), not joined: {}; libraries {} from memory, "
+                 "{} from storage ({} of them slow, so the driver compiled them again), {} "
+                 "compiled in play, {} failed",
+                 library_joins.load(), library_not_needed.load(),
+                 not_joined.empty() ? std::string{"none"}
+                                    : fmt::format("{}", fmt::join(not_joined, ", ")),
+                 counts.memory, counts.storage, counts.slow_storage, counts.compiled,
+                 counts.failed);
+    }
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
@@ -1866,8 +2211,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-    bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache,
-    PreforgedCode* code_out) try {
+    bool build_in_parallel, std::shared_ptr<vk::PipelineCache> build_cache, PreforgedCode* code_out,
+    bool store_libraries) try {
     const auto translate_start{std::chrono::steady_clock::now()};
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
@@ -1925,6 +2270,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
     PreforgedCode preforged_code;
+    // The SPIR-V of the stages before the fragment shader, which names their library, and the
+    // last of those stages.
+    u64 front_code{};
+    const Shader::IR::Program* front_last{};
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
          ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -1942,10 +2291,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
         device.SaveShader(code);
-        preforged_code.code_hash =
-            (preforged_code.code_hash * 0x9E3779B97F4A7C15ULL) ^
-            Common::CityHash64(reinterpret_cast<const char*>(code.data()),
-                               code.size() * sizeof(u32));
+        preforged_code.code_hash = FoldCodeHash(preforged_code.code_hash, code);
+        if (stage_index + 1 < Maxwell::MaxShaderStage) {
+            front_code = FoldCodeHash(front_code, code);
+        } else {
+            front_last = previous_stage;
+        }
         modules[stage_index] = BuildShader(device, code);
 
         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
@@ -1983,6 +2334,108 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     if (!build_cache) {
         build_cache = LoadPreforgedStoreEntry(key, preforged_code, store_match);
     }
+
+    // A pipeline the driver would compile in play is joined from pipeline libraries of its two
+    // halves instead: the stages before the fragment shader as they are, and the fragment shader
+    // translated once more for its own descriptor set. The driver needs no libraries when it has
+    // the pipeline's code already: a stored pair with the same SPIR-V, or a pipeline with the
+    // same SPIR-V compiled this session.
+    bool built_before{};
+    if (use_pipeline_libraries && build_in_parallel && !build_cache) {
+        std::scoped_lock lock{built_codes_mutex};
+        built_before = built_codes.contains(preforged_code.code_hash);
+    }
+    const bool join{use_pipeline_libraries && build_in_parallel && !build_cache && !built_before};
+    // A pipeline the game drew whose libraries were kept on an earlier boot isn't translated
+    // for them again.
+    const u64 played_source{store_libraries ? LibrarySource(LibraryHalf::Back, hash, 1) : 0};
+    const bool keep_libraries{use_pipeline_libraries && store_libraries &&
+                              !pipeline_libraries.HasSource(played_source)};
+    std::string library_note{use_pipeline_libraries ? "not needed, the driver has the code"
+                                                    : "off"};
+    std::optional<GraphicsPipelineLibraryInfo> library_info;
+    Shader::IR::Program library_fragment;
+    vk::ShaderModule library_module;
+    u64 back_code{};
+    if (join || keep_libraries) {
+        std::optional<LibraryFallback> fallback;
+        if (key.unique_hashes[5] == 0 || !modules[Maxwell::MaxShaderStage - 1]) {
+            fallback = LibraryFallback::NoFragmentShader;
+        } else if (!FitsLibraryScaling(infos, LibraryHalf::Front)) {
+            fallback = LibraryFallback::TooManyImages;
+        } else {
+            // In play the fragment shader's inputs are checked against the stage before it.
+            // Libraries kept while the game loads are for any stage before, as the game file
+            // shaders' are.
+            Shader::VaryingState front_stores{};
+            if (front_last) {
+                front_stores = front_last->info.stores;
+                if (front_last->is_geometry_passthrough) {
+                    front_stores.mask |= front_last->info.passthrough.mask;
+                }
+            }
+            std::vector<u32> code;
+            fallback = TranslateLibraryFragment(
+                pools, *envs.back(), host_info, profile, programs, key, device,
+                join && front_last ? &front_stores : nullptr, library_fragment, code);
+            if (!fallback) {
+                back_code = FoldCodeHash(0, code);
+                library_module = BuildShader(device, code);
+            }
+        }
+        if (fallback) {
+            library_note = LIBRARY_FALLBACK_NAMES[static_cast<size_t>(*fallback)];
+            if (join) {
+                ++library_fallbacks[static_cast<size_t>(*fallback)];
+            }
+        }
+        if (!fallback && keep_libraries) {
+            // A pipeline the game drew, built while the game loads: its libraries go to
+            // storage, so the game can join its shaders with others in play.
+            constexpr size_t fragment_stage{Maxwell::MaxShaderStage - 1};
+            std::swap(modules[fragment_stage], library_module);
+            const Shader::Info* const fragment_info{
+                std::exchange(infos[fragment_stage], &library_fragment.info)};
+            bool kept{true};
+            for (const auto& [half, code] : {std::pair{LibraryHalf::Front, front_code},
+                                             std::pair{LibraryHalf::Back, back_code}}) {
+                const LibraryHalf library_half{half};
+                kept &= pipeline_libraries.CompileIntoStore(
+                    library_half, code, 0, [&](VkPipelineCache cache) {
+                        return GraphicsPipeline::CreateLibrary(device, render_pass_cache, key,
+                                                               library_half, modules, infos, cache);
+                    });
+            }
+            std::swap(modules[fragment_stage], library_module);
+            infos[fragment_stage] = fragment_info;
+            if (kept) {
+                pipeline_libraries.NoteSource(played_source);
+            }
+        } else if (fallback && keep_libraries) {
+            pipeline_libraries.NoteSource(played_source);
+        }
+        if (!fallback && join) {
+            constexpr size_t fragment_stage{Maxwell::MaxShaderStage - 1};
+            modules[fragment_stage] = std::move(library_module);
+            infos[fragment_stage] = &library_fragment.info;
+            library_info = GraphicsPipelineLibraryInfo{
+                .libraries = &pipeline_libraries,
+                .front_code = front_code,
+                .back_code = back_code,
+                .full_worker =
+                    Common::Preforged::Options().optimize_joined ? &full_worker : nullptr,
+            };
+            library_note = "joined";
+            ++library_joins;
+        }
+    } else if (use_pipeline_libraries && build_in_parallel) {
+        ++library_not_needed;
+    }
+    if (!build_cache && !library_info) {
+        // Compiled into the driver pipeline cache, which other states of the same SPIR-V find.
+        std::scoped_lock lock{built_codes_mutex};
+        built_codes.insert(preforged_code.code_hash);
+    }
     if (build_in_parallel) {
         Common::Preforged::FrameStats::Add(Common::Preforged::FrameStats::Item::ShaderTranslate,
                                            std::chrono::steady_clock::now() - translate_start);
@@ -2014,15 +2467,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         LOG_INFO(Render_Vulkan,
                  "[ShaderTiming] {:016x} translate {:.2f} ms shaders {:016x} game files: {}, "
-                 "from storage {}",
+                 "from storage {}, libraries: {}",
                  hash, translate_time.count(), fmt::join(key.unique_hashes, ","), game_files,
-                 build_cache && !given_build_cache ? "yes" : "no");
+                 build_cache && !given_build_cache ? "yes" : "no", library_note);
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos, std::move(build_cache));
+        render_pass_cache, key, std::move(modules), infos, std::move(build_cache),
+        library_info ? &*library_info : nullptr);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
