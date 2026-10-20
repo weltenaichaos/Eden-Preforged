@@ -388,6 +388,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_READ_UNITY_FILES,
+                    titleId = R.string.preforged_read_unity_files,
+                    descriptionId = R.string.preforged_read_unity_files_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.PREFORGED_UNPACK_OODLE,
                     titleId = R.string.preforged_unpack_oodle,
                     descriptionId = R.string.preforged_unpack_oodle_description

@@ -64,6 +64,7 @@ void LoadOptions() {
     options.merge_gpu_work = Settings::values.preforged_merge_gpu_work.GetValue();
     options.unpack_unreal_packages = Settings::values.preforged_unpack_unreal_packages.GetValue();
     options.unpack_oodle = Settings::values.preforged_unpack_oodle.GetValue();
+    options.read_unity_files = Settings::values.preforged_read_unity_files.GetValue();
     options.zstd_dictionaries = Settings::values.preforged_zstd_dictionaries.GetValue();
     options.log_unreal_links = Settings::values.preforged_log_unreal_links.GetValue();
     options.unreal_learned_pairs = Settings::values.preforged_unreal_learned_pairs.GetValue();
@@ -98,8 +99,9 @@ void LoadOptions() {
              options.log_unreal_links, options.unreal_learned_pairs);
     LOG_INFO(Common,
              "[Preforged] join pipelines from shader libraries {}, compile joined pipelines in "
-             "full afterwards {}, test: join every pipeline {}",
-             options.pipeline_libraries, options.optimize_joined, options.join_every_pipeline);
+             "full afterwards {}, test: join every pipeline {}, read Unity files {}",
+             options.pipeline_libraries, options.optimize_joined, options.join_every_pipeline,
+             options.read_unity_files);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {

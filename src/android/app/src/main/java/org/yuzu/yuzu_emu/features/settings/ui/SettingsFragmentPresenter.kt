@@ -1524,6 +1524,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_RESCAN_GAME_FILES.key)
                 add(BooleanSetting.PREFORGED_UNPACK_UNREAL_PACKAGES.key)
                 add(BooleanSetting.PREFORGED_UNPACK_OODLE.key)
+                add(BooleanSetting.PREFORGED_READ_UNITY_FILES.key)
                 add(BooleanSetting.PREFORGED_ZSTD_DICTIONARIES.key)
                 add(BooleanSetting.PREFORGED_LOG_UNREAL_LINKS.key)
                 add(BooleanSetting.PREFORGED_UNREAL_LEARNED_PAIRS.key)

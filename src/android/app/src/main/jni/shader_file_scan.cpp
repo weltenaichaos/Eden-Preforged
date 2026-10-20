@@ -51,6 +51,7 @@
 #include "jni/unreal_links.h"
 #include "jni/unreal_package.h"
 #include "jni/unreal_pak.h"
+#include "jni/unity_assets.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -93,8 +94,13 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // play log tells a missed pair from a shader the game files don't have. 16: the code of vertex
 // and fragment shaders in no pair kept too, for pipeline libraries. 17: Unreal Engine 4 pak
 // files unpacked (with the AES key from the game's executable when encrypted), and the shaders
-// in their shader archives.
+// in their shader archives; the Switch shaders of Unity games' Shader objects, in their asset
+// files and bundles.
 constexpr u32 SEARCH_VERSION = 17;
+/// Bytes read from the start of a file to tell a Unity bundle or asset file.
+constexpr size_t UNITY_START = 0x100;
+/// Unity asset files and bundles logged one by one; the rest are only in the sums.
+constexpr size_t UNITY_FILES_LOGGED = 24;
 constexpr auto TRANSLATE_TIME_LIMIT = std::chrono::seconds{90};
 constexpr u32 BNSH_MAGIC = 0x48534E42; // "BNSH"
 constexpr u32 FSHA_MAGIC = 0x41485346; // "FSHA"
@@ -1666,6 +1672,58 @@ public:
         executable_reader = std::move(reader);
     }
 
+    /// The engines the game's file names point to, from LogGameEngines.
+    void SetEngines(std::vector<std::string_view> engines_) {
+        engines = std::move(engines_);
+    }
+
+    /// Sums up what the Unity bundles and asset files held, and says so when a Unity game's
+    /// files held no Shader objects.
+    void ReportUnity() const {
+        const bool unity_game = std::ranges::find(engines, "Unity") != engines.end();
+        if (!Common::Preforged::Options().read_unity_files) {
+            if (unity_game) {
+                LOG_INFO(Frontend, "[ShaderScan] Unity: 'Read Unity shader files' is off, so "
+                                   "only shaders stored unpacked are found");
+            }
+            return;
+        }
+        const auto& totals = unity_totals;
+        if (!unity_game && totals.bundles == 0 && totals.bundles_failed == 0 &&
+            totals.serialized == 0) {
+            return;
+        }
+        const auto& stats = unity_stats;
+        LOG_INFO(Frontend,
+                 "[ShaderScan] Unity: {} bundles read, {} not read{}; {} files in them read ({} "
+                 "MiB unpacked; blocks stored {}, LZMA {} ({} MiB), LZ4 {}), {} could not be "
+                 "read{}, {} texture and sound streams skipped ({} MiB); {} asset files searched "
+                 "for Shader objects: {} places looked like one, {} Shader objects with Switch "
+                 "shaders, {} Switch parts unpacked ({} MiB), {} did not unpack{}; {} NVN code "
+                 "headers in them, {} new shaders taken; the first part starts {}",
+                 totals.bundles, totals.bundles_failed,
+                 totals.first_bundle_error.empty()
+                     ? ""
+                     : fmt::format(" (first: {})", totals.first_bundle_error),
+                 totals.bundle_files, totals.bundle_bytes >> 20, totals.blocks[0],
+                 totals.blocks[1], totals.lzma_bytes >> 20, totals.blocks[2], totals.read_failed,
+                 totals.first_read_error.empty()
+                     ? ""
+                     : fmt::format(" (first: {})", totals.first_read_error),
+                 totals.streams_skipped, totals.streams_skipped_bytes >> 20, totals.serialized,
+                 stats.candidates, stats.blobs, stats.parts, stats.unpacked >> 20, stats.failed,
+                 stats.first_failure.empty() ? "" : fmt::format(" (first: {})", stats.first_failure),
+                 totals.code_headers, totals.taken,
+                 stats.first_part.empty() ? "(none)" : stats.first_part);
+        if (unity_game && stats.parts == 0) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unity: no Switch shaders found in the game files, though its "
+                     "file names point to Unity. The lines above say whether its bundles and "
+                     "asset files were read; shaders in bundles packed another way, or in a "
+                     "layout of Shader objects that isn't known, aren't found");
+        }
+    }
+
     /// Sums up what the Unreal Engine 4 pak files held.
     void ReportPaks() const {
         if (pak_totals.paks == 0) {
@@ -1774,6 +1832,17 @@ private:
             return;
         }
         ++files_scanned;
+        // Unity: bundles are read file by file, and large asset files searched for Shader
+        // objects piece by piece.
+        bool unity_assets = false;
+        if (Common::Preforged::Options().read_unity_files) {
+            const std::vector<u8> start = file->ReadBytes(UNITY_START, 0);
+            if (Preforged::Unity::IsBundle(start) && ScanUnityBundle(file, name)) {
+                LogProgress();
+                return;
+            }
+            unity_assets = size > MAX_WHOLE_FILE && Preforged::Unity::IsSerializedFile(start, size);
+        }
         bool whole = size <= MAX_WHOLE_FILE;
         if (!whole && size <= MAX_WHOLE_PACKAGE &&
             Common::Preforged::Options().unpack_unreal_packages) {
@@ -1797,6 +1866,10 @@ private:
             }
         } else {
             std::vector<u8> chunk;
+            const Preforged::Unity::ReadFn fetch = [&file](u64 offset, u64 length) {
+                return file->ReadBytes(length, offset);
+            };
+            UnitySearch unity{*this, name};
             for (size_t offset = 0; offset < size && !Stopped();
                  offset += CHUNK_SIZE) {
                 const size_t length = std::min(size - offset, CHUNK_SIZE + CHUNK_OVERLAP);
@@ -1806,6 +1879,9 @@ private:
                     auto& large = formats.large_starts[Start32(chunk)];
                     ++large.first;
                     large.second += size;
+                }
+                if (unity_assets) {
+                    unity.Search(chunk, offset, &fetch);
                 }
                 SearchShaders(chunk, name, offset);
             }
@@ -1872,10 +1948,190 @@ private:
                 return;
             }
         }
+        if (Common::Preforged::Options().read_unity_files &&
+            Preforged::Unity::IsSerializedFile(data, data.size())) {
+            UnitySearch{*this, name}.Search(data, 0, nullptr);
+        }
         auto& stored = formats.stored_starts[Start32(data)];
         ++stored.first;
         stored.second += data.size();
         SearchShaders(data, name, 0);
+    }
+
+    /// Searches one Unity asset file, whole or piece by piece, for Shader objects, unpacks
+    /// their Switch shaders and searches those; logs what the file held when done.
+    class UnitySearch {
+    public:
+        UnitySearch(Scanner& scanner_, const std::string& name_)
+            : scanner{scanner_}, name{name_}, shader_name{name_ + " (Unity shaders)"},
+              stats_before{scanner_.unity_stats}, headers_before{scanner_.code_headers},
+              taken_before{scanner_.extracted.size()} {}
+
+        UnitySearch(const UnitySearch&) = delete;
+        UnitySearch& operator=(const UnitySearch&) = delete;
+
+        ~UnitySearch() {
+            if (!searched) {
+                return;
+            }
+            auto& totals = scanner.unity_totals;
+            const auto& stats = scanner.unity_stats;
+            ++totals.serialized;
+            const size_t new_headers = scanner.code_headers - headers_before;
+            const size_t taken = scanner.extracted.size() - taken_before;
+            totals.code_headers += new_headers;
+            totals.taken += taken;
+            const size_t blobs = stats.blobs - stats_before.blobs;
+            if (blobs == 0 && stats.failed == stats_before.failed) {
+                return;
+            }
+            if (++totals.files_logged > UNITY_FILES_LOGGED) {
+                return;
+            }
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unity asset file {}: {} Shader objects with Switch shaders, "
+                     "{} parts unpacked ({} KiB), {} did not unpack, {} NVN code headers in "
+                     "them, {} new shaders taken",
+                     name, blobs, stats.parts - stats_before.parts,
+                     (stats.unpacked - stats_before.unpacked) >> 10,
+                     stats.failed - stats_before.failed, new_headers, taken);
+        }
+
+        void Search(std::span<const u8> data, u64 base_offset,
+                    const Preforged::Unity::ReadFn* fetch) {
+            searched = true;
+            Preforged::Unity::FindShaderBlobs(
+                data, base_offset,
+                [this](std::span<const u8> part, u64) {
+                    // Each part is searched at its own offset, so the code headers in it are
+                    // told apart from those of other parts.
+                    scanner.SearchShaders(part, shader_name, part_offset);
+                    part_offset += (part.size() + 15) / 16 * 16;
+                },
+                scanner.unity_stats, fetch, seen);
+        }
+
+    private:
+        Scanner& scanner;
+        const std::string& name;
+        std::string shader_name;
+        Preforged::Unity::BlobStats stats_before;
+        size_t headers_before;
+        size_t taken_before;
+        std::unordered_set<u64> seen;
+        u64 part_offset = 0;
+        bool searched = false;
+    };
+
+    /// Reads the files in a UnityFS bundle (data.unity3d, asset bundles) and searches each,
+    /// the asset files among them for Shader objects too. Returns false when the bundle can't
+    /// be read, so it is searched as stored.
+    bool ScanUnityBundle(const FileSys::VirtualFile& file, const std::string& name) {
+        using namespace Preforged::Unity;
+        const ReadFn read = [&file](u64 offset, u64 size) { return file->ReadBytes(size, offset); };
+        auto& totals = unity_totals;
+        std::string error;
+        const auto bundle = ReadBundle(read, file->GetSize(), error);
+        if (!bundle) {
+            ++totals.bundles_failed;
+            if (totals.first_bundle_error.empty()) {
+                totals.first_bundle_error = fmt::format("{}: {}", name, error);
+            }
+            LOG_INFO(Frontend, "[ShaderScan] Unity bundle {} not read ({}), so it is searched "
+                               "as stored",
+                     name, error);
+            return false;
+        }
+        ++totals.bundles;
+        const size_t headers_before = code_headers;
+        const size_t taken_before = extracted.size();
+        const size_t serialized_before = totals.serialized;
+        const size_t parts_before = unity_stats.parts;
+        BlockCache cache;
+        std::vector<u8> data;
+        size_t files = 0;
+        u64 unpacked = 0;
+        std::array<size_t, 3> methods{};
+        for (const auto& block : bundle->blocks) {
+            ++methods[std::min<u32>(block.flags & 0x3F, 2)];
+        }
+        for (const auto& node : bundle->nodes) {
+            if (Stopped()) {
+                break;
+            }
+            const std::string lower = Lower(node.path);
+            // Texture, mesh and sound data that asset files point into.
+            if (EndsWith(lower, ".ress") || EndsWith(lower, ".resource")) {
+                ++totals.streams_skipped;
+                totals.streams_skipped_bytes += node.size;
+                continue;
+            }
+            const std::string node_name = fmt::format("{}/{}", name, node.path);
+            const auto failed = [&] {
+                ++totals.read_failed;
+                if (totals.first_read_error.empty()) {
+                    totals.first_read_error = fmt::format("{}: {}", node_name, error);
+                }
+            };
+            ++files;
+            if (node.size <= MAX_WHOLE_FILE) {
+                if (!ReadBundleData(read, *bundle, node.offset, node.size, data, cache, error)) {
+                    failed();
+                    continue;
+                }
+                unpacked += data.size();
+                bytes_scanned += data.size();
+                ScanBuffer(data, node_name, 1);
+                continue;
+            }
+            // A large file, in pieces.
+            const ReadFn fetch = [&](u64 offset, u64 size) {
+                std::vector<u8> out;
+                std::string fetch_error;
+                if (offset >= node.size ||
+                    !ReadBundleData(read, *bundle, node.offset + offset,
+                                    std::min(size, node.size - offset), out, cache, fetch_error)) {
+                    out.clear();
+                }
+                return out;
+            };
+            const std::vector<u8> start = fetch(0, UNITY_START);
+            const bool assets = IsSerializedFile(start, node.size);
+            UnitySearch unity{*this, node_name};
+            for (u64 offset = 0; offset < node.size && !Stopped(); offset += CHUNK_SIZE) {
+                const u64 length = std::min<u64>(node.size - offset, CHUNK_SIZE + CHUNK_OVERLAP);
+                if (!ReadBundleData(read, *bundle, node.offset + offset, length, data, cache,
+                                    error)) {
+                    failed();
+                    break;
+                }
+                unpacked += std::min<u64>(length, CHUNK_SIZE);
+                bytes_scanned += std::min<u64>(length, CHUNK_SIZE);
+                if (assets) {
+                    unity.Search(data, offset, &fetch);
+                }
+                SearchShaders(data, node_name, offset);
+            }
+        }
+        totals.bundle_files += files;
+        totals.bundle_bytes += unpacked;
+        for (size_t method = 0; method < cache.unpacked.size(); ++method) {
+            totals.blocks[method] += cache.unpacked[method];
+        }
+        totals.lzma_bytes += cache.lzma_bytes;
+        if (++totals.bundles_logged <= UNITY_FILES_LOGGED) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] Unity bundle {} ({} MiB): format {}, Unity {}, {} blocks "
+                     "(stored {}, LZMA {}, LZ4 {}), {} files of {} read ({} MiB unpacked), {} of "
+                     "them asset files; {} Switch shader parts, {} NVN code headers, {} new "
+                     "shaders taken",
+                     name, file->GetSize() >> 20, bundle->version, bundle->revision,
+                     bundle->blocks.size(), methods[0], methods[1], methods[2], files,
+                     bundle->nodes.size(), unpacked >> 20, totals.serialized - serialized_before,
+                     unity_stats.parts - parts_before, code_headers - headers_before,
+                     extracted.size() - taken_before);
+        }
+        return true;
     }
 
     // Walks the files inside a SARC archive so compressed entries are unpacked before searching.
@@ -2662,6 +2918,28 @@ private:
     std::vector<u8> executable;
     std::string executable_note;
     std::vector<Preforged::UnrealPak::Key> known_keys;
+    std::vector<std::string_view> engines;
+    struct UnityTotals {
+        size_t bundles = 0;
+        size_t bundles_failed = 0;
+        std::string first_bundle_error;
+        size_t bundle_files = 0;
+        u64 bundle_bytes = 0;
+        size_t read_failed = 0;
+        std::string first_read_error;
+        size_t streams_skipped = 0;
+        u64 streams_skipped_bytes = 0;
+        /// Blocks unpacked: stored, LZMA, LZ4.
+        std::array<size_t, 3> blocks{};
+        u64 lzma_bytes = 0;
+        /// Asset files searched for Shader objects.
+        size_t serialized = 0;
+        size_t code_headers = 0;
+        size_t taken = 0;
+        size_t files_logged = 0;
+        size_t bundles_logged = 0;
+    } unity_totals;
+    Preforged::Unity::BlobStats unity_stats;
     std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
 };
 
@@ -2780,7 +3058,7 @@ struct EngineRule {
 
 constexpr std::array ENGINE_RULES{
     EngineRule{"Unity",
-               EngineSupport::Packed,
+               EngineSupport::Read,
                {"/data/managed/metadata/global-metadata.dat", "/data/globalgamemanagers",
                 "/data/sharedassets0.assets", "/data/data.unity3d"}},
     EngineRule{"Unreal Engine 4 (pak files)",
@@ -2819,7 +3097,7 @@ constexpr std::array ENGINE_RULES{
 
 /// Logs which engines the game's file names point to and how far the search gets with each,
 /// so a log tells why a game's shaders were or weren't found.
-void LogGameEngines(std::string_view file_list) {
+std::vector<std::string_view> LogGameEngines(std::string_view file_list) {
     struct Match {
         size_t files = 0;
         std::vector<std::string> examples;
@@ -2866,11 +3144,13 @@ void LogGameEngines(std::string_view file_list) {
         }
     }
     std::vector<std::string> found;
+    std::vector<std::string_view> engines;
     for (size_t rule = 0; rule < ENGINE_RULES.size(); ++rule) {
         const Match& match = matches[rule];
         if (match.files == 0) {
             continue;
         }
+        engines.push_back(ENGINE_RULES[rule].name);
         const char* const support = [&] {
             switch (ENGINE_RULES[rule].support) {
             case EngineSupport::Read:
@@ -2891,9 +3171,10 @@ void LogGameEngines(std::string_view file_list) {
         LOG_INFO(Frontend,
                  "[ShaderScan] game engine: not recognized from the file names; the search looks "
                  "for shaders stored unpacked in every file");
-        return;
+        return engines;
     }
     LOG_INFO(Frontend, "[ShaderScan] game engine from the file names: {}", fmt::join(found, "; "));
+    return engines;
 }
 
 /// What the last search of a game left in its shader folder.
@@ -2993,7 +3274,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - start_time)
                  .count());
-    LogGameEngines(file_list);
+    std::vector<std::string_view> engines = LogGameEngines(file_list);
     if (const auto last = ReadSearchMarker(shader_dir)) {
         if (options.rescan_game_files) {
             LOG_INFO(Frontend,
@@ -3058,6 +3339,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.SetExecutableReader([&system, program_id](std::string& note) {
         return ReadExecutableData(system, program_id, note);
     });
+    scanner.SetEngines(std::move(engines));
     scanner.SetProgress(&progress, std::max<size_t>(Scanner::CountFiles(root, "") + 1, 2));
     scanner.ReportProgress(true);
     scanner.FindZstdDictionaries(root);
@@ -3078,6 +3360,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.StudyUnrealCaches();
     scanner.ReportUnreal();
     scanner.ReportPaks();
+    scanner.ReportUnity();
     scanner.ReportUnrealLinks();
     scanner.LearnUnrealLinksFromOtherPackages();
     scanner.ReportExtraction();

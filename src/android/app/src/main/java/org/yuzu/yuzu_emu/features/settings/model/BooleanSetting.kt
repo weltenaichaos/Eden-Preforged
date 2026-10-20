@@ -99,6 +99,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_MERGE_GPU_WORK("preforged_merge_gpu_work"),
     PREFORGED_UNPACK_UNREAL_PACKAGES("preforged_unpack_unreal_packages"),
     PREFORGED_UNPACK_OODLE("preforged_unpack_oodle"),
+    PREFORGED_READ_UNITY_FILES("preforged_read_unity_files"),
     PREFORGED_ZSTD_DICTIONARIES("preforged_zstd_dictionaries"),
     PREFORGED_LOG_UNREAL_LINKS("preforged_log_unreal_links"),
     PREFORGED_UNREAL_LEARNED_PAIRS("preforged_unreal_learned_pairs"),
