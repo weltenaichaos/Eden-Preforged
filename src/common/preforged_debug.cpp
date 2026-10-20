@@ -103,8 +103,8 @@ void LoadOptions() {
     LOG_INFO(Common,
              "[Preforged] join pipelines from shader libraries {}, compile joined pipelines in "
              "full afterwards {}, test: join every pipeline {}, read Unity files {}, search "
-             "the game's program {}, find packed data inside files {}, compile on a game's "
-             "first start {}",
+             "the game's program {}, find packed data inside files {}, search and compile on "
+             "a game's first start {}",
              options.pipeline_libraries, options.optimize_joined, options.join_every_pipeline,
              options.read_unity_files, options.search_program, options.find_packed_data,
              options.first_start_compile);

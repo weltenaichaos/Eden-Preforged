@@ -104,6 +104,8 @@ constexpr auto TIME_LIMIT = std::chrono::minutes{4};
 // Freak .gfpak archives and Pokémon Scarlet and Violet's data.trpfs (build 75 had 17 without
 // them).
 constexpr u32 SEARCH_VERSION = 18;
+/// The constant buffer for bindless textures of the official NVN driver, which games are built with.
+constexpr u32 OFFICIAL_TEXTURE_BOUND = 2;
 /// Packed streams found inside files that unpack to fewer bytes are left out: too small to hold
 /// a shader worth the search.
 constexpr size_t MIN_PACKED_STREAM = 256;
@@ -352,7 +354,7 @@ public:
           real{real_}, parts{parts_} {
         stage = stage_;
         start_address = start_address_;
-        is_proprietary_driver = texture_bound == 2;
+        is_proprietary_driver = texture_bound == OFFICIAL_TEXTURE_BOUND;
         if (stage != Shader::Stage::Compute) {
             std::memcpy(&sph, code.data(), sizeof(sph));
             local_memory_size = static_cast<u32>(sph.LocalMemorySize()) +
@@ -436,6 +438,29 @@ private:
     RealParts parts;
 };
 
+/// The constant buffer slot the cached shaders use for bindless textures, or nothing when none
+/// tells. The game sets it once, so the slot most of them use is the game's.
+std::optional<u32> CachedTextureBound(const std::vector<CachedShaderCode>& shaders) {
+    std::map<u32, size_t> bounds;
+    for (const auto& shader : shaders) {
+        if (shader.env) {
+            ++bounds[shader.env->TextureBoundBuffer()];
+        }
+    }
+    if (bounds.empty()) {
+        return std::nullopt;
+    }
+    u32 bound = OFFICIAL_TEXTURE_BOUND;
+    size_t most = bounds.contains(bound) ? bounds.at(bound) : 0;
+    for (const auto& [candidate, count] : bounds) {
+        if (count > most) {
+            bound = candidate;
+            most = count;
+        }
+    }
+    return bound;
+}
+
 class Scanner {
 public:
     explicit Scanner(std::vector<CachedShaderCode> shaders_, std::stop_token stop_,
@@ -458,19 +483,17 @@ public:
         }
         // The constant buffer slot for bindless textures is set once by the game, so the cached
         // shaders tell which one it uses.
-        std::map<u32, size_t> bounds;
-        for (const auto& shader : shaders) {
-            if (shader.env) {
-                ++bounds[shader.env->TextureBoundBuffer()];
-            }
+        if (const std::optional<u32> bound = CachedTextureBound(shaders)) {
+            texture_bound = *bound;
+            LOG_INFO(Frontend, "[ShaderScan] game uses constant buffer {} for bindless textures",
+                     texture_bound);
+        } else {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] no cached shader tells which constant buffer the game uses "
+                     "for bindless textures, so the search takes {}, the one of the official NVN "
+                     "driver that games are built with",
+                     texture_bound);
         }
-        for (const auto& [bound, count] : bounds) {
-            if (count > bounds[texture_bound]) {
-                texture_bound = bound;
-            }
-        }
-        LOG_INFO(Frontend, "[ShaderScan] game uses constant buffer {} for bindless textures",
-                 texture_bound);
 
         // The official driver keeps its own values in constant buffer 1, the same for every
         // shader, so values read by cached shaders can stand in for shaders not seen yet.
@@ -996,17 +1019,43 @@ public:
     /// One line on what the search found, kept in the done marker for later starts.
     /// `cut_short` says whether the search stopped before it read all files.
     std::string ResultSummary(bool cut_short) const {
+        const std::string_view early = !cut_short              ? ""
+                                       : stop.stop_requested() ? ", stopped early because the game was closed"
+                                                               : ", stopped early at the time limit";
+        if (shaders.empty()) {
+            return fmt::format("searched without a shader cache (first start), took {} shaders "
+                               "from the files{}",
+                               extracted.size(), early);
+        }
         return fmt::format("found {} of the {} shaders the game had drawn, took {} shaders from "
                            "the files{}",
-                           FoundCount(), shaders.size(), extracted.size(),
-                           !cut_short              ? ""
-                           : stop.stop_requested() ? ", stopped early because the game was closed"
-                                                   : ", stopped early at the time limit");
+                           FoundCount(), shaders.size(), extracted.size(), early);
+    }
+
+    size_t TakenCount() const {
+        return extracted.size();
+    }
+
+    u32 TextureBound() const {
+        return texture_bound;
     }
 
     // Says in one line how much of what the game drew the search found, and where to look when
     // it found little.
     void ReportResult() const {
+        if (shaders.empty()) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] result: searched without a shader cache (the game's first "
+                     "start), {} shaders taken from the files{}",
+                     extracted.size(),
+                     !extracted.empty()
+                         ? ""
+                         : "; none found, so this game keeps its shaders where the search can't "
+                           "read them yet (see the 'game engine', 'unpacked' and 'searched as "
+                           "stored' lines above). The next start searches again with the "
+                           "shaders the game drew, to tell where they are");
+            return;
+        }
         const size_t found = FoundCount();
         const size_t percent = shaders.empty() ? 0 : found * 100 / shaders.size();
         LOG_INFO(Frontend,
@@ -2733,7 +2782,7 @@ private:
         std::optional<size_t> exit_size;
         for (size_t pos = start; pos + sizeof(u64) <= limit; pos += sizeof(u64)) {
             const u64 inst = Load64(data.data() + pos);
-            if (texture_bound != 2 && inst == EXIT_VALUE && !exit_size) {
+            if (texture_bound != OFFICIAL_TEXTURE_BOUND && inst == EXIT_VALUE && !exit_size) {
                 exit_size = pos - start + sizeof(u64);
             }
             if (inst != SELF_BRANCH_A && inst != SELF_BRANCH_B) {
@@ -3269,7 +3318,7 @@ private:
     std::map<u64, size_t> slot_fields;
     std::map<u64, size_t> fragment_slots;
     std::set<std::pair<u64, u64>> program_pairs;
-    u32 texture_bound = 2;
+    u32 texture_bound = OFFICIAL_TEXTURE_BOUND;
     DriverConstants driver_constants;
     size_t extracted_bytes = 0;
     size_t code_headers = 0;
@@ -3656,6 +3705,13 @@ struct SearchMarker {
     std::string files_id; ///< Id of the game file list it searched
     u32 version = 0;      ///< SEARCH_VERSION of the search
     std::string result;   ///< What it found, from ResultSummary
+    /// How many cached shaders it compared the files with, 0 on a game's first start. Not kept
+    /// by searches made before the first-start search.
+    std::optional<size_t> cached;
+    /// The constant buffer for bindless textures it took the shaders with.
+    std::optional<u32> bound;
+    /// How many shaders it took from the files.
+    std::optional<size_t> taken;
 };
 
 constexpr std::string_view MARKER_NAME = "shader_scan_done";
@@ -3689,6 +3745,18 @@ std::optional<SearchMarker> ReadSearchMarker(const std::filesystem::path& shader
                 std::from_chars(value.data(), value.data() + value.size(), marker.version);
             } else if (key == "result") {
                 marker.result = value;
+            } else if (key == "cached" || key == "bound" || key == "taken") {
+                u64 number = 0;
+                if (std::from_chars(value.data(), value.data() + value.size(), number).ec ==
+                    std::errc{}) {
+                    if (key == "cached") {
+                        marker.cached = static_cast<size_t>(number);
+                    } else if (key == "bound") {
+                        marker.bound = static_cast<u32>(number);
+                    } else {
+                        marker.taken = static_cast<size_t>(number);
+                    }
+                }
             }
         }
         return marker;
@@ -3705,10 +3773,19 @@ std::optional<SearchMarker> ReadSearchMarker(const std::filesystem::path& shader
 }
 
 void WriteSearchMarker(const std::filesystem::path& shader_dir, const SearchMarker& marker) {
-    void(Common::FS::WriteStringToFile(
-        shader_dir / MARKER_NAME, Common::FS::FileType::TextFile,
-        fmt::format("files {}\nversion {}\nresult {}\n", marker.files_id, marker.version,
-                    marker.result)));
+    std::string text = fmt::format("files {}\nversion {}\nresult {}\n", marker.files_id,
+                                   marker.version, marker.result);
+    if (marker.cached) {
+        text += fmt::format("cached {}\n", *marker.cached);
+    }
+    if (marker.bound) {
+        text += fmt::format("bound {}\n", *marker.bound);
+    }
+    if (marker.taken) {
+        text += fmt::format("taken {}\n", *marker.taken);
+    }
+    void(Common::FS::WriteStringToFile(shader_dir / MARKER_NAME, Common::FS::FileType::TextFile,
+                                       text));
     std::error_code error;
     std::filesystem::remove(shader_dir / OLD_MARKER_NAME, error);
 }
@@ -3749,7 +3826,11 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
                  std::chrono::steady_clock::now() - start_time)
                  .count());
     std::vector<std::string_view> engines = LogGameEngines(file_list);
-    if (const auto last = ReadSearchMarker(shader_dir)) {
+    // A search on the game's first start had no shaders the game drew to compare the files with.
+    // It runs once more when the cache shows it took the wrong texture constant buffer, or when
+    // it took nothing, to tell where the shaders the game drew are.
+    std::optional<SearchMarker> first_start;
+    if (auto last = ReadSearchMarker(shader_dir)) {
         if (options.rescan_game_files) {
             LOG_INFO(Frontend,
                      "[ShaderScan] 'Search game files on every start' is on, so it runs again "
@@ -3765,6 +3846,8 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
                      "[ShaderScan] the search improved since it last ran for this game (version "
                      "{} then, {} now), so it runs once more; last result: {}",
                      last->version, SEARCH_VERSION, last->result);
+        } else if (last->cached == size_t{0}) {
+            first_start = std::move(last);
         } else {
             LOG_INFO(Frontend,
                      "[ShaderScan] already ran for these game files with this search version "
@@ -3779,37 +3862,89 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     const auto copy = shader_dir / "shader_scan_copy.bin";
     std::filesystem::copy_file(shader_dir / "vulkan.bin", copy,
                                std::filesystem::copy_options::overwrite_existing, error);
-    if (error) {
-        LOG_INFO(Frontend,
-                 "[ShaderScan] not searching on this start: the game has no shader cache yet "
-                 "({}), as on its first start or after the cache was deleted. The search "
-                 "compares the game files with the shaders the game drew and compiles them with "
-                 "the states it drew them with, so it runs on the next start.",
-                 error.message());
-        return;
-    }
     std::vector<Vulkan::GraphicsPipelineCacheKey> graphics_keys;
-    std::vector<CachedShaderCode> shaders =
-        Vulkan::PipelineCache::ReadCachedShaderCode(copy, stop, &graphics_keys);
-    std::filesystem::remove(copy, error);
-    if (shaders.empty()) {
-        LOG_INFO(Frontend,
-                 "[ShaderScan] not searching on this start: the shader cache holds no shaders "
-                 "yet, so the search runs on the next start");
-        return;
+    std::vector<CachedShaderCode> shaders;
+    std::string no_cache;
+    if (error) {
+        no_cache = fmt::format("the game has no shader cache yet ({})", error.message());
+    } else {
+        shaders = Vulkan::PipelineCache::ReadCachedShaderCode(copy, stop, &graphics_keys);
+        std::filesystem::remove(copy, error);
+        if (shaders.empty()) {
+            no_cache = "the shader cache holds no shaders yet";
+        }
     }
 
-    LOG_INFO(Frontend, "[ShaderScan] searching game files for {} cached shaders", shaders.size());
+    if (first_start) {
+        const std::optional<u32> bound = CachedTextureBound(shaders);
+        const u32 last_bound = first_start->bound.value_or(OFFICIAL_TEXTURE_BOUND);
+        if (bound && *bound != last_bound) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] the search on the game's first start took the shaders with "
+                     "constant buffer {} for bindless textures, but the shaders the game drew "
+                     "since use {}, so it runs again",
+                     last_bound, *bound);
+        } else if (!shaders.empty() && first_start->taken == size_t{0}) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] the search on the game's first start took no shaders from the "
+                     "files, so it runs again with the {} shaders the game drew, to tell where "
+                     "they are",
+                     shaders.size());
+        } else {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] already ran for these game files on the game's first start, "
+                     "without a shader cache; {}. Last result: {}. Turn on 'Search game files on "
+                     "every start' or delete {} to run it again",
+                     bound ? fmt::format("the {} shaders the game drew since use constant buffer "
+                                         "{} for bindless textures, as the search took",
+                                         shaders.size(), *bound)
+                     : !no_cache.empty()
+                         ? no_cache
+                         : std::string{"the cached shaders don't tell which constant buffer the "
+                                       "game uses for bindless textures"},
+                     first_start->result, Common::FS::PathToUTF8String(done_marker));
+            return;
+        }
+    }
+
+    if (shaders.empty()) {
+        if (!options.first_start_compile) {
+            LOG_INFO(Frontend,
+                     "[ShaderScan] not searching on this start: {}, as on a game's first start "
+                     "or after the cache was deleted, and 'Search and compile on a game's first "
+                     "start' is off. The search runs on the next start.",
+                     no_cache);
+            return;
+        }
+        LOG_INFO(Frontend,
+                 "[ShaderScan] {}, as on a game's first start or after the cache was deleted: "
+                 "searching the game files without it, so the shaders found are compiled "
+                 "before the game draws them",
+                 no_cache);
+        // On a game's very first start its shader folder doesn't exist yet.
+        if (!Common::FS::CreateDirs(shader_dir)) {
+            LOG_ERROR(Frontend, "[ShaderScan] could not create {}, so nothing is searched",
+                      Common::FS::PathToUTF8String(shader_dir));
+            return;
+        }
+    } else {
+        LOG_INFO(Frontend, "[ShaderScan] searching game files for {} cached shaders",
+                 shaders.size());
+    }
+
+    const size_t cached_count = shaders.size();
+    Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
 
     // Mark the scan as done up front, so a crash during it never blocks the game twice.
     SearchMarker marker{
         .files_id = files_id,
         .version = SEARCH_VERSION,
         .result = "did not finish, Eden was closed or crashed during the search",
+        .cached = cached_count,
+        .bound = scanner.TextureBound(),
     };
     WriteSearchMarker(shader_dir, marker);
 
-    Scanner scanner{std::move(shaders), stop, start_time + TIME_LIMIT};
     scanner.SetExecutableReader([&system, program_id](std::string& note) {
         return ReadExecutableData(system, program_id, note);
     });
@@ -3862,6 +3997,7 @@ void RunShaderFileScan(Core::System& system, u64 program_id, std::stop_token sto
     scanner.SavePrograms(shader_dir / "preforged_programs.bin");
     scanner.ReportResult();
     marker.result = scanner.ResultSummary(cut_short);
+    marker.taken = scanner.TakenCount();
     WriteSearchMarker(shader_dir, marker);
     if (progress) {
         progress(1, 1);
