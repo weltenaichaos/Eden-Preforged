@@ -96,6 +96,10 @@ public:
     };
     [[nodiscard]] Counts PlayCounts() const;
 
+    /// Starts the counts again, so the ones in play leave out the libraries asked for while the
+    /// game loads.
+    void ResetCounts();
+
     [[nodiscard]] size_t StoredCount() const;
 
     [[nodiscard]] static std::string_view SourceName(Source source);

@@ -258,6 +258,9 @@ private:
     /// and which parts of the draw state set the two apart.
     void LogStateVariant(const GraphicsPipelineCacheKey& key);
 
+    /// How the pipelines that went to be joined were joined, and how their libraries were found.
+    [[nodiscard]] std::string LibraryJoinSummary();
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
@@ -278,6 +281,8 @@ private:
     /// from. Declared before the pipelines, so it goes after them.
     PipelineLibraries pipeline_libraries;
     bool use_pipeline_libraries{};
+    /// Test: every pipeline the game drew and every pipeline built in play is joined.
+    bool join_every_pipeline{};
     /// Pipelines the game needed in play that were joined from libraries, that didn't need
     /// them because the driver had their code, and that couldn't be joined, by reason.
     std::atomic<size_t> library_joins{};

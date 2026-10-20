@@ -430,6 +430,13 @@ abstract class SettingsItem(
             )
             put(
                 SwitchSetting(
+                    BooleanSetting.PREFORGED_JOIN_EVERY_PIPELINE,
+                    titleId = R.string.preforged_join_every_pipeline,
+                    descriptionId = R.string.preforged_join_every_pipeline_description
+                )
+            )
+            put(
+                SwitchSetting(
                     BooleanSetting.USE_VULKAN_DRIVER_PIPELINE_CACHE,
                     titleId = R.string.preforged_driver_pipeline_cache,
                     descriptionId = R.string.preforged_driver_pipeline_cache_description

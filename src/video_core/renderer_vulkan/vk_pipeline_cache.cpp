@@ -457,6 +457,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
       pipeline_libraries{device_}, use_pipeline_libraries{device_.CanJoinPipelineLibraries()},
+      join_every_pipeline{use_pipeline_libraries &&
+                          Common::Preforged::Options().join_every_pipeline},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       full_worker(1, "VkPipelineFull", {}, Common::ThreadPlacement::Background),
@@ -606,13 +608,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         LOG_INFO(Render_Vulkan,
                  "[Preforged] joining pipelines from shader libraries: {} (fast linking {}, "
                  "interpolation decorations only in the fragment shader {}, setting {}); "
-                 "compiling joined pipelines in full afterwards: {}",
+                 "compiling joined pipelines in full afterwards: {}; test, join every pipeline: "
+                 "{}",
                  use_pipeline_libraries ? "on" : "off",
                  library_properties.graphicsPipelineLibraryFastLinking != VK_FALSE,
                  library_properties.graphicsPipelineLibraryIndependentInterpolationDecoration !=
                      VK_FALSE,
                  Common::Preforged::Options().pipeline_libraries,
-                 use_pipeline_libraries && Common::Preforged::Options().optimize_joined);
+                 use_pipeline_libraries && Common::Preforged::Options().optimize_joined &&
+                     !join_every_pipeline,
+                 join_every_pipeline ? "on, so joined pipelines are kept as they are" : "off");
     }
 
     dynamic_features = {};
@@ -866,6 +871,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     workers.WaitForRequests(stop_loading);
     Common::Preforged::LogMemoryUse("after building the played pipelines");
+    if (join_every_pipeline) {
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] test, join every pipeline: of the {} pipelines the game drew, {}",
+                 played_keys.size(), LibraryJoinSummary());
+        // The counts in play start again.
+        library_joins = 0;
+        library_not_needed = 0;
+        for (auto& count : library_fallbacks) {
+            count = 0;
+        }
+        pipeline_libraries.ResetCounts();
+    }
 
     PrecompilePreforgedPairs(base_dir, played_keys, stop_loading, callback);
     Common::Preforged::LogMemoryUse("after compiling game file pairs");
@@ -2171,24 +2188,27 @@ void PipelineCache::LogStateVariant(const GraphicsPipelineCacheKey& key) {
              static_cast<u32>(Settings::values.dyna_state.GetValue()), graphics_cache.size(),
              std::chrono::duration_cast<std::chrono::milliseconds>(state_search_time).count());
     if (use_pipeline_libraries) {
-        std::vector<std::string> not_joined;
-        for (size_t index = 0; index < library_fallbacks.size(); ++index) {
-            if (const size_t count{library_fallbacks[index].load()}; count != 0) {
-                not_joined.push_back(fmt::format("{} {}", count, LIBRARY_FALLBACK_NAMES[index]));
-            }
-        }
-        const PipelineLibraries::Counts counts{pipeline_libraries.PlayCounts()};
-        LOG_INFO(Render_Vulkan,
-                 "[Preforged] pipeline libraries in play: {} pipelines joined, {} didn't need "
-                 "them (the driver had their code), not joined: {}; libraries {} from memory, "
-                 "{} from storage ({} of them slow, so the driver compiled them again), {} "
-                 "compiled in play, {} failed",
-                 library_joins.load(), library_not_needed.load(),
-                 not_joined.empty() ? std::string{"none"}
-                                    : fmt::format("{}", fmt::join(not_joined, ", ")),
-                 counts.memory, counts.storage, counts.slow_storage, counts.compiled,
-                 counts.failed);
+        LOG_INFO(Render_Vulkan, "[Preforged] pipeline libraries in play: {}",
+                 LibraryJoinSummary());
     }
+}
+
+std::string PipelineCache::LibraryJoinSummary() {
+    std::vector<std::string> not_joined;
+    for (size_t index = 0; index < library_fallbacks.size(); ++index) {
+        if (const size_t count{library_fallbacks[index].load()}; count != 0) {
+            not_joined.push_back(fmt::format("{} {}", count, LIBRARY_FALLBACK_NAMES[index]));
+        }
+    }
+    const PipelineLibraries::Counts counts{pipeline_libraries.PlayCounts()};
+    return fmt::format("{} pipelines joined, {} didn't need them (the driver had their code), "
+                       "not joined: {}; libraries {} from memory, {} from storage ({} of them "
+                       "slow, so the driver compiled them again), {} compiled, {} failed",
+                       library_joins.load(), library_not_needed.load(),
+                       not_joined.empty() ? std::string{"none"}
+                                          : fmt::format("{}", fmt::join(not_joined, ", ")),
+                       counts.memory, counts.storage, counts.slow_storage, counts.compiled,
+                       counts.failed);
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
@@ -2340,12 +2360,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // translated once more for its own descriptor set. The driver needs no libraries when it has
     // the pipeline's code already: a stored pair with the same SPIR-V, or a pipeline with the
     // same SPIR-V compiled this session.
+    // The test switch joins every pipeline the game drew, while it loads, and every pipeline
+    // built in play, but not the pairs compiled into the pair store.
+    const bool join_for_test{join_every_pipeline && (build_in_parallel || store_libraries)};
     bool built_before{};
-    if (use_pipeline_libraries && build_in_parallel && !build_cache) {
+    if (use_pipeline_libraries && build_in_parallel && !build_cache && !join_for_test) {
         std::scoped_lock lock{built_codes_mutex};
         built_before = built_codes.contains(preforged_code.code_hash);
     }
-    const bool join{use_pipeline_libraries && build_in_parallel && !build_cache && !built_before};
+    const bool join{join_for_test || (use_pipeline_libraries && build_in_parallel &&
+                                      !build_cache && !built_before)};
     // A pipeline the game drew whose libraries were kept on an earlier boot isn't translated
     // for them again.
     const u64 played_source{store_libraries ? LibrarySource(LibraryHalf::Back, hash, 1) : 0};
@@ -2422,8 +2446,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 .libraries = &pipeline_libraries,
                 .front_code = front_code,
                 .back_code = back_code,
-                .full_worker =
-                    Common::Preforged::Options().optimize_joined ? &full_worker : nullptr,
+                .full_worker = Common::Preforged::Options().optimize_joined && !join_every_pipeline
+                                   ? &full_worker
+                                   : nullptr,
             };
             library_note = "joined";
             ++library_joins;

@@ -69,6 +69,7 @@ void LoadOptions() {
     options.unreal_learned_pairs = Settings::values.preforged_unreal_learned_pairs.GetValue();
     options.pipeline_libraries = Settings::values.preforged_pipeline_libraries.GetValue();
     options.optimize_joined = Settings::values.preforged_optimize_joined.GetValue();
+    options.join_every_pipeline = Settings::values.preforged_join_every_pipeline.GetValue();
     FrameStats::SetEnabled(options.log_slow_frames);
     LOG_INFO(Common,
              "[Preforged] switches: bake constants {}, scan {}, rescan {}, pre-compile {}, "
@@ -97,8 +98,8 @@ void LoadOptions() {
              options.log_unreal_links, options.unreal_learned_pairs);
     LOG_INFO(Common,
              "[Preforged] join pipelines from shader libraries {}, compile joined pipelines in "
-             "full afterwards {}",
-             options.pipeline_libraries, options.optimize_joined);
+             "full afterwards {}, test: join every pipeline {}",
+             options.pipeline_libraries, options.optimize_joined, options.join_every_pipeline);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {

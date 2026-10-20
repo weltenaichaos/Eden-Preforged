@@ -74,6 +74,9 @@ struct DebugOptions {
     /// After joining a pipeline from libraries, compiles the full pipeline on a background thread
     /// and switches to it, since a joined pipeline can run a little slower on the GPU.
     bool optimize_joined = true;
+    /// Test: every pipeline the game drew and every pipeline built in play is joined from
+    /// libraries and kept that way, so the picture shows whether joining is right. Off for play.
+    bool join_every_pipeline = false;
 };
 
 /// How many queue submits the GPU may have left to finish before the next one waits for it.

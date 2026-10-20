@@ -104,6 +104,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_UNREAL_LEARNED_PAIRS("preforged_unreal_learned_pairs"),
     PREFORGED_PIPELINE_LIBRARIES("preforged_pipeline_libraries"),
     PREFORGED_OPTIMIZE_JOINED("preforged_optimize_joined"),
+    PREFORGED_JOIN_EVERY_PIPELINE("preforged_join_every_pipeline"),
     USE_VULKAN_DRIVER_PIPELINE_CACHE("use_vulkan_driver_pipeline_cache"),
     EXTENDED_LOGGING("extended_logging"),
     DONT_SHOW_DRIVER_SHADER_WARNING("dont_show_driver_shader_warning"),

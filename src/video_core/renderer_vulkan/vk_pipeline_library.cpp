@@ -306,6 +306,14 @@ PipelineLibraries::Counts PipelineLibraries::PlayCounts() const {
     };
 }
 
+void PipelineLibraries::ResetCounts() {
+    count_memory = 0;
+    count_storage = 0;
+    count_compiled = 0;
+    count_failed = 0;
+    count_slow_storage = 0;
+}
+
 size_t PipelineLibraries::StoredCount() const {
     std::scoped_lock lock{store_mutex};
     return store.size();

@@ -956,6 +956,8 @@ struct Values {
                                                Category::Miscellaneous};
     Setting<bool> preforged_optimize_joined{linkage, true, "preforged_optimize_joined",
                                             Category::Miscellaneous};
+    Setting<bool> preforged_join_every_pipeline{linkage, false, "preforged_join_every_pipeline",
+                                                Category::Miscellaneous};
     Setting<u32, true> preforged_precompile_percent{linkage, 100, 0, 100, "preforged_compile_share", Category::Miscellaneous, Specialization::Scalar};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
