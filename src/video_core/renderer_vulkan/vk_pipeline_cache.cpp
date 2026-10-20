@@ -423,6 +423,124 @@ u64 LibrarySource(LibraryHalf half, u64 shader, u64 state_hash) {
     return Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words));
 }
 
+/// x, y, z and w of a viewport as they are.
+constexpr u16 IDENTITY_VIEWPORT_SWIZZLE = 0x6420;
+
+/// The state the shaders from the game files are compiled with on a game's first start, before
+/// it has drawn anything: triangles, one RGBA8 color target and a depth target, no MSAA, no alpha
+/// test or transform feedback, the y direction and depth range the GPU starts with. Of the state,
+/// a shader's SPIR-V only depends on the primitive class, alpha test, early Z, the y direction,
+/// the depth range (without VK_EXT_depth_clip_control) and the attribute types, which are read
+/// from each vertex shader's code. The rest is dynamic or doesn't change the shaders.
+GraphicsPipelineCacheKey StarterKey(const DynamicFeatures& features) {
+    GraphicsPipelineCacheKey key{};
+    FixedPipelineState& state{key.state};
+    state.driver_id = features.driver_id;
+    state.driver_version = features.driver_version;
+    state.extended_dynamic_state.Assign(features.has_extended_dynamic_state ? 1 : 0);
+    state.extended_dynamic_state_2.Assign(features.has_extended_dynamic_state_2 ? 1 : 0);
+    state.extended_dynamic_state_2_logic_op.Assign(
+        features.has_extended_dynamic_state_2_logic_op ? 1 : 0);
+    state.extended_dynamic_state_3_blend.Assign(features.has_extended_dynamic_state_3_blend ? 1
+                                                                                          : 0);
+    state.extended_dynamic_state_3_enables.Assign(
+        features.has_extended_dynamic_state_3_enables ? 1 : 0);
+    state.color_write_enable_dynamic.Assign(features.has_color_write_enable ? 1 : 0);
+    state.dynamic_vertex_input.Assign(features.has_dynamic_vertex_input ? 1 : 0);
+    state.polygon_mode.Assign(FixedPipelineState::PackPolygonMode(Maxwell::PolygonMode::Fill));
+    state.topology.Assign(Maxwell::PrimitiveTopology::Triangles);
+    state.msaa_mode.Assign(Tegra::Texture::MsaaMode::Msaa1x1);
+    state.alpha_test_func.Assign(
+        FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL));
+    state.depth_enabled.Assign(1);
+    state.depth_format.Assign(static_cast<u32>(Tegra::DepthFormat::Z24_UNORM_S8_UINT));
+    // The first vertex, as the GPU starts, where the driver has it.
+    state.provoking_vertex_last.Assign(features.has_provoking_vertex &&
+                                               !features.has_provoking_vertex_first_mode &&
+                                               features.has_provoking_vertex_last_mode
+                                           ? 1
+                                           : 0);
+    state.color_formats.fill(static_cast<u8>(Tegra::RenderTargetFormat::NONE));
+    state.color_formats[0] = static_cast<u8>(Tegra::RenderTargetFormat::A8B8G8R8_UNORM);
+    state.point_size = std::bit_cast<u32>(1.0f);
+    state.viewport_swizzles.fill(IDENTITY_VIEWPORT_SWIZZLE);
+    for (FixedPipelineState::BlendingAttachment& attachment : state.attachments) {
+        attachment.mask_r.Assign(1);
+        attachment.mask_g.Assign(1);
+        attachment.mask_b.Assign(1);
+        attachment.mask_a.Assign(1);
+    }
+    if (!features.has_dynamic_vertex_input) {
+        // Without dynamic vertex input the attributes are part of the pipeline: all float.
+        for (FixedPipelineState::VertexAttribute& attribute : state.attributes) {
+            attribute.enabled.Assign(1);
+            attribute.type.Assign(static_cast<u32>(Maxwell::VertexAttribute::Type::Float));
+            attribute.size.Assign(
+                static_cast<u32>(Maxwell::VertexAttribute::Size::Size_R32_G32_B32_A32));
+        }
+    }
+    return key;
+}
+
+/// Logs how the pipelines the game drew on earlier boots differ in the state that changes their
+/// shaders, against the starter state a first start compiles with, to see how well it fits.
+void LogPlayedStates(std::span<const GraphicsPipelineCacheKey> keys) {
+    if (keys.empty()) {
+        return;
+    }
+    using Topology = Maxwell::PrimitiveTopology;
+    const u32 always{FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL)};
+    size_t points{};
+    size_t lines{};
+    size_t patches{};
+    size_t other_stages{};
+    size_t lower_left{};
+    size_t minus_one{};
+    size_t alpha_test{};
+    size_t early_z{};
+    size_t msaa{};
+    size_t xfb{};
+    size_t dual_source{};
+    size_t like_starter{};
+    for (const GraphicsPipelineCacheKey& key : keys) {
+        const FixedPipelineState& state{key.state};
+        const Topology topology{state.topology.Value()};
+        const bool is_points{topology == Topology::Points};
+        points += is_points ? 1 : 0;
+        lines += topology == Topology::Lines || topology == Topology::LineLoop ||
+                         topology == Topology::LineStrip || topology == Topology::LinesAdjacency ||
+                         topology == Topology::LineStripAdjacency
+                     ? 1
+                     : 0;
+        patches += topology == Topology::Patches ? 1 : 0;
+        const bool more_stages{key.unique_hashes[0] != 0 || key.unique_hashes[2] != 0 ||
+                               key.unique_hashes[3] != 0 || key.unique_hashes[4] != 0};
+        other_stages += more_stages ? 1 : 0;
+        lower_left += state.y_negate != 0 ? 1 : 0;
+        minus_one += state.ndc_minus_one_to_one != 0 ? 1 : 0;
+        const bool alpha{state.alpha_test_func != always};
+        alpha_test += alpha ? 1 : 0;
+        early_z += state.early_z != 0 ? 1 : 0;
+        msaa += state.msaa_mode.Value() != Tegra::Texture::MsaaMode::Msaa1x1 ? 1 : 0;
+        xfb += state.xfb_enabled != 0 ? 1 : 0;
+        dual_source += state.attachment0_dual_source_blend != 0 ? 1 : 0;
+        like_starter += !more_stages && !is_points && !alpha && state.early_z == 0 &&
+                                state.xfb_enabled == 0 &&
+                                state.attachment0_dual_source_blend == 0
+                            ? 1
+                            : 0;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[Preforged] the {} pipelines the game drew: {} points, {} lines, {} patches, {} "
+             "with more stages than a vertex and a fragment shader, {} with the window origin "
+             "lower left, {} with depth -1 to 1, {} with alpha test, {} with early Z, {} with "
+             "MSAA, {} with transform feedback, {} with dual source blending; {} change their "
+             "shaders as the starter state of a first start does (by primitive, stages, alpha "
+             "test, early Z, transform feedback and blending)",
+             keys.size(), points, lines, patches, other_stages, lower_left, minus_one, alpha_test,
+             early_z, msaa, xfb, dual_source, like_starter);
+}
+
 } // Anonymous namespace
 
 size_t ComputePipelineCacheKey::Hash() const noexcept {
@@ -1449,7 +1567,8 @@ void PipelineCache::PrecompilePreforgedPairs(
     std::stop_token stop_loading, const VideoCore::DiskResourceLoadCallback& callback) {
     const auto programs_ptr{std::make_shared<std::optional<VideoCommon::PreforgedPrograms>>(
         VideoCommon::ReadPreforgedPrograms(base_dir / "preforged_programs.bin"))};
-    if (!*programs_ptr || played_keys.empty()) {
+    LogPlayedStates(played_keys);
+    if (!*programs_ptr) {
         return;
     }
     const VideoCommon::PreforgedPrograms& programs{**programs_ptr};
@@ -1498,10 +1617,29 @@ void PipelineCache::PrecompilePreforgedPairs(
         ++count;
         example = &key;
     }
-    if (state_counts.empty()) {
-        return;
-    }
+    // On a game's first start it hasn't drawn anything yet, so the starter state stands in for
+    // the states it draws. Later starts use the states it drew.
+    std::optional<GraphicsPipelineCacheKey> starter;
     const GraphicsPipelineCacheKey* common_template{};
+    if (state_counts.empty()) {
+        if (!Common::Preforged::Options().first_start_compile) {
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] the game hasn't drawn any pipeline of a vertex and a fragment "
+                     "shader yet (first start), and compiling on a first start is switched off");
+            return;
+        }
+        starter = StarterKey(dynamic_features);
+        common_template = &*starter;
+        LOG_INFO(Render_Vulkan,
+                 "[Preforged] the game hasn't drawn any pipeline of a vertex and a fragment "
+                 "shader yet (first start): compiling the shaders from the game files with the "
+                 "starter state (triangles, one RGBA8 color target with depth, no MSAA, no alpha "
+                 "test, window origin upper left, depth 0 to 1), fragment shader libraries also "
+                 "with the origin lower left{}",
+                 device.IsExtDepthClipControlSupported()
+                     ? std::string{}
+                     : std::string{", vertex shader libraries also with depth -1 to 1"});
+    }
     size_t common_count{};
     for (const auto& [hash, entry] : state_counts) {
         if (entry.first > common_count) {
@@ -1888,6 +2026,8 @@ void PipelineCache::PrecompilePreforgedPairs(
         size_t vertex_shaders{};
         size_t fragment_shaders{};
         size_t unpaired_shaders{};
+        // Libraries for the other window origin or depth range, on a first start.
+        size_t starter_variants{};
         const auto add_library{
             [&](u64 hash, const VideoCommon::PreforgedShader& shader, bool unpaired) {
                 LibraryHalf half{};
@@ -1919,6 +2059,28 @@ void PipelineCache::PrecompilePreforgedPairs(
                 }
                 library_candidates[drawn ? 0 : 1].push_back(
                     LibraryJob{hash, &shader, half, key, drawn_types, source});
+                if (!starter) {
+                    return;
+                }
+                // Before the game has drawn, its window origin isn't known, nor its depth range,
+                // which changes vertex shaders without VK_EXT_depth_clip_control. Both change the
+                // SPIR-V of the shaders that read them, so the other one is compiled too. A
+                // shader whose SPIR-V stays the same is stored once.
+                GraphicsPipelineCacheKey other{key};
+                if (!front) {
+                    other.state.y_negate.Assign(1);
+                } else if (!device.IsExtDepthClipControlSupported()) {
+                    other.state.ndc_minus_one_to_one.Assign(1);
+                } else {
+                    return;
+                }
+                const u64 other_source{LibrarySource(half, hash, ShaderStateHash(other))};
+                if (other_source != source && pipeline_libraries.HasSource(other_source)) {
+                    return;
+                }
+                library_candidates[1].push_back(
+                    LibraryJob{hash, &shader, half, other, drawn_types, other_source});
+                ++starter_variants;
             }};
         for (const auto& [hash, shader] : programs.shaders) {
             add_library(hash, shader, false);
@@ -1961,6 +2123,7 @@ void PipelineCache::PrecompilePreforgedPairs(
             double longest_ms{};
         } library_state;
         const auto library_start{std::chrono::steady_clock::now()};
+        const size_t stored_before{pipeline_libraries.StoredCount()};
         if (!library_todo.empty()) {
             callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, 0, library_todo.size());
         }
@@ -2072,6 +2235,13 @@ void PipelineCache::PrecompilePreforgedPairs(
             library_state.longest_ms, library_state.failed,
             skipped.empty() ? std::string{"none"} : fmt::format("{}", fmt::join(skipped, ", ")),
             pipeline_libraries.StoredCount());
+        if (starter) {
+            LOG_INFO(Render_Vulkan,
+                     "[Preforged] first start: {} of the libraries were for the other window "
+                     "origin or depth range; {} new libraries were stored in all, the rest had "
+                     "the SPIR-V of another",
+                     starter_variants, pipeline_libraries.StoredCount() - stored_before);
+        }
     }
     if (per_shader_types) {
         LOG_INFO(Render_Vulkan,

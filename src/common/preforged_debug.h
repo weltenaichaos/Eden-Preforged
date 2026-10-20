@@ -38,6 +38,9 @@ struct DebugOptions {
     bool unreal_learned_pairs = true;
     /// Compiles the shader pairs found in the game files while the game loads.
     bool precompile_game_shaders = true;
+    /// Compiles them on a game's first start too, before it has drawn anything, with a starter
+    /// state most games draw with. Later starts use the states the game drew.
+    bool first_start_compile = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.
     bool log_shader_compiles = true;
     /// Share of the game file shader pairs to compile, in percent, most likely first. Compiled

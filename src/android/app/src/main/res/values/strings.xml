@@ -672,6 +672,8 @@
     <string name="preforged_rescan_game_files_description">Repeats the game file search on every start while on. Takes a few minutes.</string>
     <string name="preforged_precompile_game_shaders">Compile shaders from game files</string>
     <string name="preforged_precompile_game_shaders_description">Compiles the shader pairs found in the game files while the game loads, so they do not stutter later.</string>
+    <string name="preforged_first_start_compile">Compile on a game\'s first start</string>
+    <string name="preforged_first_start_compile_description">On a game\'s first start it has not drawn anything yet, so there is no state of its own to compile the shaders from the game files with. This compiles them with a starter state most games draw with (triangles, no MSAA, no alpha test), the fragment shaders for both window origins. Later starts use the states the game drew. Off compiles nothing on a first start. Takes effect at the next game start.</string>
     <string name="preforged_log_shader_compiles">Log shader compiles</string>
     <string name="preforged_log_shader_compiles_description">Logs every shader compile during play with its timing and where its shaders came from.</string>
     <string name="preforged_precompile_percent">Share of game file shaders to compile</string>

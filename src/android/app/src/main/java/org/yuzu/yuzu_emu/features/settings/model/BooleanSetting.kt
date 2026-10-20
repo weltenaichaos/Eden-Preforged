@@ -85,6 +85,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     PREFORGED_SCAN_GAME_FILES("preforged_scan_game_files"),
     PREFORGED_RESCAN_GAME_FILES("preforged_rescan_game_files"),
     PREFORGED_PRECOMPILE_GAME_SHADERS("preforged_precompile_game_shaders"),
+    PREFORGED_FIRST_START_COMPILE("preforged_first_start_compile"),
     PREFORGED_LOG_SHADER_COMPILES("preforged_log_shader_compiles"),
     PREFORGED_STORE_ANY_STATE("preforged_reuse_other_state"),
     PREFORGED_INPUT_TYPES_PER_SHADER("preforged_input_types_per_shader"),

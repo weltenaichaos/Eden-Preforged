@@ -1531,6 +1531,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_LOG_UNREAL_LINKS.key)
                 add(BooleanSetting.PREFORGED_UNREAL_LEARNED_PAIRS.key)
                 add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
+                add(BooleanSetting.PREFORGED_FIRST_START_COMPILE.key)
                 add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
                 add(BooleanSetting.PREFORGED_PIPELINE_LIBRARIES.key)
                 add(BooleanSetting.PREFORGED_OPTIMIZE_JOINED.key)

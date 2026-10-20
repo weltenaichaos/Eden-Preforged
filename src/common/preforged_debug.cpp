@@ -48,6 +48,7 @@ void LoadOptions() {
     options.rescan_game_files = Settings::values.preforged_rescan_game_files.GetValue();
     options.precompile_game_shaders =
         Settings::values.preforged_precompile_game_shaders.GetValue();
+    options.first_start_compile = Settings::values.preforged_first_start_compile.GetValue();
     options.log_shader_compiles = Settings::values.preforged_log_shader_compiles.GetValue();
     options.precompile_percent =
         std::min(Settings::values.preforged_precompile_percent.GetValue(), 100u);
@@ -102,9 +103,11 @@ void LoadOptions() {
     LOG_INFO(Common,
              "[Preforged] join pipelines from shader libraries {}, compile joined pipelines in "
              "full afterwards {}, test: join every pipeline {}, read Unity files {}, search "
-             "the game's program {}, find packed data inside files {}",
+             "the game's program {}, find packed data inside files {}, compile on a game's "
+             "first start {}",
              options.pipeline_libraries, options.optimize_joined, options.join_every_pipeline,
-             options.read_unity_files, options.search_program, options.find_packed_data);
+             options.read_unity_files, options.search_program, options.find_packed_data,
+             options.first_start_compile);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {
