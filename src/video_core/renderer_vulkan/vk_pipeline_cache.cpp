@@ -431,14 +431,21 @@ constexpr u16 IDENTITY_VIEWPORT_SWIZZLE = 0x6420;
 /// The alpha tests a first start compiles the fragment shaders from the game files for, besides
 /// "always" (off) that the starter state has. A fragment shader's SPIR-V holds the alpha test's
 /// comparison and reference, so a draw that discards texels by alpha needs a fragment shader
-/// compiled for that test; the game doesn't say which it uses until it draws. These are the ones
-/// games reach for most: discard a texel whose alpha is not greater than the 8-bit midpoint (the
-/// usual cutout) or than zero (anything fully see-through), and the same with "greater or equal".
-constexpr std::array<std::pair<Maxwell::ComparisonOp, float>, 3> FIRST_START_ALPHA_TESTS{{
-    {Maxwell::ComparisonOp::Greater_GL, 128.0f / 255.0f},
-    {Maxwell::ComparisonOp::Greater_GL, 0.0f},
-    {Maxwell::ComparisonOp::GreaterEqual_GL, 128.0f / 255.0f},
-}};
+/// compiled for that test; the game doesn't say which it uses until it draws. These are the
+/// comparisons and references games reach for most: discard a texel whose alpha is not greater
+/// (or greater-or-equal) than zero (anything fully see-through), the 8-bit midpoint 128/255, a
+/// half or one. A reference a game uses that is not in this set still compiles in play, and every
+/// later start uses the references the game actually drew.
+constexpr std::array<Maxwell::ComparisonOp, 2> FIRST_START_ALPHA_FUNCS{
+    Maxwell::ComparisonOp::Greater_GL,
+    Maxwell::ComparisonOp::GreaterEqual_GL,
+};
+constexpr std::array<float, 4> FIRST_START_ALPHA_REFS{
+    0.0f,
+    128.0f / 255.0f,
+    0.5f,
+    1.0f,
+};
 
 /// The state the shaders from the game files are compiled with on a game's first start, before
 /// it has drawn anything: triangles, one RGBA8 color target and a depth target, no MSAA, no alpha
@@ -2043,8 +2050,9 @@ void PipelineCache::PrecompilePreforgedPairs(
         size_t unpaired_shaders{};
         // Libraries for the other window origin or depth range, on a first start.
         size_t starter_variants{};
-        // Fragment libraries for a common alpha test, on a first start (first_start_states).
-        size_t alpha_variants{};
+        // Libraries for a common state a first start can't guess: an alpha test, point sprites or
+        // dual-source blending (first_start_states).
+        size_t state_variants{};
         const bool first_start_states{Common::Preforged::Options().first_start_states};
         const auto add_library{
             [&](u64 hash, const VideoCommon::PreforgedShader& shader, bool unpaired) {
@@ -2105,19 +2113,35 @@ void PipelineCache::PrecompilePreforgedPairs(
                     other.state.ndc_minus_one_to_one.Assign(1);
                     queue_variant(other, starter_variants);
                 }
-                // The starter state has the alpha test off, but many games discard see-through
-                // texels with one, and its comparison and reference are compiled into the fragment
-                // shader. So the fragment shaders are also compiled for the common alpha tests, so
-                // an alpha-tested draw joins a library instead of compiling the fragment in play.
-                if (!front && first_start_states) {
-                    for (const auto& [func, reference] : FIRST_START_ALPHA_TESTS) {
+                // The starter state leaves off a few things a first start can't guess, each
+                // compiled into the shader's SPIR-V, so a draw that uses one can't join the
+                // starter library and compiles the shader in play. So the shaders are also
+                // compiled for the common ones, so such a draw joins a library instead.
+                if (!first_start_states) {
+                    return;
+                }
+                if (front) {
+                    // Point sprites: a vertex shader writes the point size for them.
+                    GraphicsPipelineCacheKey other{key};
+                    other.state.topology.Assign(Maxwell::PrimitiveTopology::Points);
+                    queue_variant(other, state_variants);
+                    return;
+                }
+                // Alpha test: many games discard see-through texels with one (grass, fences,
+                // hair), its comparison and reference compiled into the fragment shader.
+                for (const Maxwell::ComparisonOp func : FIRST_START_ALPHA_FUNCS) {
+                    for (const float reference : FIRST_START_ALPHA_REFS) {
                         GraphicsPipelineCacheKey other{key};
                         other.state.alpha_test_func.Assign(
                             FixedPipelineState::PackComparisonOp(func));
                         other.state.alpha_test_ref = std::bit_cast<u32>(reference);
-                        queue_variant(other, alpha_variants);
+                        queue_variant(other, state_variants);
                     }
                 }
+                // Dual-source blending changes a fragment shader's outputs.
+                GraphicsPipelineCacheKey dual{key};
+                dual.state.attachment0_dual_source_blend.Assign(1);
+                queue_variant(dual, state_variants);
             }};
         for (const auto& [hash, shader] : programs.shaders) {
             add_library(hash, shader, false);
@@ -2275,9 +2299,10 @@ void PipelineCache::PrecompilePreforgedPairs(
         if (starter) {
             LOG_INFO(Render_Vulkan,
                      "[Preforged] first start: {} of the libraries were for the other window "
-                     "origin or depth range, {} for a common alpha test; {} new libraries were "
-                     "stored in all, the rest had the SPIR-V of another",
-                     starter_variants, alpha_variants,
+                     "origin or depth range, {} for a common alpha test, point sprites or "
+                     "dual-source blending; {} new libraries were stored in all, the rest had the "
+                     "SPIR-V of another",
+                     starter_variants, state_variants,
                      pipeline_libraries.StoredCount() - stored_before);
         }
     }

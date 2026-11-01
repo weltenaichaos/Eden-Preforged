@@ -44,12 +44,13 @@ struct DebugOptions {
     /// Compiles them on a game's first start too, before it has drawn anything, with a starter
     /// state most games draw with. Later starts use the states the game drew.
     bool first_start_compile = true;
-    /// On a game's first start, compiles the fragment shaders from the game files for the common
-    /// alpha tests as well, not only "off" as the starter state has it. Many games discard
-    /// see-through texels with an alpha test, whose comparison and reference are compiled into the
-    /// fragment shader, so a draw that uses one needs a fragment shader compiled for it. Costs a
-    /// longer first-start compile for a smoother first play. Later starts use the states the game
-    /// drew, so this only shapes the very first start.
+    /// On a game's first start, compiles the shaders from the game files for the common states a
+    /// first start can't guess as well, not only the starter state: the common alpha tests (games
+    /// discard see-through texels with one, its comparison and reference compiled into the
+    /// fragment shader), point sprites and dual-source blending. A draw that uses one then joins a
+    /// library instead of compiling the shader in play. Costs a longer first-start compile for a
+    /// smoother first play. Later starts use the states the game drew, so this only shapes the
+    /// very first start.
     bool first_start_states = true;
     /// Logs every shader compile during play, with its timing and where its shaders came from.
     bool log_shader_compiles = true;
