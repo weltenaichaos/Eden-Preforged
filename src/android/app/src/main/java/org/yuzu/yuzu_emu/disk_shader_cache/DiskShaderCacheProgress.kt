@@ -78,10 +78,12 @@ object DiskShaderCacheProgress {
         }
     }
 
-    // Shows how far along a compile stage is, e.g. "Precompiling game shaders  4321 / 24000", so a
-    // long first start reads as real progress instead of a bar that looks stuck.
+    // Shows how far along a compile stage is, e.g. "4321 / 24000  Precompiling game shaders", so a
+    // long first start reads as real progress instead of a bar that looks stuck. The count goes
+    // first so it stays visible: the label can be wider than the screen, and because the count
+    // changes every update the text view can't scroll it into view the way it does a fixed label.
     private fun withCount(message: String, progress: Int, max: Int): String =
-        if (max > 0) "$message  $progress / $max" else message
+        if (max > 0) "$progress / $max  $message" else message
 
     // Equivalent to VideoCore::LoadCallbackStage
     enum class LoadCallbackStage {
