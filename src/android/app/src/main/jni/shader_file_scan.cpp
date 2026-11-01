@@ -586,7 +586,23 @@ public:
         total_files = total;
     }
 
+    /// The progress bar counts in steps this many times finer than one file, so it can advance
+    /// through a single large file (a game's one big archive can be most of the search) instead of
+    /// standing still until the whole file is done.
+    static constexpr size_t PROGRESS_STEPS = 1000;
+
     void ReportProgress(bool force) {
+        ReportProgressAt(files_visited * PROGRESS_STEPS, force);
+    }
+
+    /// Reports progress part way through the file being scanned now, as `done` of `total` of it.
+    void ReportFileProgress(size_t done, size_t total) {
+        const size_t within = total == 0 ? 0 : std::min(done * PROGRESS_STEPS / total,
+                                                         PROGRESS_STEPS - 1);
+        ReportProgressAt(files_visited * PROGRESS_STEPS + within, false);
+    }
+
+    void ReportProgressAt(size_t steps, bool force) {
         if (!progress_callback || !*progress_callback) {
             return;
         }
@@ -596,7 +612,8 @@ public:
         }
         last_progress_report = now;
         // Stays one short of the end until the shaders are processed too.
-        (*progress_callback)(std::min(files_visited, total_files - 1), total_files);
+        const size_t max_steps = total_files * PROGRESS_STEPS;
+        (*progress_callback)(std::min(steps, max_steps - 1), max_steps);
     }
 
     void Report(std::string_view phase) const {
@@ -2068,6 +2085,9 @@ private:
             u64 streams_end = 0;
             for (size_t offset = 0; offset < size && !Stopped();
                  offset += CHUNK_SIZE) {
+                // Advances the progress bar through this file, since one large archive can be most
+                // of the whole search.
+                ReportFileProgress(offset, size);
                 const size_t length = std::min(size - offset, CHUNK_SIZE + CHUNK_OVERLAP);
                 chunk = file->ReadBytes(length, offset);
                 bytes_scanned += std::min(length, CHUNK_SIZE);

@@ -56,19 +56,32 @@ object DiskShaderCacheProgress {
                 )
 
                 LoadCallbackStage.PrecompileGameShaders -> emulationViewModel.updateProgress(
-                    emulationActivity.getString(R.string.precompiling_game_shaders),
+                    withCount(
+                        emulationActivity.getString(R.string.precompiling_game_shaders),
+                        progress,
+                        max
+                    ),
                     progress,
                     max
                 )
 
                 LoadCallbackStage.PrecompileCpuCode -> emulationViewModel.updateProgress(
-                    emulationActivity.getString(R.string.precompiling_cpu_code),
+                    withCount(
+                        emulationActivity.getString(R.string.precompiling_cpu_code),
+                        progress,
+                        max
+                    ),
                     progress,
                     max
                 )
             }
         }
     }
+
+    // Shows how far along a compile stage is, e.g. "Precompiling game shaders  4321 / 24000", so a
+    // long first start reads as real progress instead of a bar that looks stuck.
+    private fun withCount(message: String, progress: Int, max: Int): String =
+        if (max > 0) "$message  $progress / $max" else message
 
     // Equivalent to VideoCore::LoadCallbackStage
     enum class LoadCallbackStage {
