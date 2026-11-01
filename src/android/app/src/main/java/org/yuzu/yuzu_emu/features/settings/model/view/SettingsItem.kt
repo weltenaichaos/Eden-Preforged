@@ -293,6 +293,13 @@ abstract class SettingsItem(
                 )
             )
             put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_FIRST_START_STATES,
+                    titleId = R.string.preforged_first_start_states,
+                    descriptionId = R.string.preforged_first_start_states_description
+                )
+            )
+            put(
                 SliderSetting(
                     IntSetting.PREFORGED_PRECOMPILE_PERCENT,
                     titleId = R.string.preforged_precompile_percent,

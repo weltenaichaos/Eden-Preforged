@@ -16,8 +16,10 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include <array>
 #include <bit>
 #include <numeric>
+#include <utility>
 #include "common/cityhash.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -425,6 +427,18 @@ u64 LibrarySource(LibraryHalf half, u64 shader, u64 state_hash) {
 
 /// x, y, z and w of a viewport as they are.
 constexpr u16 IDENTITY_VIEWPORT_SWIZZLE = 0x6420;
+
+/// The alpha tests a first start compiles the fragment shaders from the game files for, besides
+/// "always" (off) that the starter state has. A fragment shader's SPIR-V holds the alpha test's
+/// comparison and reference, so a draw that discards texels by alpha needs a fragment shader
+/// compiled for that test; the game doesn't say which it uses until it draws. These are the ones
+/// games reach for most: discard a texel whose alpha is not greater than the 8-bit midpoint (the
+/// usual cutout) or than zero (anything fully see-through), and the same with "greater or equal".
+constexpr std::array<std::pair<Maxwell::ComparisonOp, float>, 3> FIRST_START_ALPHA_TESTS{{
+    {Maxwell::ComparisonOp::Greater_GL, 128.0f / 255.0f},
+    {Maxwell::ComparisonOp::Greater_GL, 0.0f},
+    {Maxwell::ComparisonOp::GreaterEqual_GL, 128.0f / 255.0f},
+}};
 
 /// The state the shaders from the game files are compiled with on a game's first start, before
 /// it has drawn anything: triangles, one RGBA8 color target and a depth target, no MSAA, no alpha
@@ -2029,6 +2043,9 @@ void PipelineCache::PrecompilePreforgedPairs(
         size_t unpaired_shaders{};
         // Libraries for the other window origin or depth range, on a first start.
         size_t starter_variants{};
+        // Fragment libraries for a common alpha test, on a first start (first_start_states).
+        size_t alpha_variants{};
+        const bool first_start_states{Common::Preforged::Options().first_start_states};
         const auto add_library{
             [&](u64 hash, const VideoCommon::PreforgedShader& shader, bool unpaired) {
                 LibraryHalf half{};
@@ -2063,25 +2080,44 @@ void PipelineCache::PrecompilePreforgedPairs(
                 if (!starter) {
                     return;
                 }
+                // Queues one more state of this shader to compile on a first start. Skips it when
+                // its state leaves the SPIR-V the same as the base's or matches a stored library.
+                const auto queue_variant{[&](const GraphicsPipelineCacheKey& other,
+                                             size_t& counter) {
+                    const u64 other_source{LibrarySource(half, hash, ShaderStateHash(other))};
+                    if (other_source == source || pipeline_libraries.HasSource(other_source)) {
+                        return;
+                    }
+                    library_candidates[1].push_back(
+                        LibraryJob{hash, &shader, half, other, drawn_types, other_source});
+                    ++counter;
+                }};
                 // Before the game has drawn, its window origin isn't known, nor its depth range,
                 // which changes vertex shaders without VK_EXT_depth_clip_control. Both change the
                 // SPIR-V of the shaders that read them, so the other one is compiled too. A
                 // shader whose SPIR-V stays the same is stored once.
-                GraphicsPipelineCacheKey other{key};
                 if (!front) {
+                    GraphicsPipelineCacheKey other{key};
                     other.state.y_negate.Assign(1);
+                    queue_variant(other, starter_variants);
                 } else if (!device.IsExtDepthClipControlSupported()) {
+                    GraphicsPipelineCacheKey other{key};
                     other.state.ndc_minus_one_to_one.Assign(1);
-                } else {
-                    return;
+                    queue_variant(other, starter_variants);
                 }
-                const u64 other_source{LibrarySource(half, hash, ShaderStateHash(other))};
-                if (other_source != source && pipeline_libraries.HasSource(other_source)) {
-                    return;
+                // The starter state has the alpha test off, but many games discard see-through
+                // texels with one, and its comparison and reference are compiled into the fragment
+                // shader. So the fragment shaders are also compiled for the common alpha tests, so
+                // an alpha-tested draw joins a library instead of compiling the fragment in play.
+                if (!front && first_start_states) {
+                    for (const auto& [func, reference] : FIRST_START_ALPHA_TESTS) {
+                        GraphicsPipelineCacheKey other{key};
+                        other.state.alpha_test_func.Assign(
+                            FixedPipelineState::PackComparisonOp(func));
+                        other.state.alpha_test_ref = std::bit_cast<u32>(reference);
+                        queue_variant(other, alpha_variants);
+                    }
                 }
-                library_candidates[1].push_back(
-                    LibraryJob{hash, &shader, half, other, drawn_types, other_source});
-                ++starter_variants;
             }};
         for (const auto& [hash, shader] : programs.shaders) {
             add_library(hash, shader, false);
@@ -2239,9 +2275,10 @@ void PipelineCache::PrecompilePreforgedPairs(
         if (starter) {
             LOG_INFO(Render_Vulkan,
                      "[Preforged] first start: {} of the libraries were for the other window "
-                     "origin or depth range; {} new libraries were stored in all, the rest had "
-                     "the SPIR-V of another",
-                     starter_variants, pipeline_libraries.StoredCount() - stored_before);
+                     "origin or depth range, {} for a common alpha test; {} new libraries were "
+                     "stored in all, the rest had the SPIR-V of another",
+                     starter_variants, alpha_variants,
+                     pipeline_libraries.StoredCount() - stored_before);
         }
     }
     if (per_shader_types) {
