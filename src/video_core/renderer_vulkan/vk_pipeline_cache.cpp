@@ -1436,6 +1436,52 @@ u32 ApplyInputUse(GraphicsPipelineCacheKey& key, const InputUse& use,
     }
     return typed;
 }
+
+/// Up to this many integer attributes, SignMixes makes every mix; past it, the mixes with one or
+/// two attributes flipped.
+constexpr size_t SIGN_MIX_ALL_UP_TO = 4;
+
+/// The mixes of signed and unsigned over the integer vertex attributes of `key`, other than the
+/// one it has. A shader's code reads a signed and an unsigned integer attribute alike, so a first
+/// start can't tell them apart, and games often feed both to one vertex shader (an unsigned index
+/// next to signed data). A draw with any of these mixes then joins a library.
+std::vector<GraphicsPipelineCacheKey> SignMixes(const GraphicsPipelineCacheKey& key) {
+    std::array<size_t, Maxwell::NumVertexAttributes> integers{};
+    size_t count{};
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        const u32 type{key.state.DynamicAttributeType(index)};
+        if (type == 2 || type == 3) {
+            integers[count++] = index;
+        }
+    }
+    std::vector<GraphicsPipelineCacheKey> mixes;
+    const auto add{[&](u32 flips) {
+        GraphicsPipelineCacheKey mix{key};
+        for (size_t bit = 0; bit < count; ++bit) {
+            if (((flips >> bit) & 1) == 0) {
+                continue;
+            }
+            const size_t index{integers[bit]};
+            const u64 type{mix.state.DynamicAttributeType(index) == 3 ? 2u : 3u};
+            mix.state.attribute_types &= ~(u64{3} << (index * 2));
+            mix.state.attribute_types |= type << (index * 2);
+        }
+        mixes.push_back(mix);
+    }};
+    if (count <= SIGN_MIX_ALL_UP_TO) {
+        for (u32 flips = 1; flips < (1u << count); ++flips) {
+            add(flips);
+        }
+    } else {
+        for (size_t first = 0; first < count; ++first) {
+            add(1u << first);
+            for (size_t second = first + 1; second < count; ++second) {
+                add((1u << first) | (1u << second));
+            }
+        }
+    }
+    return mixes;
+}
 } // Anonymous namespace
 
 void PipelineCache::OpenPreforgedStore(const std::filesystem::path& base_dir) {
@@ -2044,9 +2090,9 @@ void PipelineCache::PrecompilePreforgedPairs(
             GraphicsPipelineCacheKey key;
             bool drawn_types;
             u64 source;
-            /// Reads the vertex shader's integer attributes as signed instead of the unsigned a
-            /// first start guesses. The attribute types are resolved in the worker, so the flip
-            /// happens there, after the guess.
+            /// Compiles the vertex shader for every mix of signed and unsigned over its integer
+            /// attributes, other than the unsigned guess of a first start. The attribute types are
+            /// resolved in the worker, so the mixes are made there, after the guess.
             bool flip_integer_sign = false;
         };
         // Shaders the game drew come first, since a new pipeline in play most often pairs a
@@ -2065,7 +2111,7 @@ void PipelineCache::PrecompilePreforgedPairs(
         // With a dynamic reference one library per alpha test function covers every reference, so
         // the reference variants collapse to a single canonical one.
         const bool dynamic_alpha_ref{Common::Preforged::Options().dynamic_alpha_ref};
-        // Compiles each vertex shader a second time with its integer attributes read as signed.
+        // Compiles each vertex shader for the signed and unsigned mixes of its integer attributes.
         const bool first_start_signed{Common::Preforged::Options().first_start_vertex_signed};
         // Marks a library source apart as the signed-attribute reading of a vertex shader, so it
         // doesn't collide with the unsigned reading's source and later starts skip it once stored.
@@ -2144,9 +2190,9 @@ void PipelineCache::PrecompilePreforgedPairs(
                     queue_variant(other, state_variants);
                     // A signed-integer vertex attribute reads the same as an unsigned one in the
                     // shader's code, so a first start can't tell them apart and guesses unsigned.
-                    // The signed reading is compiled too, so a draw that feeds a signed attribute
-                    // joins a library instead of compiling the vertex shader in play. The flip to
-                    // signed happens in the worker, where the attribute types are resolved; the
+                    // The signed and unsigned mixes are compiled too, so a draw that feeds a signed
+                    // attribute joins a library instead of compiling the vertex shader in play. The
+                    // mixes are made in the worker, where the attribute types are resolved; the
                     // source is marked apart so it doesn't collide with the unsigned reading's.
                     if (first_start_signed) {
                         const u64 signed_source{source ^ SIGNED_VARIANT_SENTINEL};
@@ -2218,6 +2264,8 @@ void PipelineCache::PrecompilePreforgedPairs(
             std::array<size_t, LIBRARY_FALLBACK_NAMES.size()> fallbacks{};
             double total_ms{};
             double longest_ms{};
+            /// Libraries compiled for the signed and unsigned mixes of vertex attributes.
+            size_t sign_mixes{};
         } library_state;
         const auto library_start{std::chrono::steady_clock::now()};
         const size_t stored_before{pipeline_libraries.StoredCount()};
@@ -2231,94 +2279,119 @@ void PipelineCache::PrecompilePreforgedPairs(
                 GraphicsPipelineCacheKey key{job.key};
                 const bool front{job.half == LibraryHalf::Front};
                 // Attribute types for a vertex shader the game hasn't drawn, as for the pairs.
+                bool types_resolved{false};
                 if (front && per_shader_types && key.state.dynamic_vertex_input) {
                     const InputUse use{input_use_of(job.hash, *job.shader, shared.texture_bound,
                                                     key, job.drawn_types)};
                     if (!job.drawn_types) {
                         ApplyInputUse(key, use, votes);
                     }
-                    // The signed reading: the guess above gives every integer attribute the
-                    // unsigned type, so flip those to signed. A draw that feeds a signed attribute
-                    // then joins this library instead of compiling the vertex shader in play. A
-                    // shader with no integer attribute gives the same SPIR-V as the unsigned
-                    // reading and is folded by code hash when it is stored.
-                    if (job.flip_integer_sign) {
-                        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
-                            if (key.state.DynamicAttributeType(index) == 3) { // unsigned -> signed
-                                key.state.attribute_types &= ~(u64{3} << (index * 2));
-                                key.state.attribute_types |= u64{2} << (index * 2);
+                    types_resolved = true;
+                }
+                // The states to compile: the job's own, or for the signed reading every mix of
+                // signed and unsigned over the vertex shader's integer attributes other than the
+                // unsigned guess the shader's own job compiles. The guess above gives every
+                // integer attribute the unsigned type, and a game often feeds an unsigned index
+                // next to signed data in one shader, so a draw with any mix joins a library.
+                std::vector<GraphicsPipelineCacheKey> variants;
+                if (!job.flip_integer_sign) {
+                    variants.push_back(key);
+                } else if (types_resolved) {
+                    variants = SignMixes(key);
+                }
+                const auto compile_variant{[&](const GraphicsPipelineCacheKey& variant)
+                                               -> std::pair<std::optional<LibraryFallback>, bool> {
+                    VideoCommon::PreforgedEnvironment env{job.shader->code, job.shader->stage,
+                                                          job.shader->start_address,
+                                                          shared.texture_bound};
+                    std::optional<LibraryFallback> fallback;
+                    bool compiled{};
+                    try {
+                        ShaderPools pools;
+                        std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> stage_programs;
+                        std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+                        std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+                        std::vector<u32> code;
+                        const size_t stage{front ? 0U : Maxwell::MaxShaderStage - 1};
+                        if (front) {
+                            // The vertex shader as a pipeline of only it and a fragment shader
+                            // translates it: in set 0 from binding 0, the stage first in line.
+                            Shader::IR::Program& program{stage_programs[1]};
+                            const u32 cfg_offset{static_cast<u32>(env.StartAddress() +
+                                                                  sizeof(Shader::ProgramHeader))};
+                            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset,
+                                                           false);
+                            program =
+                                TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                            infos[stage] = &program.info;
+                            if (!FitsLibraryScaling(infos, LibraryHalf::Front)) {
+                                fallback = LibraryFallback::TooManyImages;
+                            } else {
+                                const Shader::RuntimeInfo runtime_info{MakeRuntimeInfo(
+                                    stage_programs, variant, program, nullptr, device)};
+                                ConvertLegacyToGeneric(program, runtime_info);
+                                Shader::Backend::Bindings bindings{};
+                                code = EmitSPIRV(profile, runtime_info, program, bindings);
                             }
-                        }
-                    }
-                }
-                VideoCommon::PreforgedEnvironment env{job.shader->code, job.shader->stage,
-                                                      job.shader->start_address,
-                                                      shared.texture_bound};
-                const auto job_start{std::chrono::steady_clock::now()};
-                std::optional<LibraryFallback> fallback;
-                bool compiled{};
-                try {
-                    ShaderPools pools;
-                    std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> stage_programs;
-                    std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
-                    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
-                    std::vector<u32> code;
-                    const size_t stage{front ? 0U : Maxwell::MaxShaderStage - 1};
-                    if (front) {
-                        // The vertex shader as a pipeline of only it and a fragment shader
-                        // translates it: in set 0 from binding 0, the stage first in line.
-                        Shader::IR::Program& program{stage_programs[1]};
-                        const u32 cfg_offset{
-                            static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-                        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
-                        program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
-                        infos[stage] = &program.info;
-                        if (!FitsLibraryScaling(infos, LibraryHalf::Front)) {
-                            fallback = LibraryFallback::TooManyImages;
                         } else {
-                            const Shader::RuntimeInfo runtime_info{
-                                MakeRuntimeInfo(stage_programs, key, program, nullptr, device)};
-                            ConvertLegacyToGeneric(program, runtime_info);
-                            Shader::Backend::Bindings bindings{};
-                            code = EmitSPIRV(profile, runtime_info, program, bindings);
+                            Shader::IR::Program& program{
+                                stage_programs[Maxwell::MaxShaderProgram - 1]};
+                            fallback = TranslateLibraryFragment(pools, env, host_info, profile,
+                                                                stage_programs, variant, device,
+                                                                nullptr, program, code);
+                            infos[stage] = &program.info;
                         }
+                        if (!fallback) {
+                            modules[stage] = BuildShader(device, code);
+                            compiled = pipeline_libraries.CompileIntoStore(
+                                job.half, FoldCodeHash(0, code), job.source,
+                                [&](VkPipelineCache cache) {
+                                    return GraphicsPipeline::CreateLibrary(
+                                        device, render_pass_cache, variant, job.half, modules,
+                                        infos, cache);
+                                });
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_DEBUG(Render_Vulkan, "[Preforged] library of {:016x} failed: {}",
+                                  job.hash, e.what());
+                        fallback = LibraryFallback::TranslateFailed;
+                    }
+                    return {fallback, compiled};
+                }};
+                std::array<size_t, LIBRARY_FALLBACK_NAMES.size()> job_fallbacks{};
+                size_t job_compiled{};
+                size_t job_failed{};
+                double job_ms{};
+                double job_longest_ms{};
+                for (const GraphicsPipelineCacheKey& variant : variants) {
+                    const auto variant_start{std::chrono::steady_clock::now()};
+                    const auto result{compile_variant(variant)};
+                    const std::chrono::duration<double, std::milli> time{
+                        std::chrono::steady_clock::now() - variant_start};
+                    if (result.first) {
+                        ++job_fallbacks[static_cast<size_t>(*result.first)];
+                    } else if (result.second) {
+                        ++job_compiled;
+                        job_ms += time.count();
+                        job_longest_ms = std::max(job_longest_ms, time.count());
                     } else {
-                        Shader::IR::Program& program{stage_programs[Maxwell::MaxShaderProgram - 1]};
-                        fallback =
-                            TranslateLibraryFragment(pools, env, host_info, profile, stage_programs,
-                                                     key, device, nullptr, program, code);
-                        infos[stage] = &program.info;
+                        ++job_failed;
                     }
-                    if (!fallback) {
-                        modules[stage] = BuildShader(device, code);
-                        compiled = pipeline_libraries.CompileIntoStore(
-                            job.half, FoldCodeHash(0, code), job.source,
-                            [&](VkPipelineCache cache) {
-                                return GraphicsPipeline::CreateLibrary(device, render_pass_cache,
-                                                                       key, job.half, modules,
-                                                                       infos, cache);
-                            });
-                    }
-                } catch (const std::exception& e) {
-                    LOG_DEBUG(Render_Vulkan, "[Preforged] library of {:016x} failed: {}", job.hash,
-                              e.what());
-                    fallback = LibraryFallback::TranslateFailed;
                 }
-                if (fallback || !compiled) {
+                if (job_compiled == 0) {
                     // Not tried again on later boots.
                     pipeline_libraries.NoteSource(job.source);
                 }
-                const std::chrono::duration<double, std::milli> time{
-                    std::chrono::steady_clock::now() - job_start};
                 std::scoped_lock lock{library_state.mutex};
-                if (fallback) {
-                    ++library_state.fallbacks[static_cast<size_t>(*fallback)];
-                } else if (compiled) {
-                    ++library_state.compiled;
-                    library_state.total_ms += time.count();
-                    library_state.longest_ms = std::max(library_state.longest_ms, time.count());
-                } else {
-                    ++library_state.failed;
+                for (size_t index = 0; index < job_fallbacks.size(); ++index) {
+                    library_state.fallbacks[index] += job_fallbacks[index];
+                }
+                library_state.compiled += job_compiled;
+                library_state.failed += job_failed;
+                library_state.total_ms += job_ms;
+                library_state.longest_ms = std::max(library_state.longest_ms, job_longest_ms);
+                if (job.flip_integer_sign) {
+                    library_state.sign_mixes += job_compiled;
                 }
                 ++library_state.done;
                 callback(VideoCore::LoadCallbackStage::PrecompileGameShaders, library_state.done,
@@ -2349,9 +2422,10 @@ void PipelineCache::PrecompilePreforgedPairs(
             LOG_INFO(Render_Vulkan,
                      "[Preforged] first start: {} of the libraries were for the other window "
                      "origin or depth range, {} for a common alpha test, point sprites or "
-                     "dual-source blending, {} for signed vertex attributes; {} new libraries were "
-                     "stored in all, the rest had the SPIR-V of another",
-                     starter_variants, state_variants, signed_variants,
+                     "dual-source blending, {} vertex shaders for signed vertex attributes ({} "
+                     "signed and unsigned mixes compiled); {} new libraries were stored in all, "
+                     "the rest had the SPIR-V of another",
+                     starter_variants, state_variants, signed_variants, library_state.sign_mixes,
                      pipeline_libraries.StoredCount() - stored_before);
         }
     }
