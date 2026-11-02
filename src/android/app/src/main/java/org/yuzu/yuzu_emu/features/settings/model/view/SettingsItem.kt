@@ -307,6 +307,13 @@ abstract class SettingsItem(
                 )
             )
             put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_FIRST_START_VERTEX_SIGNED,
+                    titleId = R.string.preforged_first_start_vertex_signed,
+                    descriptionId = R.string.preforged_first_start_vertex_signed_description
+                )
+            )
+            put(
                 SliderSetting(
                     IntSetting.PREFORGED_PRECOMPILE_PERCENT,
                     titleId = R.string.preforged_precompile_percent,

@@ -2044,6 +2044,10 @@ void PipelineCache::PrecompilePreforgedPairs(
             GraphicsPipelineCacheKey key;
             bool drawn_types;
             u64 source;
+            /// Reads the vertex shader's integer attributes as signed instead of the unsigned a
+            /// first start guesses. The attribute types are resolved in the worker, so the flip
+            /// happens there, after the guess.
+            bool flip_integer_sign = false;
         };
         // Shaders the game drew come first, since a new pipeline in play most often pairs a
         // drawn shader with another.
@@ -2061,6 +2065,12 @@ void PipelineCache::PrecompilePreforgedPairs(
         // With a dynamic reference one library per alpha test function covers every reference, so
         // the reference variants collapse to a single canonical one.
         const bool dynamic_alpha_ref{Common::Preforged::Options().dynamic_alpha_ref};
+        // Compiles each vertex shader a second time with its integer attributes read as signed.
+        const bool first_start_signed{Common::Preforged::Options().first_start_vertex_signed};
+        // Marks a library source apart as the signed-attribute reading of a vertex shader, so it
+        // doesn't collide with the unsigned reading's source and later starts skip it once stored.
+        constexpr u64 SIGNED_VARIANT_SENTINEL{0x5369'676E'6564'5661ULL}; // "SignedVa"
+        size_t signed_variants{};
         const auto add_library{
             [&](u64 hash, const VideoCommon::PreforgedShader& shader, bool unpaired) {
                 LibraryHalf half{};
@@ -2132,6 +2142,20 @@ void PipelineCache::PrecompilePreforgedPairs(
                     GraphicsPipelineCacheKey other{key};
                     other.state.topology.Assign(Maxwell::PrimitiveTopology::Points);
                     queue_variant(other, state_variants);
+                    // A signed-integer vertex attribute reads the same as an unsigned one in the
+                    // shader's code, so a first start can't tell them apart and guesses unsigned.
+                    // The signed reading is compiled too, so a draw that feeds a signed attribute
+                    // joins a library instead of compiling the vertex shader in play. The flip to
+                    // signed happens in the worker, where the attribute types are resolved; the
+                    // source is marked apart so it doesn't collide with the unsigned reading's.
+                    if (first_start_signed) {
+                        const u64 signed_source{source ^ SIGNED_VARIANT_SENTINEL};
+                        if (!pipeline_libraries.HasSource(signed_source)) {
+                            library_candidates[1].push_back(LibraryJob{
+                                hash, &shader, half, key, drawn_types, signed_source, true});
+                            ++signed_variants;
+                        }
+                    }
                     return;
                 }
                 // Alpha test: many games discard see-through texels with one (grass, fences,
@@ -2212,6 +2236,19 @@ void PipelineCache::PrecompilePreforgedPairs(
                                                     key, job.drawn_types)};
                     if (!job.drawn_types) {
                         ApplyInputUse(key, use, votes);
+                    }
+                    // The signed reading: the guess above gives every integer attribute the
+                    // unsigned type, so flip those to signed. A draw that feeds a signed attribute
+                    // then joins this library instead of compiling the vertex shader in play. A
+                    // shader with no integer attribute gives the same SPIR-V as the unsigned
+                    // reading and is folded by code hash when it is stored.
+                    if (job.flip_integer_sign) {
+                        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+                            if (key.state.DynamicAttributeType(index) == 3) { // unsigned -> signed
+                                key.state.attribute_types &= ~(u64{3} << (index * 2));
+                                key.state.attribute_types |= u64{2} << (index * 2);
+                            }
+                        }
                     }
                 }
                 VideoCommon::PreforgedEnvironment env{job.shader->code, job.shader->stage,
@@ -2312,9 +2349,9 @@ void PipelineCache::PrecompilePreforgedPairs(
             LOG_INFO(Render_Vulkan,
                      "[Preforged] first start: {} of the libraries were for the other window "
                      "origin or depth range, {} for a common alpha test, point sprites or "
-                     "dual-source blending; {} new libraries were stored in all, the rest had the "
-                     "SPIR-V of another",
-                     starter_variants, state_variants,
+                     "dual-source blending, {} for signed vertex attributes; {} new libraries were "
+                     "stored in all, the rest had the SPIR-V of another",
+                     starter_variants, state_variants, signed_variants,
                      pipeline_libraries.StoredCount() - stored_before);
         }
     }

@@ -51,6 +51,8 @@ void LoadOptions() {
     options.first_start_compile = Settings::values.preforged_first_start_compile.GetValue();
     options.first_start_states = Settings::values.preforged_first_start_states.GetValue();
     options.dynamic_alpha_ref = Settings::values.preforged_dynamic_alpha_ref.GetValue();
+    options.first_start_vertex_signed =
+        Settings::values.preforged_first_start_vertex_signed.GetValue();
     options.log_shader_compiles = Settings::values.preforged_log_shader_compiles.GetValue();
     options.precompile_percent =
         std::min(Settings::values.preforged_precompile_percent.GetValue(), 100u);
@@ -108,11 +110,13 @@ void LoadOptions() {
              "full afterwards {}, test: join every pipeline {}, read Unity files {}, read "
              "IoStore containers {}, search the game's program {}, find packed data inside files "
              "{}, search and compile on a game's first start {}, compile common states on a "
-             "first start {}, dynamic alpha test reference {}",
+             "first start {}, dynamic alpha test reference {}, signed vertex attributes on a "
+             "first start {}",
              options.pipeline_libraries, options.optimize_joined, options.join_every_pipeline,
              options.read_unity_files, options.read_iostore, options.search_program,
              options.find_packed_data,
-             options.first_start_compile, options.first_start_states, options.dynamic_alpha_ref);
+             options.first_start_compile, options.first_start_states, options.dynamic_alpha_ref,
+             options.first_start_vertex_signed);
     if (options.track_allocations) {
         HeapProfile::Start();
     } else if (HeapProfile::Sampling()) {

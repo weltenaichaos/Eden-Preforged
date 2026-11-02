@@ -941,6 +941,9 @@ struct Values {
                                                Category::Miscellaneous};
     Setting<bool> preforged_dynamic_alpha_ref{linkage, false, "preforged_dynamic_alpha_ref",
                                               Category::Miscellaneous};
+    Setting<bool> preforged_first_start_vertex_signed{linkage, false,
+                                                      "preforged_first_start_vertex_signed",
+                                                      Category::Miscellaneous};
     Setting<bool> preforged_log_shader_compiles{linkage, true, "preforged_log_shader_compiles", Category::Miscellaneous};
     Setting<bool> preforged_store_any_state{linkage, false, "preforged_reuse_other_state", Category::Miscellaneous};
     Setting<bool> preforged_input_types_per_shader{linkage, true, "preforged_input_types_per_shader", Category::Miscellaneous};

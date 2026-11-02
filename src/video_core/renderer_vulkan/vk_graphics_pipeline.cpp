@@ -1591,6 +1591,23 @@ bool GraphicsPipeline::JoinPipeline(VkRenderPass render_pass,
                  "fragment half {} {:.2f} ms, join {:.2f} ms",
                  key.Hash(), PipelineLibraries::SourceName(front.source), front.ms,
                  PipelineLibraries::SourceName(back.source), back.ms, link_time.count());
+        // When the vertex half had to be compiled in play, log the attribute types it was drawn
+        // with, so a first start's cold vertex compiles can be read off and covered ahead.
+        if (front.source == PipelineLibraries::Source::Compiled) {
+            std::string attrs;
+            for (size_t index = 0; index < key.state.attributes.size(); ++index) {
+                const u32 type{key.state.DynamicAttributeType(index)};
+                if (type != 0) {
+                    attrs += fmt::format("{}:{} ", index,
+                                         type == 1 ? "float" : type == 2 ? "sint" : "uint");
+                }
+            }
+            LOG_INFO(Render_Vulkan,
+                     "[ShaderTiming] {:016x} vertex half compiled in play, dynamic vertex input "
+                     "{}, attribute types: {}",
+                     key.Hash(), key.state.dynamic_vertex_input != 0,
+                     attrs.empty() ? std::string{"none"} : attrs);
+        }
     }
     return true;
 }

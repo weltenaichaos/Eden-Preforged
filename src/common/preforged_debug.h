@@ -59,6 +59,13 @@ struct DebugOptions {
     /// it is tested. Changing it rebuilds the shaders a game draws (its state hashes change), so
     /// its first start after a flip compiles again.
     bool dynamic_alpha_ref = false;
+    /// On a game's first start, compiles each vertex shader a second time with its integer vertex
+    /// attributes read as signed as well as unsigned. A first start can't tell a signed integer
+    /// attribute from an unsigned one from the shader's code alone, so it guesses unsigned; a draw
+    /// that feeds a signed attribute then compiles the vertex shader in play. Compiling both
+    /// readings ahead lets such a draw join a library instead. Costs a longer first-start compile.
+    /// Off by default while it is tested. Later starts use the types the game drew.
+    bool first_start_vertex_signed = false;
     /// Logs every shader compile during play, with its timing and where its shaders came from.
     bool log_shader_compiles = true;
     /// Share of the game file shader pairs to compile, in percent, most likely first. Compiled
