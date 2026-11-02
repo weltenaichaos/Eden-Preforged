@@ -257,6 +257,10 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
         info.alpha_test_func = MaxwellToCompareFunction(
             key.state.UnpackComparisonOp(key.state.alpha_test_func.Value()));
         info.alpha_test_reference = std::bit_cast<float>(key.state.alpha_test_ref);
+        // One fragment shader per alpha test function covers every reference value: the reference
+        // comes from a push constant at draw time, so it is left out of the state that forks the
+        // shader (the state carries a canonical 0 when this is on).
+        info.alpha_test_dynamic_reference = Common::Preforged::Options().dynamic_alpha_ref;
 
         info.dual_source_blend = key.state.attachment0_dual_source_blend != 0;
 
@@ -2054,6 +2058,9 @@ void PipelineCache::PrecompilePreforgedPairs(
         // dual-source blending (first_start_states).
         size_t state_variants{};
         const bool first_start_states{Common::Preforged::Options().first_start_states};
+        // With a dynamic reference one library per alpha test function covers every reference, so
+        // the reference variants collapse to a single canonical one.
+        const bool dynamic_alpha_ref{Common::Preforged::Options().dynamic_alpha_ref};
         const auto add_library{
             [&](u64 hash, const VideoCommon::PreforgedShader& shader, bool unpaired) {
                 LibraryHalf half{};
@@ -2134,8 +2141,13 @@ void PipelineCache::PrecompilePreforgedPairs(
                         GraphicsPipelineCacheKey other{key};
                         other.state.alpha_test_func.Assign(
                             FixedPipelineState::PackComparisonOp(func));
-                        other.state.alpha_test_ref = std::bit_cast<u32>(reference);
+                        other.state.alpha_test_ref =
+                            dynamic_alpha_ref ? 0u : std::bit_cast<u32>(reference);
                         queue_variant(other, state_variants);
+                        if (dynamic_alpha_ref) {
+                            // The reference is sent per draw, so one variant per function is enough.
+                            break;
+                        }
                     }
                 }
                 // Dual-source blending changes a fragment shader's outputs.

@@ -52,6 +52,13 @@ struct DebugOptions {
     /// smoother first play. Later starts use the states the game drew, so this only shapes the
     /// very first start.
     bool first_start_states = true;
+    /// Reads the alpha test reference from a push constant the host sets per draw, instead of
+    /// baking it into the fragment shader. The reference then stops forking the shader, so one
+    /// library per alpha test function covers every reference value a game uses. This cuts the
+    /// scattered first-start compiles games cause by nudging that reference. Off by default while
+    /// it is tested. Changing it rebuilds the shaders a game draws (its state hashes change), so
+    /// its first start after a flip compiles again.
+    bool dynamic_alpha_ref = false;
     /// Logs every shader compile during play, with its timing and where its shaders came from.
     bool log_shader_compiles = true;
     /// Share of the game file shader pairs to compile, in percent, most likely first. Compiled

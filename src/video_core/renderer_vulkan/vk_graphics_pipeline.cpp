@@ -49,6 +49,7 @@ namespace {
 using boost::container::small_vector;
 using boost::container::static_vector;
 using Shader::ImageBufferDescriptor;
+using Shader::Backend::SPIRV::ALPHA_REF_LAYOUT_OFFSET;
 using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
@@ -1397,6 +1398,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
+    // When the alpha test reference is dynamic the fragment shader reads it from a push constant, so
+    // send this draw's live reference. One shader then covers every reference value.
+    const bool push_alpha_ref{Common::Preforged::Options().dynamic_alpha_ref &&
+                              maxwell3d != nullptr};
+    const f32 alpha_ref_value{push_alpha_ref ? maxwell3d->regs.alpha_test_ref : 0.0f};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
     const bool bind_descriptor_buffer{
         descriptor_set_layout && uses_descriptor_buffer &&
@@ -1425,7 +1431,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words, push_alpha_ref,
+                      alpha_ref_value](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -1452,6 +1459,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
                                  &render_area_data);
+        }
+        if (push_alpha_ref) {
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                                 ALPHA_REF_LAYOUT_OFFSET, sizeof(alpha_ref_value),
+                                 &alpha_ref_value);
         }
         if (uses_libraries) {
             // Set 0 for the stages before the fragment shader, set 1 for the fragment shader,

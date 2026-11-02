@@ -300,6 +300,13 @@ abstract class SettingsItem(
                 )
             )
             put(
+                SwitchSetting(
+                    BooleanSetting.PREFORGED_DYNAMIC_ALPHA_REF,
+                    titleId = R.string.preforged_dynamic_alpha_ref,
+                    descriptionId = R.string.preforged_dynamic_alpha_ref_description
+                )
+            )
+            put(
                 SliderSetting(
                     IntSetting.PREFORGED_PRECOMPILE_PERCENT,
                     titleId = R.string.preforged_precompile_percent,

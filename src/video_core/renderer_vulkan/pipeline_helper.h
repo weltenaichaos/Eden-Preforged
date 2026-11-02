@@ -13,6 +13,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include "common/preforged_debug.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -310,15 +311,22 @@ public:
 
 private:
     VkPushConstantRange PushConstantRange() const noexcept {
+        using Shader::Backend::SPIRV::AlphaRefLayout;
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+        // Graphics pipelines reserve room for the live alpha test reference when the setting asks
+        // for it, so the fragment shader and the host agree on the same push constant layout.
+        const u32 alpha_ref_size =
+            !is_compute && Common::Preforged::Options().dynamic_alpha_ref
+                ? static_cast<u32>(sizeof(AlphaRefLayout))
+                : 0u;
         return VkPushConstantRange{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS),
             .offset = 0,
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
-                    static_cast<u32>(sizeof(RenderAreaLayout)),
+                    static_cast<u32>(sizeof(RenderAreaLayout)) + alpha_ref_size,
         };
     }
 

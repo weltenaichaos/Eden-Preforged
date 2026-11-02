@@ -29,9 +29,17 @@ struct RescalingLayout {
 struct RenderAreaLayout {
     std::array<f32, 4> render_area;
 };
+// The alpha test reference, pushed live when preforged_dynamic_alpha_ref is on so one fragment
+// shader serves every reference value. It sits past the rescaling and render-area push constants
+// so it never overlaps them (an alpha-tested surface also samples textures, which uses rescaling).
+struct AlphaRefLayout {
+    f32 alpha_ref;
+};
 constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescaling_textures);
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
+constexpr u32 ALPHA_REF_LAYOUT_OFFSET =
+    static_cast<u32>(sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {

@@ -99,6 +99,9 @@ struct RuntimeInfo {
     std::optional<float> fixed_state_point_size;
     std::optional<CompareFunction> alpha_test_func;
     float alpha_test_reference{};
+    /// Read the alpha test reference from a push constant at draw time instead of baking it into
+    /// the shader, so one fragment shader covers every reference value (preforged_dynamic_alpha_ref).
+    bool alpha_test_dynamic_reference{};
 
     /// Static Y negate value
     bool y_negate{};

@@ -1534,6 +1534,7 @@ class SettingsFragmentPresenter(
                 add(BooleanSetting.PREFORGED_PRECOMPILE_GAME_SHADERS.key)
                 add(BooleanSetting.PREFORGED_FIRST_START_COMPILE.key)
                 add(BooleanSetting.PREFORGED_FIRST_START_STATES.key)
+                add(BooleanSetting.PREFORGED_DYNAMIC_ALPHA_REF.key)
                 add(IntSetting.PREFORGED_PRECOMPILE_PERCENT.key)
                 add(BooleanSetting.PREFORGED_PIPELINE_LIBRARIES.key)
                 add(BooleanSetting.PREFORGED_OPTIMIZE_JOINED.key)
