@@ -1111,6 +1111,10 @@ void SetDriverConstBufferFolding(bool enabled) {
     fold_driver_const_buffer.store(enabled, std::memory_order_relaxed);
 }
 
+bool DriverConstBufferFolding() {
+    return fold_driver_const_buffer.load(std::memory_order_relaxed);
+}
+
 void ConstantPropagationPass(Environment& env, IR::Program& program) {
     const auto end{program.post_order_blocks.rend()};
     for (auto it = program.post_order_blocks.rbegin(); it != end; ++it) {

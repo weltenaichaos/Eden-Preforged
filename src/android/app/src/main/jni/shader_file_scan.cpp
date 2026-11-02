@@ -1272,6 +1272,10 @@ public:
     // Translates each cached shader twice, with what the game really used and with the guesses,
     // and compares the results. Equal results mean the guesses would have built the same shader.
     void CompareGuessesWithRuntime() const {
+        // This test flips constant buffer 1 folding on and off. The setting the user chose
+        // ("Bake constant buffer into shaders") is put back at the end, so the game's own
+        // shaders are built the way it asks.
+        const bool user_folding{Shader::Optimization::DriverConstBufferFolding()};
         const Shader::HostTranslateInfo host_info = MakeHostInfo();
         Vulkan::ShaderPools pools;
         const auto translate = [&](Shader::Environment& env) {
@@ -1376,7 +1380,7 @@ public:
                 ++unfolded_failed;
             }
         }
-        Shader::Optimization::SetDriverConstBufferFolding(false);
+        Shader::Optimization::SetDriverConstBufferFolding(user_folding);
         LOG_INFO(Frontend,
                  "[ShaderScan] without constant buffer 1 folding, all guessed vs runtime: {} "
                  "identical, {} different, {} failed; folding changes {} runtime shaders",
