@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -13,6 +14,8 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/preforged_debug.h"
+#include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -64,12 +67,14 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
+    const Common::Preforged::SubmitCauseScope cause{Common::Preforged::SubmitCause::Wait};
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
     AllocateNewContext();
 }
 
 void Scheduler::WaitWorker() {
+    const Common::Preforged::FrameStats::Timer timer{Common::Preforged::FrameStats::Item::WorkerWait};
     DispatchWork();
 
     // Ensure the queue is drained.
@@ -84,13 +89,59 @@ void Scheduler::WaitWorker() {
 
 void Scheduler::DispatchWork() {
     if (chunk && !chunk->Empty()) {
+        if (!chunk->HasSubmit()) {
+            unsubmitted_work = true;
+        }
         {
             std::scoped_lock ql{queue_mutex};
             work_queue.push(std::move(chunk));
+            Common::Preforged::NoteWorkQueue(work_queue.size());
         }
         event_cv.notify_all();
         AcquireNewChunk();
     }
+}
+
+bool Scheduler::HasUnsubmittedWork() const {
+    return unsubmitted_work || (chunk && !chunk->Empty()) || state.renderpass != nullptr ||
+           deferred_clear.framebuffer != nullptr;
+}
+
+bool Scheduler::GpuIsBehind(u64 submits) {
+    // Submits before the one being recorded that the GPU has not finished.
+    const auto unfinished = [this] {
+        const u64 recorded = master_semaphore->CurrentTick() - 1;
+        const u64 finished = master_semaphore->KnownGpuTick();
+        return recorded > finished ? recorded - finished : 0;
+    };
+    if (unfinished() < submits) {
+        return false;
+    }
+    master_semaphore->Refresh();
+    return unfinished() >= submits;
+}
+
+void Scheduler::LimitGpuLag() {
+    if (!Common::Preforged::Options().limit_gpu_lag) {
+        return;
+    }
+    const u64 tick = master_semaphore->CurrentTick();
+    if (tick <= Common::Preforged::MaxGpuLag + 1) {
+        return;
+    }
+    // Leaves at most MaxGpuLag earlier submits unfinished. All of them went to the worker
+    // already, so the wait ends once the GPU gets through them.
+    const u64 wait_tick = tick - 1 - Common::Preforged::MaxGpuLag;
+    if (master_semaphore->IsFree(wait_tick)) {
+        return;
+    }
+    master_semaphore->Refresh();
+    if (master_semaphore->IsFree(wait_tick)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    master_semaphore->Wait(wait_tick);
+    Common::Preforged::NoteGpuLagWait(std::chrono::steady_clock::now() - start);
 }
 
 void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
@@ -279,6 +330,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 
         work = std::move(work_queue.front());
         work_queue.pop();
+        Common::Preforged::NoteWorkQueue(work_queue.size());
         event_cv.notify_all();
         return true;
     }};
@@ -323,14 +375,20 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 }
 
 void Scheduler::AllocateWorkerCommandBuffer() {
-    current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+    // The worker runs behind the GPU thread, so the GPU thread's current tick can be far past
+    // the submit these command buffers go out with, which keeps them marked in use for longer
+    // and makes the pool grow. Ticks go up by one per submit, in the order the worker submits.
+    const u64 tick = Common::Preforged::Options().limit_gpu_lag ? worker_submitted_tick + 1
+                                                                : master_semaphore->CurrentTick();
+    current_cmdbuf = vk::CommandBuffer(command_pool->Commit(tick), device.GetDispatchLoader());
     current_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
-    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+    current_upload_cmdbuf =
+        vk::CommandBuffer(command_pool->Commit(tick), device.GetDispatchLoader());
     current_upload_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
@@ -340,10 +398,18 @@ void Scheduler::AllocateWorkerCommandBuffer() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    LimitGpuLag();
     EndPendingOperations();
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
+    unsubmitted_work = false;
+    {
+        const u64 finished = master_semaphore->KnownGpuTick();
+        Common::Preforged::NoteSubmit(signal_value,
+                                      signal_value - 1 > finished ? signal_value - 1 - finished : 0);
+        Common::Preforged::NoteGpuTick(finished);
+    }
     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
@@ -361,9 +427,11 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
 
         std::scoped_lock lock{submit_mutex};
+        worker_submitted_tick = signal_value;
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
+            Common::Preforged::NoteQueueSubmit(signal_value - master_semaphore->KnownGpuTick());
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {

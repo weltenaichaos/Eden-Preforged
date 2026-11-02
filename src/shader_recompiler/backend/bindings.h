@@ -15,6 +15,9 @@ struct Bindings {
     u32 image{};
     u32 texture_scaling_index{};
     u32 image_scaling_index{};
+    /// The descriptor set the shader's resources are in. Pipeline libraries keep the fragment
+    /// shader's resources in a set of their own.
+    u32 descriptor_set{};
 };
 
 } // namespace Shader::Backend

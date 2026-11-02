@@ -14,6 +14,7 @@
 #endif
 
 #include "common/logging.h"
+#include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -159,6 +160,7 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage() {
+    const Common::Preforged::FrameStats::Timer timer{Common::Preforged::FrameStats::Item::Present};
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
         *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
         VK_NULL_HANDLE, &image_index);
@@ -215,6 +217,7 @@ bool Swapchain::AcquireNextImage() {
 }
 
 void Swapchain::Present(VkSemaphore render_semaphore) {
+    const Common::Preforged::FrameStats::Timer timer{Common::Preforged::FrameStats::Item::Present};
     const auto present_queue{device.GetPresentQueue()};
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,

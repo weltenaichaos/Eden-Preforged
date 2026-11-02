@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <climits>
+#include <utility>
 
 #include <boost/container/static_vector.hpp>
 
@@ -286,7 +287,7 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("c{}", desc.index));
         for (size_t i = 0; i < desc.count; ++i) {
             ctx.cbufs[desc.index + i].*member_type = id;
@@ -316,7 +317,7 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     for (const StorageBufferDescriptor& desc : info.storage_buffers_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("ssbo{}", index));
         if (ctx.profile.supported_spirv >= 0x00010400) {
             ctx.interfaces.push_back(id);
@@ -464,7 +465,8 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
                          IR::Program& program, Bindings& bindings)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
-      stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
+      stage{program.stage}, descriptor_set{bindings.descriptor_set},
+      texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     const bool is_unified{profile.unified_descriptor_binding};
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
@@ -1021,55 +1023,75 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInput(const Info& info) {
-    if (!info.uses_rescaling_uniform) {
+    const bool wants_alpha_ref{WantsDynamicAlphaRef()};
+    if (!info.uses_rescaling_uniform && !wants_alpha_ref) {
         return;
     }
     if (profile.unified_descriptor_binding) {
-        DefineRescalingInputPushConstant();
-    } else {
+        // The live alpha test reference shares this one push constant block, because a shader may
+        // use only one and an alpha-tested surface usually samples a (rescaled) texture too.
+        DefineRescalingInputPushConstant(info.uses_rescaling_uniform, wants_alpha_ref);
+    } else if (info.uses_rescaling_uniform) {
         DefineRescalingInputUniformConstant();
     }
 }
 
-void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+void EmitContext::DefineRescalingInputPushConstant(bool with_rescaling, bool with_alpha_ref) {
+    boost::container::static_vector<Id, 4> members{};
+    boost::container::static_vector<std::pair<u32, u32>, 4> offsets{};
     u32 member_index{0};
 
-    rescaling_textures_type = TypeArray(U32[1], Const(4u));
-    Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
-    members.push_back(rescaling_textures_type);
-    rescaling_textures_member_index = member_index++;
+    if (with_rescaling) {
+        rescaling_textures_type = TypeArray(U32[1], Const(4u));
+        Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(rescaling_textures_type);
+        rescaling_textures_member_index = member_index++;
+        offsets.emplace_back(rescaling_textures_member_index,
+                             static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
 
-    rescaling_images_type = TypeArray(U32[1], Const(NUM_IMAGE_SCALING_WORDS));
-    Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
-    members.push_back(rescaling_images_type);
-    rescaling_images_member_index = member_index++;
+        rescaling_images_type = TypeArray(U32[1], Const(NUM_IMAGE_SCALING_WORDS));
+        Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(rescaling_images_type);
+        rescaling_images_member_index = member_index++;
+        offsets.emplace_back(rescaling_images_member_index,
+                             static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
 
-    if (stage != Stage::Compute) {
+        if (stage != Stage::Compute) {
+            members.push_back(F32[1]);
+            rescaling_downfactor_member_index = member_index++;
+            offsets.emplace_back(rescaling_downfactor_member_index,
+                                 static_cast<u32>(offsetof(RescalingLayout, down_factor)));
+        }
+    }
+    if (with_alpha_ref) {
         members.push_back(F32[1]);
-        rescaling_downfactor_member_index = member_index++;
+        alpha_ref_member_index = member_index++;
+        offsets.emplace_back(alpha_ref_member_index, ALPHA_REF_LAYOUT_OFFSET);
     }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
 
-    MemberDecorate(push_constant_struct, rescaling_textures_member_index, spv::Decoration::Offset,
-                   static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
-    MemberName(push_constant_struct, rescaling_textures_member_index, "rescaling_textures");
-
-    MemberDecorate(push_constant_struct, rescaling_images_member_index, spv::Decoration::Offset,
-                   static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
-    MemberName(push_constant_struct, rescaling_images_member_index, "rescaling_images");
-
-    if (stage != Stage::Compute) {
-        MemberDecorate(push_constant_struct, rescaling_downfactor_member_index,
-                       spv::Decoration::Offset,
-                       static_cast<u32>(offsetof(RescalingLayout, down_factor)));
-        MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
+    if (with_rescaling) {
+        MemberName(push_constant_struct, rescaling_textures_member_index, "rescaling_textures");
+        MemberName(push_constant_struct, rescaling_images_member_index, "rescaling_images");
+        if (stage != Stage::Compute) {
+            MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
+        }
+    }
+    if (with_alpha_ref) {
+        MemberName(push_constant_struct, alpha_ref_member_index, "alpha_ref");
+    }
+    for (const auto& [index, offset] : offsets) {
+        MemberDecorate(push_constant_struct, index, spv::Decoration::Offset, offset);
     }
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
+    if (with_alpha_ref) {
+        // The alpha test reads the reference from this same block.
+        alpha_ref_push_constant = rescaling_push_constants;
+    }
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
@@ -1115,6 +1137,15 @@ void EmitContext::DefineRenderArea(const Info& info) {
             interfaces.push_back(render_area_push_constant);
         }
     }
+}
+
+bool EmitContext::WantsDynamicAlphaRef() const {
+    // Only the fragment stage runs the alpha test, and only when the test is on and the setting
+    // asks for the reference to come from a push constant instead of being baked in.
+    return stage == Stage::Fragment && runtime_info.alpha_test_dynamic_reference &&
+           runtime_info.alpha_test_func &&
+           *runtime_info.alpha_test_func != CompareFunction::Always &&
+           profile.unified_descriptor_binding;
 }
 
 void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {
@@ -1334,7 +1365,7 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
         }
         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
@@ -1357,7 +1388,7 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "imgbuf"));
         image_buffers.push_back({
             .id = id,
@@ -1382,7 +1413,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "tex"));
         textures.push_back({
             .id = id,
@@ -1412,7 +1443,7 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "img"));
         images.push_back({
             .id = id,

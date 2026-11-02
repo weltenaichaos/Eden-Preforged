@@ -7,6 +7,7 @@
 #include <thread>
 
 #include <ranges>
+#include "common/preforged_frame_stats.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -83,6 +84,8 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
+        const Common::Preforged::FrameStats::Timer timer{
+            Common::Preforged::FrameStats::Item::GpuWait};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
@@ -104,6 +107,7 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    const Common::Preforged::FrameStats::Timer timer{Common::Preforged::FrameStats::Item::GpuWait};
     while (!semaphore.Wait(tick)) {
     }
 
@@ -353,7 +357,9 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             free_queue.push_front(std::move(fence));
             gpu_tick.store(host_tick, std::memory_order_release);
         }
-        gpu_tick.notify_one();
+        // Several threads can wait for the GPU at once (the GPU thread, the present thread and
+        // the fence release thread), so wake all of them.
+        gpu_tick.notify_all();
     }
 }
 

@@ -24,6 +24,7 @@ import org.yuzu.yuzu_emu.utils.GpuDriverHelper
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.utils.GpuDriverMetadata
 import org.yuzu.yuzu_emu.utils.DirectoryInitialization
+import org.yuzu.yuzu_emu.utils.Log
 import org.yuzu.yuzu_emu.utils.NativeConfig
 import java.io.File
 
@@ -56,8 +57,6 @@ class DriverViewModel : ViewModel() {
     private val _showClearButton = MutableStateFlow(false)
     val showClearButton = _showClearButton.asStateFlow()
 
-    private val driversToDelete = mutableListOf<String>()
-
     private var previousDriverPath: String = ""
     private var activeGame: Game? = null
 
@@ -73,8 +72,6 @@ class DriverViewModel : ViewModel() {
     fun reloadDriverData() {
         _areDriversLoading.value = true
         driverData = GpuDriverHelper.getDrivers()
-            .filterNot { driversToDelete.contains(it.first) }
-            .toMutableList()
         updateDriverList()
         _areDriversLoading.value = false
     }
@@ -120,6 +117,12 @@ class DriverViewModel : ViewModel() {
 
         if (!skipShaderWipe && newDriverPath != previousDriverPath) {
             activeGame?.let {
+                // Say so in the log: without it, the next start's empty cache looks like a bug.
+                Log.info(
+                    "[DriverViewModel] GPU driver for ${it.title} changed from " +
+                        "'${previousDriverPath.ifEmpty { "system" }}' to " +
+                        "'${newDriverPath.ifEmpty { "system" }}', deleting its shader cache"
+                )
                 wipeGameShaders(it)
 
                 if (!BooleanSetting.DONT_SHOW_DRIVER_SHADER_WARNING.getBoolean(needsGlobal = true)) {
@@ -167,17 +170,21 @@ class DriverViewModel : ViewModel() {
             return
         }
 
-        driversToDelete.add(driverData[driverIndex].first)
+        // The file goes now. Deleting it only when the driver manager closed left it on disk
+        // while the list no longer showed it, so the download list called it installed and the
+        // driver could be neither picked nor installed again.
+        val driverPath = driverData[driverIndex].first
+        val deleted = File(driverPath).let { !it.exists() || it.delete() }
+        Log.info(
+            "[DriverViewModel] GPU driver file '$driverPath' " +
+                if (deleted) "deleted" else "could not be deleted"
+        )
         driverData.removeAt(driverIndex)
         val safeSelectedPosition = selectedPosition.coerceIn(0, driverData.size)
         onDriverSelected(safeSelectedPosition)
     }
 
     fun onDriverAdded(driver: Pair<String, GpuDriverMetadata>) {
-        if (driversToDelete.contains(driver.first)) {
-            driversToDelete.remove(driver.first)
-        }
-
         val existingDriverIndex = driverData.indexOfFirst {
             it.first == driver.first || it.second == driver.second
         }
@@ -200,14 +207,6 @@ class DriverViewModel : ViewModel() {
                 NativeConfig.unloadPerGameConfig()
                 NativeConfig.reloadGlobalConfig()
             }
-
-            driversToDelete.forEach {
-                val driver = File(it)
-                if (driver.exists()) {
-                    driver.delete()
-                }
-            }
-            driversToDelete.clear()
         } finally {
             activeGame = null
             _isDeletingDrivers.value = false
@@ -221,7 +220,27 @@ class DriverViewModel : ViewModel() {
 
         val selectedDriverFile = File(StringSetting.DRIVER_PATH.getString())
         val selectedDriverMetadata = GpuDriverHelper.customDriverSettingData
-        if (GpuDriverHelper.installedCustomDriverData == selectedDriverMetadata) {
+        val installedDriverMetadata = GpuDriverHelper.installedCustomDriverData
+        // Says which driver the game gets and why, since a missing driver file silently falls
+        // back to the system driver.
+        val selectedPath = selectedDriverFile.path
+        val setting = if (selectedPath.isEmpty()) {
+            "system driver"
+        } else {
+            val found = if (selectedDriverFile.exists()) "found" else "missing"
+            "'$selectedPath' (file $found, name '${selectedDriverMetadata.name}')"
+        }
+        val decision = when {
+            installedDriverMetadata == selectedDriverMetadata -> "keeping it"
+            selectedDriverMetadata.name == null -> "using the system driver"
+            selectedDriverFile.exists() -> "installing the chosen driver"
+            else -> "the chosen driver file is gone, using the system driver"
+        }
+        Log.info(
+            "[DriverViewModel] GPU driver for this game: setting $setting, installed now " +
+                "'${installedDriverMetadata.name}'; $decision"
+        )
+        if (installedDriverMetadata == selectedDriverMetadata) {
             setDriverReady()
             return
         }

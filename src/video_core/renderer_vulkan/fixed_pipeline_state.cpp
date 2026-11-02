@@ -11,6 +11,7 @@
 #include <ranges>
 #include "common/cityhash.h"
 #include "common/common_types.h"
+#include "common/preforged_debug.h"
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -179,7 +180,12 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     for (size_t i = 0; i < regs.rt.size(); ++i) {
         color_formats[i] = static_cast<u8>(regs.rt[i].format);
     }
-    alpha_test_ref = std::bit_cast<u32>(regs.alpha_test_ref);
+    // With a dynamic alpha test reference the shader reads it from a push constant, so the state
+    // keeps a canonical 0 here. Every reference then lands on the same pipeline and shader library
+    // instead of forking a new one, and the real value is sent per draw.
+    alpha_test_ref = Common::Preforged::Options().dynamic_alpha_ref
+                         ? 0u
+                         : std::bit_cast<u32>(regs.alpha_test_ref);
     point_size = std::bit_cast<u32>(regs.point_size);
 
     if (maxwell3d.dirty.flags[Dirty::VertexInput]) {

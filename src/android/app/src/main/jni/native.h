@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <optional>
 
 #include <android/native_window_jni.h>
@@ -66,6 +67,9 @@ public:
 
 private:
     static void LoadDiskCacheProgress(VideoCore::LoadCallbackStage stage, int progress, int max);
+    static void LogMemoryUse();
+    void CheckForFreeze();
+    void LogFreeze(double seconds);
     static void OnEmulationStopped(Core::SystemResultStatus result);
     static void ChangeProgram(std::size_t program_index);
     void ReloadDiskShaderCache(u64 program_id);
@@ -88,6 +92,11 @@ private:
     std::unique_ptr<FileSys::ManualContentProvider> m_manual_provider;
     int m_applet_id{1};
     std::optional<u64> m_pending_shader_cache_title;
+    // The CPU cores wait for loading to finish before they run the game (see InitializeEmulation).
+    bool m_cores_wait_for_loading{false};
+    std::chrono::steady_clock::time_point m_loaded_time{};
+    // Freeze reports logged since the game last showed a frame (see CheckForFreeze).
+    int m_freeze_reports{0};
 
     // GPU driver parameters
     std::shared_ptr<Common::DynamicLibrary> m_vulkan_library;

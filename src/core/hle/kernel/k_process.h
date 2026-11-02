@@ -222,6 +222,10 @@ public:
         return m_code_address;
     }
 
+    size_t GetCodeSize() const {
+        return m_code_size;
+    }
+
     void SetArgPointer(KProcessAddress addr) {
         m_arg_pointer = addr;
     }

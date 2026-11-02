@@ -3,6 +3,8 @@
 
 #include <memory>
 
+#include "common/preforged_debug.h"
+
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
@@ -23,6 +25,7 @@ void InnerFence::Queue() {
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
+    const Common::Preforged::SubmitCauseScope cause{Common::Preforged::SubmitCause::Fence};
     scheduler.Flush();
 }
 

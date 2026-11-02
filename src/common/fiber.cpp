@@ -25,8 +25,11 @@ struct Fiber::FiberImpl {
     FiberImpl() {}
 
     u32 canary_1 = CANARY_VALUE;
-    std::array<u8, DEFAULT_STACK_SIZE> stack{};
-    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack{};
+    // The stacks are left unfilled. Filling them with zeros put all 4 MiB of every fiber in
+    // memory, while a stack only uses the pages it reaches. Every emulated thread has a fiber,
+    // and those of the service threads stay behind after each game stops.
+    std::array<u8, DEFAULT_STACK_SIZE> stack;
+    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack;
     u32 canary_2 = CANARY_VALUE;
 
     boost::context::detail::fcontext_t context{};

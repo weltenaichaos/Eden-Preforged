@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <filesystem>
+#include <system_error>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -16,6 +19,8 @@
 
 #ifdef _WIN32
 #include "common/string_util.h"
+#else
+#include <unistd.h>
 #endif
 
 #include <boost/algorithm/string/replace.hpp>
@@ -75,11 +80,15 @@ void Config::WriteToIni() const {
         break;
     }
     LOG_INFO(Config, "Writing {} configuration to: {}", config_type, config_loc);
+
+    // Write a temporary file and move it over the old one, so the app being killed mid-save
+    // (for example by an app update) cannot leave an empty config behind.
+    const std::string temp_loc = config_loc + ".tmp";
     FILE* fp = nullptr;
 #ifdef _WIN32
-    fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L"wb");
+    fp = _wfopen(Common::UTF8ToUTF16W(temp_loc).data(), L"wb");
 #else
-    fp = fopen(config_loc.c_str(), "wb");
+    fp = fopen(temp_loc.c_str(), "wb");
 #endif
 
     if (fp == nullptr) {
@@ -89,10 +98,23 @@ void Config::WriteToIni() const {
 
     CSimpleIniA::FileWriter writer(fp);
     const SI_Error rc = config->Save(writer, false);
-    if (rc < 0) {
+    bool written = rc >= 0 && std::fflush(fp) == 0;
+#ifndef _WIN32
+    written = written && fsync(fileno(fp)) == 0;
+#endif
+    written = std::fclose(fp) == 0 && written;
+    if (!written) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
+        std::error_code ec;
+        std::filesystem::remove(FS::ToU8String(temp_loc), ec);
+        return;
     }
-    fclose(fp);
+
+    std::error_code ec;
+    std::filesystem::rename(FS::ToU8String(temp_loc), FS::ToU8String(config_loc), ec);
+    if (ec) {
+        LOG_ERROR(Frontend, "Config file could not be saved: {}", ec.message());
+    }
 }
 
 void Config::SetUpIni() {

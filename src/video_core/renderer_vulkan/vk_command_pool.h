@@ -23,6 +23,9 @@ public:
 
     VkCommandBuffer Commit();
 
+    /// Takes a free command buffer, in use until the GPU reaches `tick`.
+    VkCommandBuffer Commit(u64 tick);
+
 private:
     struct Pool;
 

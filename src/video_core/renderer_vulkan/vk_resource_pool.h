@@ -29,7 +29,11 @@ public:
     ResourcePool(const ResourcePool&) = default;
 
 protected:
+    /// Takes a free resource and marks it in use until the GPU reaches the current tick.
     size_t CommitResource();
+
+    /// Takes a free resource and marks it in use until the GPU reaches `tick`.
+    size_t CommitResource(u64 tick);
 
     /// Called when a chunk of resources have to be allocated.
     virtual void Allocate(size_t begin, size_t end) = 0;

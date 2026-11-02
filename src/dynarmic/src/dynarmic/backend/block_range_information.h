@@ -9,6 +9,7 @@
 #pragma once
 
 #include <set>
+#include <unordered_set>
 
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/interval_set.hpp>
@@ -25,7 +26,9 @@ public:
     void AddRange(boost::icl::discrete_interval<P> range, IR::LocationDescriptor location);
     void ClearCache();
     ::Common::unordered_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<P>& ranges);
-    boost::icl::interval_map<P, ::Common::unordered_set<IR::LocationDescriptor>> block_ranges;
+    // Each range keeps its own set, and there are hundreds of thousands of ranges, so these are
+    // node based sets, which stay small for the one or two blocks most ranges have.
+    boost::icl::interval_map<P, std::unordered_set<IR::LocationDescriptor>> block_ranges;
 };
 
 }  // namespace Dynarmic::Backend

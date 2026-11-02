@@ -5,13 +5,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
+#ifdef __ANDROID__
+#include <malloc.h>
+#endif
+
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/preforged_debug.h"
+#include "common/preforged_heap_profile.h"
+#include "common/settings.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -19,6 +29,78 @@
 namespace Vulkan::vk {
 
 namespace {
+
+#ifdef __ANDROID__
+namespace HeapProfile = Common::Preforged::HeapProfile;
+
+void* AllocateHost(size_t size, size_t alignment) {
+    if (alignment <= alignof(std::max_align_t)) {
+        return std::malloc(size);
+    }
+    void* pointer = nullptr;
+    return posix_memalign(&pointer, alignment, size) == 0 ? pointer : nullptr;
+}
+
+void NoteHost(void* pointer, size_t size, VkSystemAllocationScope scope, void* caller) {
+    HeapProfile::NoteAllocation(pointer, size, HeapProfile::Kind::Driver,
+                                static_cast<unsigned>(scope), reinterpret_cast<uintptr_t>(caller));
+}
+
+[[gnu::noinline]] VKAPI_ATTR void* VKAPI_CALL HostAllocation(void*, size_t size, size_t alignment,
+                                                             VkSystemAllocationScope scope) {
+    void* const pointer = AllocateHost(size, alignment);
+    NoteHost(pointer, size, scope, __builtin_return_address(0));
+    return pointer;
+}
+
+[[gnu::noinline]] VKAPI_ATTR void* VKAPI_CALL HostReallocation(void*, void* original, size_t size,
+                                                               size_t alignment,
+                                                               VkSystemAllocationScope scope) {
+    void* const caller = __builtin_return_address(0);
+    if (original == nullptr) {
+        void* const pointer = AllocateHost(size, alignment);
+        NoteHost(pointer, size, scope, caller);
+        return pointer;
+    }
+    if (size == 0) {
+        HeapProfile::NoteFree(original);
+        std::free(original);
+        return nullptr;
+    }
+    if (alignment <= alignof(std::max_align_t)) {
+        HeapProfile::NoteFree(original);
+        void* const pointer = std::realloc(original, size);
+        NoteHost(pointer, size, scope, caller);
+        return pointer;
+    }
+    // realloc does not keep larger alignments, so move the memory by hand.
+    void* const pointer = AllocateHost(size, alignment);
+    if (pointer == nullptr) {
+        return nullptr;
+    }
+    std::memcpy(pointer, original, std::min(size, malloc_usable_size(original)));
+    HeapProfile::NoteFree(original);
+    std::free(original);
+    NoteHost(pointer, size, scope, caller);
+    return pointer;
+}
+
+VKAPI_ATTR void VKAPI_CALL HostFree(void*, void* memory) {
+    if (memory != nullptr) {
+        HeapProfile::NoteFree(memory);
+        std::free(memory);
+    }
+}
+
+constexpr VkAllocationCallbacks HOST_CALLBACKS{
+    .pUserData = nullptr,
+    .pfnAllocation = HostAllocation,
+    .pfnReallocation = HostReallocation,
+    .pfnFree = HostFree,
+    .pfnInternalAllocation = nullptr,
+    .pfnInternalFree = nullptr,
+};
+#endif
 
 template <typename Func>
 void SortPhysicalDevices(std::vector<VkPhysicalDevice>& devices, const InstanceDispatch& dld,
@@ -335,12 +417,22 @@ const char* Exception::what() const noexcept {
     return string_VkResult(result);
 }
 
+const VkAllocationCallbacks* HostAllocator() {
+#ifdef __ANDROID__
+    // Read once, so everything is destroyed with the callbacks it was created with.
+    static const bool enabled = Settings::values.preforged_track_driver_memory.GetValue();
+    return enabled ? &HOST_CALLBACKS : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
 void Destroy(VkInstance instance, const InstanceDispatch& dld) noexcept {
-    dld.vkDestroyInstance(instance, nullptr);
+    dld.vkDestroyInstance(instance, HostAllocator());
 }
 
 void Destroy(VkDevice device, const InstanceDispatch& dld) noexcept {
-    dld.vkDestroyDevice(device, nullptr);
+    dld.vkDestroyDevice(device, HostAllocator());
 }
 
 void Destroy(VkDevice device, VkBuffer handle, const DeviceDispatch& dld) noexcept {
@@ -348,14 +440,17 @@ void Destroy(VkDevice device, VkBuffer handle, const DeviceDispatch& dld) noexce
 }
 
 void Destroy(VkDevice device, VkBufferView handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::BufferView, -1);
     dld.vkDestroyBufferView(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkCommandPool handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::CommandPool, -1);
     dld.vkDestroyCommandPool(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkDescriptorPool handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::DescriptorPool, -1);
     dld.vkDestroyDescriptorPool(device, handle, nullptr);
 }
 
@@ -369,18 +464,22 @@ void Destroy(VkDevice device, VkDescriptorUpdateTemplate handle,
 }
 
 void Destroy(VkDevice device, VkDeviceMemory handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::DeviceMemory, -1);
     dld.vkFreeMemory(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkEvent handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Event, -1);
     dld.vkDestroyEvent(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkFence handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Fence, -1);
     dld.vkDestroyFence(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkFramebuffer handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Framebuffer, -1);
     dld.vkDestroyFramebuffer(device, handle, nullptr);
 }
 
@@ -389,10 +488,12 @@ void Destroy(VkDevice device, VkImage handle, const DeviceDispatch& dld) noexcep
 }
 
 void Destroy(VkDevice device, VkImageView handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::ImageView, -1);
     dld.vkDestroyImageView(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkPipeline handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Pipeline, -1);
     dld.vkDestroyPipeline(device, handle, nullptr);
 }
 
@@ -405,14 +506,17 @@ void Destroy(VkDevice device, VkPipelineLayout handle, const DeviceDispatch& dld
 }
 
 void Destroy(VkDevice device, VkQueryPool handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::QueryPool, -1);
     dld.vkDestroyQueryPool(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkRenderPass handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::RenderPass, -1);
     dld.vkDestroyRenderPass(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkSampler handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Sampler, -1);
     dld.vkDestroySampler(device, handle, nullptr);
 }
 
@@ -421,10 +525,12 @@ void Destroy(VkDevice device, VkSwapchainKHR handle, const DeviceDispatch& dld) 
 }
 
 void Destroy(VkDevice device, VkSemaphore handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Semaphore, -1);
     dld.vkDestroySemaphore(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkShaderModule handle, const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::ShaderModule, -1);
     dld.vkDestroyShaderModule(device, handle, nullptr);
 }
 
@@ -444,11 +550,15 @@ void Destroy(VkInstance instance, VkSurfaceKHR handle, const InstanceDispatch& d
 
 VkResult Free(VkDevice device, VkDescriptorPool handle, Span<VkDescriptorSet> sets,
               const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::DescriptorSet,
+                                           -static_cast<std::int64_t>(sets.size()));
     return dld.vkFreeDescriptorSets(device, handle, sets.size(), sets.data());
 }
 
 VkResult Free(VkDevice device, VkCommandPool handle, Span<VkCommandBuffer> buffers,
               const DeviceDispatch& dld) noexcept {
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::CommandBuffer,
+                                           -static_cast<std::int64_t>(buffers.size()));
     dld.vkFreeCommandBuffers(device, handle, buffers.size(), buffers.data());
     return VK_SUCCESS;
 }
@@ -482,7 +592,7 @@ Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char
         .ppEnabledExtensionNames = extensions.data(),
     };
     VkInstance instance;
-    Check(dispatch.vkCreateInstance(&ci, nullptr, &instance));
+    Check(dispatch.vkCreateInstance(&ci, HostAllocator(), &instance));
     if (!Proc(dispatch.vkDestroyInstance, dispatch, "vkDestroyInstance", instance)) {
         // We successfully created an instance but the destroy function couldn't be loaded.
         // This is a good moment to panic.
@@ -520,6 +630,7 @@ void Image::SetObjectNameEXT(const char* name) const {
 
 void Image::Release() const noexcept {
     if (handle) {
+        ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Image, -1);
         vmaDestroyImage(allocator, handle, allocation);
     }
 }
@@ -542,6 +653,7 @@ void Buffer::SetObjectNameEXT(const char* name) const {
 
 void Buffer::Release() const noexcept {
     if (handle) {
+        ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Buffer, -1);
         vmaDestroyBuffer(allocator, handle, allocation);
     }
 }
@@ -597,6 +709,8 @@ DescriptorSets DescriptorPool::Allocate(const VkDescriptorSetAllocateInfo& ai) c
     std::unique_ptr sets = std::make_unique<VkDescriptorSet[]>(num);
     switch (const VkResult result = dld->vkAllocateDescriptorSets(owner, &ai, sets.get())) {
     case VK_SUCCESS:
+        ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::DescriptorSet,
+                                               static_cast<std::int64_t>(num));
         return DescriptorSets(std::move(sets), num, owner, handle, *dld);
     case VK_ERROR_OUT_OF_POOL_MEMORY:
     case VK_ERROR_FRAGMENTED_POOL:
@@ -622,6 +736,8 @@ CommandBuffers CommandPool::Allocate(std::size_t num_buffers, VkCommandBufferLev
     std::unique_ptr buffers = std::make_unique<VkCommandBuffer[]>(num_buffers);
     switch (const VkResult result = dld->vkAllocateCommandBuffers(owner, &ai, buffers.get())) {
     case VK_SUCCESS:
+        ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::CommandBuffer,
+                                               static_cast<std::int64_t>(num_buffers));
         return CommandBuffers(std::move(buffers), num_buffers, owner, handle, *dld);
     case VK_ERROR_OUT_OF_POOL_MEMORY:
     case VK_ERROR_FRAGMENTED_POOL:
@@ -675,7 +791,7 @@ Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreate
         .pEnabledFeatures = nullptr,
     };
     VkDevice device;
-    Check(dispatch.vkCreateDevice(physical_device, &ci, nullptr, &device));
+    Check(dispatch.vkCreateDevice(physical_device, &ci, HostAllocator(), &device));
     Load(device, dispatch);
     return Device(device, dispatch);
 }
@@ -689,12 +805,14 @@ Queue Device::GetQueue(u32 family_index) const noexcept {
 BufferView Device::CreateBufferView(const VkBufferViewCreateInfo& ci) const {
     VkBufferView object;
     Check(dld->vkCreateBufferView(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::BufferView, 1);
     return BufferView(object, handle, *dld);
 }
 
 ImageView Device::CreateImageView(const VkImageViewCreateInfo& ci) const {
     VkImageView object;
     Check(dld->vkCreateImageView(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::ImageView, 1);
     return ImageView(object, handle, *dld);
 }
 
@@ -710,30 +828,35 @@ Semaphore Device::CreateSemaphore() const {
 Semaphore Device::CreateSemaphore(const VkSemaphoreCreateInfo& ci) const {
     VkSemaphore object;
     Check(dld->vkCreateSemaphore(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Semaphore, 1);
     return Semaphore(object, handle, *dld);
 }
 
 Fence Device::CreateFence(const VkFenceCreateInfo& ci) const {
     VkFence object;
     Check(dld->vkCreateFence(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Fence, 1);
     return Fence(object, handle, *dld);
 }
 
 DescriptorPool Device::CreateDescriptorPool(const VkDescriptorPoolCreateInfo& ci) const {
     VkDescriptorPool object;
     Check(dld->vkCreateDescriptorPool(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::DescriptorPool, 1);
     return DescriptorPool(object, handle, *dld);
 }
 
 RenderPass Device::CreateRenderPass(const VkRenderPassCreateInfo& ci) const {
     VkRenderPass object;
     Check(dld->vkCreateRenderPass(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::RenderPass, 1);
     return RenderPass(object, handle, *dld);
 }
 
 RenderPass Device::CreateRenderPass2(const VkRenderPassCreateInfo2& ci) const {
     VkRenderPass object;
     Check(dld->vkCreateRenderPass2(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::RenderPass, 1);
     return RenderPass(object, handle, *dld);
 }
 
@@ -762,9 +885,12 @@ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, 
     // Adreno 5xx drivers do not properly return when a graphics pipeline fails to be created
     // Some (unkown) Mali drivers also do not properly return
     // This result code is out of spec, but should be handled as "kinda working"
-    if (result == VK_INCOMPLETE)
+    if (result == VK_INCOMPLETE) {
+        ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Pipeline, 1);
         return Pipeline(object, handle, *dld);
+    }
     Check(result);
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Pipeline, 1);
     return Pipeline(object, handle, *dld);
 }
 
@@ -772,24 +898,28 @@ Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                        VkPipelineCache cache) const {
     VkPipeline object;
     Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Pipeline, 1);
     return Pipeline(object, handle, *dld);
 }
 
 Sampler Device::CreateSampler(const VkSamplerCreateInfo& ci) const {
     VkSampler object;
     Check(dld->vkCreateSampler(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Sampler, 1);
     return Sampler(object, handle, *dld);
 }
 
 Framebuffer Device::CreateFramebuffer(const VkFramebufferCreateInfo& ci) const {
     VkFramebuffer object;
     Check(dld->vkCreateFramebuffer(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Framebuffer, 1);
     return Framebuffer(object, handle, *dld);
 }
 
 CommandPool Device::CreateCommandPool(const VkCommandPoolCreateInfo& ci) const {
     VkCommandPool object;
     Check(dld->vkCreateCommandPool(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::CommandPool, 1);
     return CommandPool(object, handle, *dld);
 }
 
@@ -803,12 +933,14 @@ DescriptorUpdateTemplate Device::CreateDescriptorUpdateTemplate(
 QueryPool Device::CreateQueryPool(const VkQueryPoolCreateInfo& ci) const {
     VkQueryPool object;
     Check(dld->vkCreateQueryPool(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::QueryPool, 1);
     return QueryPool(object, handle, *dld);
 }
 
 ShaderModule Device::CreateShaderModule(const VkShaderModuleCreateInfo& ci) const {
     VkShaderModule object;
     Check(dld->vkCreateShaderModule(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::ShaderModule, 1);
     return ShaderModule(object, handle, *dld);
 }
 
@@ -821,6 +953,7 @@ Event Device::CreateEvent() const {
 
     VkEvent object;
     Check(dld->vkCreateEvent(handle, &ci, nullptr, &object));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::Event, 1);
     return Event(object, handle, *dld);
 }
 
@@ -835,12 +968,14 @@ DeviceMemory Device::TryAllocateMemory(const VkMemoryAllocateInfo& ai) const noe
     if (dld->vkAllocateMemory(handle, &ai, nullptr, &memory) != VK_SUCCESS) {
         return {};
     }
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::DeviceMemory, 1);
     return DeviceMemory(memory, handle, *dld);
 }
 
 DeviceMemory Device::AllocateMemory(const VkMemoryAllocateInfo& ai) const {
     VkDeviceMemory memory;
     Check(dld->vkAllocateMemory(handle, &ai, nullptr, &memory));
+    ::Common::Preforged::NoteVulkanObjects(::Common::Preforged::VulkanObject::DeviceMemory, 1);
     return DeviceMemory(memory, handle, *dld);
 }
 

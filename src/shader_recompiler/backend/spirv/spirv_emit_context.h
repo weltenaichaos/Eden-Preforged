@@ -214,6 +214,8 @@ public:
     const Profile& profile;
     const RuntimeInfo& runtime_info;
     Stage stage{};
+    /// The descriptor set every resource of the shader is decorated with.
+    u32 descriptor_set{};
 
     Id void_id{};
     Id U1{};
@@ -309,6 +311,9 @@ public:
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
+    Id alpha_ref_push_constant{};
+    u32 alpha_ref_member_index{};
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -395,9 +400,10 @@ private:
     void DefineWriteStorageCasLoopFunction(const Info& info);
     void DefineGlobalMemoryFunctions(const Info& info);
     void DefineRescalingInput(const Info& info);
-    void DefineRescalingInputPushConstant();
+    void DefineRescalingInputPushConstant(bool with_rescaling, bool with_alpha_ref);
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
+    [[nodiscard]] bool WantsDynamicAlphaRef() const;
 
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);

@@ -27,6 +27,7 @@ import androidx.navigation.findNavController
 import androidx.navigation.fragment.findNavController
 import androidx.recyclerview.widget.GridLayoutManager
 import com.google.android.material.transition.MaterialSharedAxis
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.yuzu.yuzu_emu.HomeNavigationDirections
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
@@ -41,6 +42,7 @@ import org.yuzu.yuzu_emu.model.DriverViewModel
 import org.yuzu.yuzu_emu.model.HomeSetting
 import org.yuzu.yuzu_emu.model.HomeViewModel
 import org.yuzu.yuzu_emu.ui.main.MainActivity
+import org.yuzu.yuzu_emu.updater.PreforgedUpdater
 import org.yuzu.yuzu_emu.utils.FileUtil
 import org.yuzu.yuzu_emu.utils.GpuDriverHelper
 import org.yuzu.yuzu_emu.utils.Log
@@ -80,6 +82,20 @@ class HomeSettingsFragment : Fragment() {
         binding.toolbarHomeSettings.title = getString(R.string.preferences_settings)
 
         val optionsList: MutableList<HomeSetting> = mutableListOf<HomeSetting>().apply {
+            add(
+                HomeSetting(
+                    R.string.preforged_update,
+                    R.string.preforged_update_description,
+                    R.drawable.ic_system_update_alt,
+                    { PreforgedUpdater.checkAndInstall(requireActivity()) },
+                    details = MutableStateFlow(
+                        getString(
+                            R.string.preforged_update_installed,
+                            PreforgedUpdater.installedBuild
+                        )
+                    )
+                )
+            )
             add(
                 HomeSetting(
                     R.string.advanced_settings,

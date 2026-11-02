@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,21 @@ public:
      * @param length The length (in bytes) of the range to invalidate.
      */
     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);
+
+    struct CompileAheadResult {
+        std::size_t compiled = 0;          ///< Blocks compiled by this call.
+        std::size_t already_compiled = 0;  ///< Blocks that were in the code cache already.
+        std::size_t code_cache_free = 0;   ///< Bytes left in the code cache afterwards.
+        bool stopped_early = false;        ///< Stopped because the code cache reached keep_free.
+    };
+
+    /**
+     * Compiles the blocks at these locations (IR::LocationDescriptor values) now instead of when
+     * they first run. Applies pending cache invalidations first. Stops once the code cache has
+     * fewer than keep_free bytes left. Must not be called while the JIT runs. Backends other
+     * than arm64 compile nothing.
+     */
+    CompileAheadResult CompileAhead(std::span<const std::uint64_t> locations, std::size_t keep_free);
 
     /**
      * Reset CPU state to state at startup. Does not clear code cache.

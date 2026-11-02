@@ -42,4 +42,11 @@ VkCommandBuffer CommandPool::Commit() {
     return pools[pool_index].cmdbufs[sub_index];
 }
 
+VkCommandBuffer CommandPool::Commit(u64 tick) {
+    const size_t index = CommitResource(tick);
+    const auto pool_index = index / COMMAND_BUFFER_POOL_SIZE;
+    const auto sub_index = index % COMMAND_BUFFER_POOL_SIZE;
+    return pools[pool_index].cmdbufs[sub_index];
+}
+
 } // namespace Vulkan

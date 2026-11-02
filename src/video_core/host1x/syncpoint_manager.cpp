@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "common/preforged_frame_stats.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
 namespace Tegra {
@@ -95,6 +96,8 @@ void SyncpointManager::Wait(std::atomic<u32>& syncpoint, std::condition_variable
     if (pred()) {
         return;
     }
+    const ::Common::Preforged::FrameStats::Timer timer{
+        ::Common::Preforged::FrameStats::Item::SyncpointWait};
 
     std::unique_lock lk(guard);
     wait_cv.wait(lk, pred);

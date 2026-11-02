@@ -10,6 +10,7 @@
 
 #include <bit>
 
+#include "common/preforged_frame_stats.h"
 #include "dynarmic/backend/arm64/a64_address_space.h"
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
@@ -70,6 +71,7 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
     if (CodePtr block_entry = Get(descriptor)) {
         return block_entry;
     }
+    const ::Common::Preforged::FrameStats::Timer timer{::Common::Preforged::FrameStats::Item::CpuCode};
     GenerateIR(ir_block, descriptor);
     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
     return block_info.entry_point;
@@ -95,6 +97,7 @@ void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::Locat
 }
 
 void AddressSpace::ClearCache() {
+    ::Common::Preforged::FrameStats::Add(::Common::Preforged::FrameStats::Item::CpuCodeClear, {});
     block_entries.clear();
     reverse_block_entries.clear();
     block_infos.clear();

@@ -948,6 +948,13 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
         emulationViewModel.totalShaders.collect(viewLifecycleOwner) {
             binding.loadingProgressIndicator.max = it
         }
+        emulationViewModel.shaderLoading.collect(viewLifecycleOwner) {
+            if (it) {
+                ViewUtils.showView(binding.loadingIndicator)
+            } else if (emulationViewModel.emulationStarted.value) {
+                ViewUtils.hideView(binding.loadingIndicator)
+            }
+        }
         emulationViewModel.shaderMessage.collect(viewLifecycleOwner) {
             if (it.isNotEmpty()) {
                 binding.loadingText.text = it
@@ -958,7 +965,9 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
             if (it) {
                 binding.drawerLayout.setDrawerLockMode(IntSetting.LOCK_DRAWER.getInt())
                 ViewUtils.showView(binding.surfaceInputOverlay)
-                ViewUtils.hideView(binding.loadingIndicator)
+                if (!emulationViewModel.shaderLoading.value) {
+                    ViewUtils.hideView(binding.loadingIndicator)
+                }
 
                 emulationState.updateSurface()
 

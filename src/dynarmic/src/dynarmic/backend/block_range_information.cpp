@@ -17,7 +17,7 @@ namespace Dynarmic::Backend {
 
 template<typename P>
 void BlockRangeInformation<P>::AddRange(boost::icl::discrete_interval<P> range, IR::LocationDescriptor location) {
-    block_ranges.add(std::make_pair(range, ::Common::unordered_set<IR::LocationDescriptor>{location}));
+    block_ranges.add(std::make_pair(range, std::unordered_set<IR::LocationDescriptor>{location}));
 }
 
 template<typename P>

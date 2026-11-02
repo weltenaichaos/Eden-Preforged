@@ -43,6 +43,7 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 
     compileOptions {
@@ -69,6 +70,8 @@ android {
         targetSdk = 36
         versionName = getGitVersion()
         versionCode = autoVersion
+        // The CI run number, so the in-app updater can tell which test build is installed.
+        buildConfigField("int", "PREFORGED_BUILD", System.getenv("GITHUB_RUN_NUMBER") ?: "0")
 
         externalNativeBuild {
             cmake {

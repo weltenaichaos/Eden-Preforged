@@ -165,6 +165,10 @@ void Jit::ClearCache() {
     impl->ClearCache();
 }
 
+Jit::CompileAheadResult Jit::CompileAhead(std::span<const std::uint64_t>, std::size_t) {
+    return {};
+}
+
 void Jit::InvalidateCacheRange(u64 start_address, std::size_t length) {
     impl->InvalidateCacheRange(start_address, length);
 }

@@ -82,7 +82,19 @@ void AlphaTest(EmitContext& ctx) {
 
     const Id true_label{ctx.OpLabel()};
     const Id discard_label{ctx.OpLabel()};
-    const Id alpha_reference{ctx.Const(ctx.runtime_info.alpha_test_reference)};
+    // With a dynamic reference the host sets it per draw in a push constant, so this one shader
+    // covers every reference value instead of baking one in. Otherwise the reference is a constant.
+    const Id alpha_reference{[&] {
+        if (ctx.runtime_info.alpha_test_dynamic_reference &&
+            Sirit::ValidId(ctx.alpha_ref_push_constant)) {
+            const Id pointer_type{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1])};
+            const Id index{ctx.Const(ctx.alpha_ref_member_index)};
+            const Id pointer{
+                ctx.OpAccessChain(pointer_type, ctx.alpha_ref_push_constant, index)};
+            return ctx.OpLoad(ctx.F32[1], pointer);
+        }
+        return ctx.Const(ctx.runtime_info.alpha_test_reference);
+    }()};
     const Id condition{ComparisonFunction(ctx, comparison, alpha, alpha_reference)};
 
     ctx.OpSelectionMerge(true_label, spv::SelectionControlMask::MaskNone);

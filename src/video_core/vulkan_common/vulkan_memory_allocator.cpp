@@ -17,6 +17,7 @@
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#include "common/preforged_debug.h"
 #include <ranges>
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -222,6 +223,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci) const
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
     vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+    Common::Preforged::NoteVulkanObjects(Common::Preforged::VulkanObject::Image, 1);
 
     // Log GPU memory allocation for images
     if (GPU::Logging::IsActive() &&
@@ -259,6 +261,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+    Common::Preforged::NoteVulkanObjects(Common::Preforged::VulkanObject::Buffer, 1);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     // Log GPU memory allocation for buffers
@@ -316,6 +319,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 
     vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
                                            &allocation, &alloc_info));
+    Common::Preforged::NoteVulkanObjects(Common::Preforged::VulkanObject::Buffer, 1);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);

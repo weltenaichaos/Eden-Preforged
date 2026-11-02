@@ -14,6 +14,7 @@
 
 #include <fmt/ranges.h>
 
+#include "common/preforged_debug.h"
 #include "common/logging.h"
 #include <ranges>
 #include "common/scope_exit.h"
@@ -232,12 +233,16 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         Frame* generated = present_manager.GetRenderFrame();
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
+        const Common::Preforged::SubmitCauseScope cause{Common::Preforged::SubmitCause::Frame};
         scheduler.Flush(*generated->render_ready);
         present_manager.Present(generated);
     }
 #endif
 
-    scheduler.Flush(*frame->render_ready);
+    {
+        const Common::Preforged::SubmitCauseScope cause{Common::Preforged::SubmitCause::Frame};
+        scheduler.Flush(*frame->render_ready);
+    }
 
     present_manager.Present(frame);
 #ifdef HAS_LSFG
